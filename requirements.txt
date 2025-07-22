@@ -1,0 +1,8 @@
+opencv-python
+PySide6
+torch
+onnxruntime
+numpy
+Pillow
+pyfakewebcam
+pyinstaller 
