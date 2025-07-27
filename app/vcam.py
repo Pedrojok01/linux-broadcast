@@ -1,4 +1,4 @@
-import pyfakewebcam
+import sys
 import numpy as np
 import logging
 
@@ -6,6 +6,7 @@ import logging
 class VCam:
     """
     A class to handle the virtual webcam.
+    On Windows, it runs in a 'preview' mode where it does nothing.
     """
 
     def __init__(self, width, height, device, channels=3):
@@ -13,22 +14,31 @@ class VCam:
         self.height = height
         self.device = device
         self.channels = channels
+        self._camera = None
+
+        if sys.platform == "win32":
+            logging.info("Running on Windows. Virtual camera disabled (Preview Mode).")
+            return
+
         try:
+            import pyfakewebcam
+
             self._camera = pyfakewebcam.FakeWebcam(self.device, self.width, self.height)
+        except ImportError:
+            logging.error(
+                "The 'pyfakewebcam' package is not installed. "
+                "Please install it to use the virtual camera feature on Linux."
+            )
         except Exception as e:
             logging.error(
                 f"Could not create virtual webcam at {self.device}. "
                 f"Please ensure v4l2loopback is installed and the device exists. Error: {e}"
             )
-            self._camera = None
 
     def write_frame(self, frame: np.ndarray):
         """
         Write a frame to the virtual camera.
-
-        Args:
-            frame: The frame to write to the virtual camera.
-                   It should be a numpy array with RGB format.
+        Does nothing if the virtual camera is not available.
         """
         if self._camera is None:
             return

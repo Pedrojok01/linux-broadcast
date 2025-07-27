@@ -1,5 +1,6 @@
 import cv2
 import logging
+import sys
 
 logging.basicConfig(level=logging.INFO)
 
@@ -60,23 +61,23 @@ class Camera:
     @staticmethod
     def list_cameras():
         """
-        List available cameras.
+        List available cameras using a more robust, platform-specific method.
 
         Returns:
             A list of available camera indices.
         """
-        index = 0
+        if sys.platform == "win32":
+            backend = cv2.CAP_MSMF
+        else:
+            backend = cv2.CAP_V4L2
+
         arr = []
-        while True:
+        for index in range(10):  # Check up to 10 devices
             try:
-                cap = cv2.VideoCapture(index)
-                if not cap.isOpened():
-                    break
-                else:
+                cap = cv2.VideoCapture(index, backend)
+                if cap.isOpened():
                     arr.append(index)
-                cap.release()
-                index += 1
+                    cap.release()
             except Exception as e:
-                logging.error(f"Error while checking for camera at index {index}: {e}")
-                break
+                logging.debug(f"Could not probe camera at index {index}: {e}")
         return arr

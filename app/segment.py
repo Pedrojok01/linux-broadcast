@@ -5,6 +5,7 @@ from torchvision import transforms
 import logging
 import onnxruntime
 import numpy as np
+import cv2
 
 
 class IBNorm(nn.Module):
@@ -246,7 +247,10 @@ class PyTorchSegmenter:
         try:
             self.model = MODNet(backbone_arch="mobilenetv2")
             self.model = nn.DataParallel(self.model)
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            # Load the model with strict=False to ignore mismatched layers
+            self.model.load_state_dict(
+                torch.load(model_path, map_location=self.device), strict=False
+            )
             self.model.eval()
             self.model.to(self.device)
             self.transform = self._get_transform()
@@ -273,7 +277,9 @@ class PyTorchSegmenter:
             numpy.ndarray: The foreground mask.
         """
         h, w, _ = image.shape
-        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+        # Convert BGR to RGB before transforming
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_tensor = self.transform(image_rgb).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             matte = self.model(image_tensor, inference=True)
@@ -289,9 +295,15 @@ class ONNXSegmenter:
 
     def __init__(self, model_path: str):
         try:
-            self.session = onnxruntime.InferenceSession(
-                model_path, providers=["CPUExecutionProvider"]
-            )
+            # Check for CUDA availability for ONNX Runtime
+            if "CUDAExecutionProvider" in onnxruntime.get_available_providers():
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                logging.info("ONNX: Using CUDAExecutionProvider.")
+            else:
+                providers = ["CPUExecutionProvider"]
+                logging.info("ONNX: CUDA not available. Using CPUExecutionProvider.")
+
+            self.session = onnxruntime.InferenceSession(model_path, providers=providers)
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             self.transform = self._get_transform()
@@ -318,8 +330,118 @@ class ONNXSegmenter:
             numpy.ndarray: The foreground mask.
         """
         h, w, _ = image.shape
-        image_tensor = self.transform(image).unsqueeze(0).numpy()
+        # Convert BGR to RGB before transforming
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_tensor = self.transform(image_rgb).unsqueeze(0).numpy()
 
+        matte = self.session.run([self.output_name], {self.input_name: image_tensor})[0]
+
+        matte_tensor = torch.from_numpy(matte)
+        matte = F.interpolate(matte_tensor, size=(h, w), mode="bilinear", align_corners=False)
+        return matte.squeeze().numpy()
+
+
+class RVMSegmenter:
+    """
+    A wrapper class for the ONNX Robust Video Matting (RVM) model.
+    It maintains recurrent states for temporal consistency.
+    """
+
+    def __init__(self, model_path: str):
+        try:
+            # Check for CUDA availability for ONNX Runtime
+            if "CUDAExecutionProvider" in onnxruntime.get_available_providers():
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                logging.info("RVM: Using CUDAExecutionProvider.")
+            else:
+                providers = ["CPUExecutionProvider"]
+                logging.info("RVM: CUDA not available. Using CPUExecutionProvider.")
+
+            self.session = onnxruntime.InferenceSession(model_path, providers=providers)
+            self.input_names = [inp.name for inp in self.session.get_inputs()]
+            self.output_names = [out.name for out in self.session.get_outputs()]
+
+            # RVM model has specific input names for recurrent states
+            self.rec_in_names = sorted(
+                [name for name in self.input_names if name.startswith("r") and name.endswith("i")]
+            )
+            self.rec_out_names = sorted(
+                [name for name in self.output_names if name.startswith("r") and name.endswith("o")]
+            )
+
+            # Initialize recurrent states
+            # RVM expects specific shapes for recurrent states, let's get them from the model
+            self.rec = []
+            for name in self.rec_in_names:
+                for inp in self.session.get_inputs():
+                    if inp.name == name:
+                        self.rec.append(np.zeros(inp.shape, dtype=np.float32))
+                        break
+
+            self.downsample_ratio = np.array([0.25], dtype=np.float32)  # Hyperparameter
+
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while loading the RVM model: {e}")
+            raise
+
+    def segment(self, image):
+        """
+        Segment the foreground from the background in an image using RVM.
+        """
+        h, w, _ = image.shape
+        image_tensor = self._preprocess(image)
+
+        inputs = {self.input_names[0]: image_tensor}
+        for name, r_val in zip(self.rec_in_names, self.rec):
+            inputs[name] = r_val
+        if "downsample_ratio" in self.input_names:
+            inputs["downsample_ratio"] = self.downsample_ratio
+
+        outs = self.session.run(self.output_names, inputs)
+
+        # The matte is usually the first output
+        matte = outs[0]
+        # Recurrent states are all outputs after the first two (fgr, pha)
+        self.rec = outs[2:]  # Update recurrent states
+
+        return self._postprocess(matte, h, w)
+
+    def _preprocess(self, image):
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Normalize and add batch dimension
+        image_rgb = image_rgb / 255.0
+        image_norm = (image_rgb - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+        return np.expand_dims(image_norm.transpose(2, 0, 1), 0).astype("float32")
+
+    def _postprocess(self, matte, h, w):
+        # Resize matte to original image size and remove batch dimension
+        matte_tensor = torch.from_numpy(matte)
+        matte = F.interpolate(matte_tensor, size=(h, w), mode="bilinear", align_corners=False)
+        return matte.squeeze().numpy()
+
+
+class RMBGSegmenter(ONNXSegmenter):
+    """A wrapper for the RMBG (Remove Background) 2.0 ONNX model.
+
+    The published ONNX weights expect a fixed 1024×1024 RGB input. We therefore
+    resize each incoming frame to that resolution for inference and upscale the
+    resulting matte back to the original frame size so the rest of the pipeline
+    remains unchanged.
+    """
+
+    def __init__(self, model_path: str):
+        super().__init__(model_path)
+        self.input_size = (1024, 1024)  # (width, height)
+
+    def segment(self, image):
+        h, w, _ = image.shape
+        # Convert BGR → RGB and resize for the model
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_resized = cv2.resize(image_rgb, self.input_size, interpolation=cv2.INTER_AREA)
+
+        image_tensor = self.transform(image_resized).unsqueeze(0).numpy()
         matte = self.session.run([self.output_name], {self.input_name: image_tensor})[0]
 
         matte_tensor = torch.from_numpy(matte)
@@ -329,11 +451,15 @@ class ONNXSegmenter:
 
 def create_segmenter(model_path: str):
     """
-    Factory function to create the appropriate segmenter based on the model file extension.
+    Factory function to create the appropriate segmenter based on the model file extension or name.
     """
-    if model_path.endswith(".pth"):
+    if "rmbg" in model_path:
+        return RMBGSegmenter(model_path)
+    elif "rvm" in model_path:
+        return RVMSegmenter(model_path)
+    elif model_path.endswith(".pth"):
         return PyTorchSegmenter(model_path)
     elif model_path.endswith(".onnx"):
         return ONNXSegmenter(model_path)
     else:
-        raise ValueError(f"Unsupported model file extension: {model_path}")
+        raise ValueError(f"Unsupported model file: {model_path}")

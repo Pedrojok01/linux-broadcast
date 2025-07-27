@@ -1,7 +1,5 @@
 import unittest
-from pathlib import Path
 import numpy as np
-import torch
 
 from app.segment import create_segmenter, PyTorchSegmenter, ONNXSegmenter
 from scripts.download_model import download_models

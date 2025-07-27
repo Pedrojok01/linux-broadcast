@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 import cv2
 import numpy as np
 import logging
+import sys
 
 from app.camera import Camera
 from app.segment import create_segmenter
@@ -46,7 +47,9 @@ class VideoThread(QThread):
                 logging.error("Could not get frame from camera.")
                 return
             height, width, _ = frame.shape
-            vcam = VCam(width=width, height=height, device=self.virtual_device)
+            vcam = None
+            if self.virtual_device:
+                vcam = VCam(width=width, height=height, device=self.virtual_device)
         except Exception as e:
             logging.error(f"Error initializing video thread: {e}")
             return
@@ -56,7 +59,8 @@ class VideoThread(QThread):
             if frame is not None:
                 mask = segmenter.segment(frame)
                 output_frame = apply_background(frame, mask, background_image, blur=self.blur)
-                vcam.write_frame(output_frame)
+                if vcam:
+                    vcam.write_frame(output_frame)
                 self.change_pixmap_signal.emit(output_frame)
 
         camera.release()
@@ -69,7 +73,10 @@ class VideoThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Linux Virtual Background")
+        if sys.platform == "win32":
+            self.setWindowTitle("Virtual Background (Windows Preview)")
+        else:
+            self.setWindowTitle("Linux Virtual Background")
 
         self.settings = load_settings()
 
@@ -80,20 +87,31 @@ class MainWindow(QMainWindow):
         # Model Selection
         model_groupbox = QGroupBox("Model Selection")
         model_layout = QVBoxLayout()
-        self.pytorch_radio = QRadioButton("PyTorch")
-        self.onnx_radio = QRadioButton("ONNX")
+        self.pytorch_radio = QRadioButton("MODNet (PyTorch)")
+        self.onnx_radio = QRadioButton("MODNet (ONNX)")
+        self.rvm_radio = QRadioButton("RVM (ONNX)")
+        self.rmbg_radio = QRadioButton("RMBG-2.0 (ONNX)")
         model_layout.addWidget(self.pytorch_radio)
         model_layout.addWidget(self.onnx_radio)
+        model_layout.addWidget(self.rvm_radio)
+        model_layout.addWidget(self.rmbg_radio)
         model_groupbox.setLayout(model_layout)
         self.layout.addWidget(model_groupbox)
 
-        if self.settings.get("model", "pytorch") == "onnx":
+        model_setting = self.settings.get("model", "pytorch")
+        if model_setting == "onnx":
             self.onnx_radio.setChecked(True)
+        elif model_setting == "rvm":
+            self.rvm_radio.setChecked(True)
+        elif model_setting == "rmbg":
+            self.rmbg_radio.setChecked(True)
         else:
             self.pytorch_radio.setChecked(True)
 
         self.pytorch_radio.toggled.connect(self.save_current_settings)
         self.onnx_radio.toggled.connect(self.save_current_settings)
+        self.rvm_radio.toggled.connect(self.save_current_settings)
+        self.rmbg_radio.toggled.connect(self.save_current_settings)
 
         # Camera selection
         self.camera_selector = QComboBox()
@@ -140,7 +158,15 @@ class MainWindow(QMainWindow):
         self.video_thread = None
 
     def save_current_settings(self):
-        self.settings["model"] = "onnx" if self.onnx_radio.isChecked() else "pytorch"
+        if self.pytorch_radio.isChecked():
+            model = "pytorch"
+        elif self.onnx_radio.isChecked():
+            model = "onnx"
+        elif self.rvm_radio.isChecked():
+            model = "rvm"
+        else:
+            model = "rmbg"
+        self.settings["model"] = model
         if self.available_cameras:
             self.settings["camera_id"] = self.camera_selector.currentIndex()
         self.settings["background_path"] = self.background_path
@@ -170,17 +196,26 @@ class MainWindow(QMainWindow):
                 print("No cameras available to start.")
                 return
 
-            model_name = (
-                "modnet_webcam.onnx" if self.onnx_radio.isChecked() else "modnet_webcam.pth"
-            )
+            if self.pytorch_radio.isChecked():
+                model_name = "modnet_webcam.pth"
+            elif self.onnx_radio.isChecked():
+                model_name = "modnet_webcam.onnx"
+            elif self.rvm_radio.isChecked():
+                model_name = "rvm_mobilenetv3_fp16.onnx"
+            else:  # RMBG selected
+                model_name = "rmbg_2_0_fp16.onnx"
             model_path = f"models/{model_name}"
 
             selected_camera = self.available_cameras[self.camera_selector.currentIndex()]
+
+            # Platform-specific device: None on Windows, device path on Linux
+            virtual_device = "/dev/video10" if sys.platform != "win32" else None
+
             self.video_thread = VideoThread(
                 camera_id=selected_camera,
                 model_path=model_path,
                 background_path=self.background_path,
-                virtual_device="/dev/video10",
+                virtual_device=virtual_device,
                 blur=self.blur_checkbox.isChecked(),
             )
             self.video_thread.change_pixmap_signal.connect(self.update_image)
