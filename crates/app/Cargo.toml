@@ -1,0 +1,29 @@
+[package]
+name = "linux-broadcast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "NVIDIA Broadcast-style virtual webcam for Linux"
+
+[[bin]]
+name = "linux-broadcast"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+lb-pipeline = { path = "../pipeline" }
+
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+crossbeam-channel.workspace = true
+directories.workspace = true
+serde.workspace = true
+toml.workspace = true
+glob.workspace = true
+rfd.workspace = true

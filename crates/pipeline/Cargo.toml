@@ -1,0 +1,27 @@
+[package]
+name = "lb-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Webcam → segmentation → composite → v4l2loopback pipeline for linux-broadcast"
+
+[lib]
+name = "lb_pipeline"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+
+tract-onnx.workspace = true
+ndarray.workspace = true
+fast_image_resize.workspace = true
+wide.workspace = true
+
+crossbeam-channel.workspace = true
