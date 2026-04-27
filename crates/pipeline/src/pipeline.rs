@@ -54,30 +54,51 @@ impl Pipeline {
 
         let pipeline = gst::Pipeline::new();
 
-        // --- Source branch: v4l2src → videoconvert → caps RGBA → appsink ---
+        // --- Source branch: v4l2src → videoscale → videoconvert → appsink ---
+        // Let v4l2src negotiate whatever format the camera prefers (YUYV,
+        // MJPEG-decoded, NV12, …). videoscale + videoconvert then bridge
+        // the camera-native caps to our RGBA target. Constraining only at
+        // the appsink end avoids 30/1-vs-30000/1001 framerate-fraction
+        // mismatches that fail v4l2src negotiation.
         let src = gst::ElementFactory::make("v4l2src")
             .property("device", &cfg.source_device)
+            .property("do-timestamp", true)
             .build()?;
-        let src_convert = gst::ElementFactory::make("videoconvert").build()?;
         let src_scale = gst::ElementFactory::make("videoscale").build()?;
-        let src_caps = gst::Caps::builder("video/x-raw")
+        let src_convert = gst::ElementFactory::make("videoconvert").build()?;
+        // Caps between videoconvert and appsink: RGBA at our target size,
+        // framerate left open so the camera's native rate flows through.
+        let appsink_caps = gst::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("width", cfg.width as i32)
+            .field("height", cfg.height as i32)
+            .build();
+        let src_capsfilter = gst::ElementFactory::make("capsfilter")
+            .property("caps", &appsink_caps)
+            .build()?;
+        let appsink = gst_app::AppSink::builder()
+            .caps(&appsink_caps)
+            .max_buffers(2)
+            .drop(true)
+            .sync(false)
+            .enable_last_sample(false)
+            .build();
+        // Belt-and-braces: also set sync=false explicitly post-build, since
+        // some gstreamer-rs builder properties don't always round-trip.
+        appsink.set_sync(false);
+        // Caps emitted by appsrc — same RGBA frames, but with an *explicit*
+        // framerate so the downstream videoconvert can match input/output
+        // fps (otherwise gst_video_converter_new asserts fps_n equality).
+        let appsrc_caps = gst::Caps::builder("video/x-raw")
             .field("format", "RGBA")
             .field("width", cfg.width as i32)
             .field("height", cfg.height as i32)
             .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
             .build();
-        let src_capsfilter = gst::ElementFactory::make("capsfilter")
-            .property("caps", &src_caps)
-            .build()?;
-        let appsink = gst_app::AppSink::builder()
-            .caps(&src_caps)
-            .max_buffers(2)
-            .drop(true)
-            .build();
 
         // --- Sink branch: appsrc → videoconvert → v4l2sink ---
         let appsrc = gst_app::AppSrc::builder()
-            .caps(&src_caps)
+            .caps(&appsrc_caps)
             .format(gst::Format::Time)
             .is_live(true)
             .build();
@@ -94,12 +115,18 @@ impl Pipeline {
         let v4l2sink = gst::ElementFactory::make("v4l2sink")
             .property("device", &cfg.sink_device)
             .property("sync", false)
+            // async=false → don't block pipeline in PAUSED waiting for a
+            // preroll buffer from appsrc. Without this, the pipeline
+            // deadlocks: v4l2sink waits for preroll, appsrc can't push
+            // because new_sample never fires while we're in PAUSED, and
+            // new_sample is what's *supposed* to push the first buffer.
+            .property("async", false)
             .build()?;
 
         pipeline.add_many([
             &src,
-            &src_convert,
             &src_scale,
+            &src_convert,
             &src_capsfilter,
             appsink.upcast_ref(),
             appsrc.upcast_ref(),
@@ -107,7 +134,13 @@ impl Pipeline {
             &sink_capsfilter,
             &v4l2sink,
         ])?;
-        gst::Element::link_many([&src, &src_convert, &src_scale, &src_capsfilter, appsink.upcast_ref()])?;
+        gst::Element::link_many([
+            &src,
+            &src_scale,
+            &src_convert,
+            &src_capsfilter,
+            appsink.upcast_ref(),
+        ])?;
         gst::Element::link_many([appsrc.upcast_ref(), &sink_convert, &sink_capsfilter, &v4l2sink])?;
 
         // Shared state between the appsink callback, command receiver, and main thread.
@@ -151,6 +184,11 @@ impl Pipeline {
 
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
+                .new_preroll(|sink| {
+                    log::info!("new_preroll fired");
+                    let _ = sink.pull_preroll();
+                    Ok(gst::FlowSuccess::Ok)
+                })
                 .new_sample(move |sink| {
                     cmd_drain(&cmd_rx_for_cb);
 
@@ -207,6 +245,12 @@ impl Pipeline {
                         wmap.copy_from_slice(&frame_rgba);
                     }
                     frame_idx += 1;
+                    if frame_idx == 1 || frame_idx.is_multiple_of(fps as u64) {
+                        log::info!(
+                            "pushed frame #{} ({}x{} RGBA)",
+                            frame_idx, frame_w, frame_h
+                        );
+                    }
                     appsrc_clone.push_buffer(out).map_err(|_| gst::FlowError::Error)?;
 
                     Ok(gst::FlowSuccess::Ok)
@@ -214,9 +258,38 @@ impl Pipeline {
                 .build(),
         );
 
+        // Install a sync handler so element errors / warnings are visible
+        // immediately, not just when the main loop calls `iter_timed`.
+        if let Some(bus) = pipeline.bus() {
+            bus.set_sync_handler(|_, msg| {
+                match msg.view() {
+                    gst::MessageView::Error(err) => log::error!(
+                        "GST {} :: {} (debug: {})",
+                        err.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                        err.error(),
+                        err.debug().unwrap_or_default(),
+                    ),
+                    gst::MessageView::Warning(w) => log::warn!(
+                        "GST {} :: {}",
+                        w.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                        w.error(),
+                    ),
+                    _ => {}
+                }
+                gst::BusSyncReply::Pass
+            });
+        }
+
         pipeline
             .set_state(gst::State::Playing)
-            .context("set pipeline to Playing")?;
+            .map_err(|e| {
+                let bus_errs = drain_bus_errors(&pipeline);
+                if bus_errs.is_empty() {
+                    anyhow!("set pipeline to Playing: {e}")
+                } else {
+                    anyhow!("set pipeline to Playing: {e}\n{}", bus_errs.join("\n"))
+                }
+            })?;
 
         // Sanity log of negotiated caps.
         if let Some(pad) = appsink.static_pad("sink") {
@@ -274,4 +347,21 @@ impl Drop for Pipeline {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
+}
+
+fn drain_bus_errors(pipeline: &gst::Pipeline) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(bus) = pipeline.bus() {
+        while let Some(msg) = bus.pop() {
+            if let gst::MessageView::Error(err) = msg.view() {
+                out.push(format!(
+                    "  ↳ {} :: {} (debug: {})",
+                    err.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                    err.error(),
+                    err.debug().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    out
 }

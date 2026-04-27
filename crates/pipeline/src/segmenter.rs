@@ -1,56 +1,64 @@
-use anyhow::{anyhow, Context, Result};
-use fast_image_resize as fr;
-use std::num::NonZeroU32;
-use tract_onnx::prelude::*;
+use anyhow::{anyhow, Result};
+use fast_image_resize::{
+    self as fr,
+    images::{Image, ImageRef},
+    FilterType, ResizeAlg, ResizeOptions,
+};
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Value;
 
 use crate::{MODEL_H, MODEL_W};
 
-type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
-
-/// MediaPipe Selfie Segmentation (Landscape) running on tract.
+/// MediaPipe Selfie Segmentation running on `ort` (ONNX Runtime, CPU EP).
 ///
 /// Input:  RGBA frame `&[u8]` of arbitrary size.
 /// Output: `Vec<f32>` mask of length `MODEL_W * MODEL_H` in `[0.0, 1.0]`,
 ///         where 1.0 means "foreground (person)".
 ///
 /// Per <https://github.com/google-ai-edge/mediapipe/issues/6134>, the raw
-/// model output requires softmax across the channel axis to match the
-/// MediaPipe reference pipeline. We apply that here.
+/// model output requires sigmoid (single-channel variant) or softmax across
+/// the channel axis (2-channel variant) to match MediaPipe's reference
+/// pipeline. We apply that here.
 pub struct Segmenter {
-    model: OnnxModel,
+    session: Session,
+    input_name: String,
     resizer: fr::Resizer,
-    /// Reusable input buffer in NHWC f32 layout: [1, H, W, 3].
+    /// Reusable input buffer in NCHW f32 layout: [1, 3, H, W].
     input_buf: Vec<f32>,
-    /// Reusable RGB buffer at model resolution (H * W * 3 bytes).
-    rgb_resized: Vec<u8>,
-    /// Reusable RGBA buffer at model resolution (fr::Image source uses RGBA8).
+    /// Reusable RGBA buffer at model resolution.
     rgba_resized: Vec<u8>,
 }
 
 impl Segmenter {
     /// Load the model from raw ONNX bytes (suitable for `include_bytes!`).
     pub fn from_bytes(onnx: &[u8]) -> Result<Self> {
-        let mut cursor = std::io::Cursor::new(onnx);
-        let model = tract_onnx::onnx()
-            .model_for_read(&mut cursor)
-            .context("parse ONNX model")?
-            .with_input_fact(
-                0,
-                f32::fact([1, MODEL_H, MODEL_W, 3]).into(),
-            )
-            .context("set input fact")?
-            .into_optimized()
-            .context("optimize tract model")?
-            .into_runnable()
-            .context("make tract model runnable")?;
+        let session = Session::builder()
+            .map_err(|e| anyhow!("ort Session::builder: {e}"))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow!("set optimization level: {e}"))?
+            .with_intra_threads(num_threads())
+            .map_err(|e| anyhow!("set intra threads: {e}"))?
+            .commit_from_memory(onnx)
+            .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))?;
+
+        let input_name = session
+            .inputs()
+            .first()
+            .ok_or_else(|| anyhow!("model has no inputs"))?
+            .name()
+            .to_string();
 
         Ok(Self {
-            model,
-            resizer: fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear)),
+            session,
+            input_name,
+            resizer: fr::Resizer::new(),
             input_buf: vec![0.0_f32; MODEL_H * MODEL_W * 3],
-            rgb_resized: vec![0_u8; MODEL_H * MODEL_W * 3],
             rgba_resized: vec![0_u8; MODEL_H * MODEL_W * 4],
         })
+    }
+
+    fn resize_opts() -> ResizeOptions {
+        ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
     }
 
     /// Run inference on an RGBA frame. Returns the mask laid out row-major
@@ -70,73 +78,66 @@ impl Segmenter {
             ));
         }
 
-        // 1. Resize the input frame down to the model's native 256x144 RGBA.
-        let src = fr::Image::from_slice_u8(
-            NonZeroU32::new(width as u32).ok_or_else(|| anyhow!("width=0"))?,
-            NonZeroU32::new(height as u32).ok_or_else(|| anyhow!("height=0"))?,
-            // fr::Image needs &mut; we copy in for safety since the GStreamer
-            // buffer slice may not be writable. The cost is one memcpy of the
-            // input frame, dwarfed by inference.
-            // SAFETY: we immediately wrap in an immutable view via Image::from_slice_u8.
-            unsafe { std::slice::from_raw_parts_mut(rgba.as_ptr() as *mut u8, rgba.len()) },
-            fr::PixelType::U8x4,
-        )
-        .map_err(|e| anyhow!("source image: {e}"))?;
-
-        let mut dst = fr::Image::from_slice_u8(
-            NonZeroU32::new(MODEL_W as u32).unwrap(),
-            NonZeroU32::new(MODEL_H as u32).unwrap(),
+        // 1. Resize the input frame down to the model's native 256x256 RGBA.
+        let src = ImageRef::new(width as u32, height as u32, rgba, fr::PixelType::U8x4)
+            .map_err(|e| anyhow!("source image: {e}"))?;
+        let mut dst = Image::from_slice_u8(
+            MODEL_W as u32,
+            MODEL_H as u32,
             &mut self.rgba_resized,
             fr::PixelType::U8x4,
         )
         .map_err(|e| anyhow!("dst image: {e}"))?;
-
         self.resizer
-            .resize(&src.view(), &mut dst.view_mut())
+            .resize(&src, &mut dst, &Self::resize_opts())
             .map_err(|e| anyhow!("resize: {e}"))?;
 
-        // 2. Drop alpha and normalize to [0,1] f32 NHWC.
-        for i in 0..(MODEL_H * MODEL_W) {
+        // 2. Drop alpha and normalize to [0,1] f32 in NCHW layout (model is
+        //    [batch, 3, H, W]). R plane first, then G, then B.
+        let plane = MODEL_H * MODEL_W;
+        for i in 0..plane {
             let r = self.rgba_resized[i * 4] as f32 / 255.0;
             let g = self.rgba_resized[i * 4 + 1] as f32 / 255.0;
             let b = self.rgba_resized[i * 4 + 2] as f32 / 255.0;
-            self.input_buf[i * 3] = r;
-            self.input_buf[i * 3 + 1] = g;
-            self.input_buf[i * 3 + 2] = b;
+            self.input_buf[i] = r;
+            self.input_buf[plane + i] = g;
+            self.input_buf[2 * plane + i] = b;
         }
 
-        // 3. Inference.
-        let input_tensor: Tensor =
-            tract_ndarray::Array4::from_shape_vec((1, MODEL_H, MODEL_W, 3), self.input_buf.clone())?
-                .into();
-        let outputs = self
-            .model
-            .run(tvec!(input_tensor.into()))
-            .context("tract run")?;
+        // 3. Inference. Use the (shape, Vec<T>) form to avoid pulling in ort's
+        //    ndarray version.
+        let shape: [i64; 4] = [1, 3, MODEL_H as i64, MODEL_W as i64];
+        let input_value = Value::from_array((shape, self.input_buf.clone()))
+            .map_err(|e| anyhow!("ort Value from array: {e}"))?;
 
-        let raw = outputs
-            .into_iter()
+        let outputs = self
+            .session
+            .run(ort::inputs![&self.input_name => input_value])
+            .map_err(|e| anyhow!("ort session.run: {e}"))?;
+
+        // 4. Extract the (only) output. Apply sigmoid for [1,1,H,W] or softmax
+        //    across channels for [1,2,H,W].
+        let (out_name, out_value) = outputs
+            .iter()
             .next()
             .ok_or_else(|| anyhow!("model produced no outputs"))?;
-        let arr = raw.to_array_view::<f32>()?;
-
-        // 4. Convert to probability mask. The landscape model output shape is
-        // [1, H, W, 1] (single foreground channel). Apply sigmoid; if a future
-        // 2-channel variant is loaded, take softmax across the channel axis.
-        let shape = arr.shape();
+        let (shape, data) = out_value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("extract f32 output tensor: {e}"))?;
         let n_pixels = MODEL_H * MODEL_W;
         let mut mask = vec![0.0_f32; n_pixels];
-        match shape {
-            [1, h, w, 1] if *h == MODEL_H && *w == MODEL_W => {
-                for (i, &v) in arr.iter().enumerate() {
-                    mask[i] = sigmoid(v);
+        match &shape[..] {
+            [1, 1, h, w] if *h as usize == MODEL_H && *w as usize == MODEL_W => {
+                // Output is already in [0, 1] (final sigmoid is part of the
+                // ONNX graph for this variant). Just clamp for safety.
+                for (i, &v) in data.iter().enumerate() {
+                    mask[i] = v.clamp(0.0, 1.0);
                 }
             }
-            [1, h, w, 2] if *h == MODEL_H && *w == MODEL_W => {
-                let flat = arr.as_slice().unwrap();
+            [1, 2, h, w] if *h as usize == MODEL_H && *w as usize == MODEL_W => {
                 for i in 0..n_pixels {
-                    let bg = flat[i * 2];
-                    let fg = flat[i * 2 + 1];
+                    let bg = data[i];
+                    let fg = data[n_pixels + i];
                     let max = bg.max(fg);
                     let ebg = (bg - max).exp();
                     let efg = (fg - max).exp();
@@ -145,7 +146,8 @@ impl Segmenter {
             }
             other => {
                 return Err(anyhow!(
-                    "unexpected model output shape {:?}, expected [1,{},{},1|2]",
+                    "output {:?} shape {:?} unexpected; want [1,1|2,{},{}]",
+                    out_name,
                     other,
                     MODEL_H,
                     MODEL_W
@@ -156,7 +158,10 @@ impl Segmenter {
     }
 }
 
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+fn num_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(4)
+        .max(1)
 }

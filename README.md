@@ -14,9 +14,11 @@ Early. Phase 1 (headless vertical slice) is scaffolded but not yet smoke-tested 
 
 ```bash
 # 1. Build deps
-sudo apt install \
+sudo apt install -y \
+  build-essential pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  libxkbcommon-dev libwayland-dev libxcb1-dev \
+  libxkbcommon-dev libwayland-dev \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
   v4l2loopback-dkms \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 

@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Result};
-use fast_image_resize as fr;
-use std::num::NonZeroU32;
+use fast_image_resize::{
+    self as fr,
+    images::{Image, ImageRef},
+    FilterType, ResizeAlg, ResizeOptions,
+};
 
 use crate::{MODEL_H, MODEL_W};
 
@@ -28,12 +31,16 @@ pub struct Compositor {
 impl Compositor {
     pub fn new() -> Self {
         Self {
-            resizer: fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear)),
+            resizer: fr::Resizer::new(),
             upsampled_mask: Vec::new(),
             bg_scaled: Vec::new(),
             bg_w: 0,
             bg_h: 0,
         }
+    }
+
+    fn resize_opts() -> ResizeOptions {
+        ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
     }
 
     /// Composite an RGBA frame in place using the given mask and background.
@@ -118,22 +125,12 @@ impl Compositor {
             return Ok(());
         }
         self.bg_scaled.resize((fw as usize) * (fh as usize) * 4, 0);
-        let src = fr::Image::from_slice_u8(
-            NonZeroU32::new(bw).ok_or_else(|| anyhow!("bg width=0"))?,
-            NonZeroU32::new(bh).ok_or_else(|| anyhow!("bg height=0"))?,
-            unsafe { std::slice::from_raw_parts_mut(bg.as_ptr() as *mut u8, bg.len()) },
-            fr::PixelType::U8x4,
-        )
-        .map_err(|e| anyhow!("bg src: {e}"))?;
-        let mut dst = fr::Image::from_slice_u8(
-            NonZeroU32::new(fw).unwrap(),
-            NonZeroU32::new(fh).unwrap(),
-            &mut self.bg_scaled,
-            fr::PixelType::U8x4,
-        )
-        .map_err(|e| anyhow!("bg dst: {e}"))?;
+        let src = ImageRef::new(bw, bh, bg, fr::PixelType::U8x4)
+            .map_err(|e| anyhow!("bg src: {e}"))?;
+        let mut dst = Image::from_slice_u8(fw, fh, &mut self.bg_scaled, fr::PixelType::U8x4)
+            .map_err(|e| anyhow!("bg dst: {e}"))?;
         self.resizer
-            .resize(&src.view(), &mut dst.view_mut())
+            .resize(&src, &mut dst, &Self::resize_opts())
             .map_err(|e| anyhow!("bg resize: {e}"))?;
         self.bg_w = fw;
         self.bg_h = fh;

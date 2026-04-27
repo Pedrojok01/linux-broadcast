@@ -20,7 +20,7 @@ env_logger = "0.11"
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
-tract-onnx = "0.21"
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
 ndarray = "0.16"
 fast_image_resize = "5"
 wide = "0.7"

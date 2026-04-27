@@ -19,8 +19,7 @@ gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-video.workspace = true
 
-tract-onnx.workspace = true
-ndarray.workspace = true
+ort.workspace = true
 fast_image_resize.workspace = true
 wide.workspace = true
 

@@ -7,6 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 description = "NVIDIA Broadcast-style virtual webcam for Linux"
 
+default-run = "linux-broadcast"
+
 [[bin]]
 name = "linux-broadcast"
 path = "src/main.rs"
