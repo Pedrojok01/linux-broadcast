@@ -21,9 +21,35 @@ pub fn build() -> IconData {
 
     // Coordinates from the SVG (viewBox 0 0 64 64) scaled by SUPER.
     let s = SUPER as f32;
-    fill_rounded_rect(&mut buf, 6.0 * s, 6.0 * s, 52.0 * s, 52.0 * s, 10.0 * s, PANEL);
-    stroke_rounded_rect(&mut buf, 6.0 * s, 6.0 * s, 52.0 * s, 52.0 * s, 10.0 * s, 1.25 * s, STROKE);
-    stroke_rounded_rect(&mut buf, 18.0 * s, 18.0 * s, 28.0 * s, 28.0 * s, 5.0 * s, 2.25 * s, FRAME);
+    fill_rounded_rect(
+        &mut buf,
+        6.0 * s,
+        6.0 * s,
+        52.0 * s,
+        52.0 * s,
+        10.0 * s,
+        PANEL,
+    );
+    stroke_rounded_rect(
+        &mut buf,
+        6.0 * s,
+        6.0 * s,
+        52.0 * s,
+        52.0 * s,
+        10.0 * s,
+        1.25 * s,
+        STROKE,
+    );
+    stroke_rounded_rect(
+        &mut buf,
+        18.0 * s,
+        18.0 * s,
+        28.0 * s,
+        28.0 * s,
+        5.0 * s,
+        2.25 * s,
+        FRAME,
+    );
     fill_circle(&mut buf, 44.0 * s, 20.0 * s, 2.6 * s, ACCENT);
 
     let small = image::imageops::resize(&buf, FINAL, FINAL, image::imageops::FilterType::Lanczos3);
@@ -63,6 +89,7 @@ fn fill_rounded_rect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stroke_rounded_rect(
     buf: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     x: f32,

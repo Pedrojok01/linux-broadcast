@@ -19,7 +19,11 @@ pub enum Background {
     /// barely-visible 4 px (0.0) to a strong ~32 px (1.0).
     Blur { strength: f32 },
     /// Composite over a static RGBA image, scaled to cover the frame.
-    Image { rgba: Vec<u8>, width: u32, height: u32 },
+    Image {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl Background {
@@ -148,20 +152,13 @@ impl Compositor {
         Ok(())
     }
 
-    fn ensure_bg_scaled(
-        &mut self,
-        bg: &[u8],
-        bw: u32,
-        bh: u32,
-        fw: u32,
-        fh: u32,
-    ) -> Result<()> {
+    fn ensure_bg_scaled(&mut self, bg: &[u8], bw: u32, bh: u32, fw: u32, fh: u32) -> Result<()> {
         if self.bg_w == fw && self.bg_h == fh && !self.bg_scaled.is_empty() {
             return Ok(());
         }
         self.bg_scaled.resize((fw as usize) * (fh as usize) * 4, 0);
-        let src = ImageRef::new(bw, bh, bg, fr::PixelType::U8x4)
-            .map_err(|e| anyhow!("bg src: {e}"))?;
+        let src =
+            ImageRef::new(bw, bh, bg, fr::PixelType::U8x4).map_err(|e| anyhow!("bg src: {e}"))?;
         let mut dst = Image::from_slice_u8(fw, fh, &mut self.bg_scaled, fr::PixelType::U8x4)
             .map_err(|e| anyhow!("bg dst: {e}"))?;
         self.resizer
@@ -182,13 +179,7 @@ impl Default for Compositor {
 /// Box-blur approximation good enough for a "Broadcast-like" backdrop blur.
 /// Two passes of a separable box kernel approximate a Gaussian with σ ≈
 /// 1.5×radius. `strength` ∈ [0,1] maps to a radius from 4 to 32 px.
-fn composite_blur(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
-    mask: &[f32],
-    strength: f32,
-) {
+fn composite_blur(frame: &mut [u8], width: u32, height: u32, mask: &[f32], strength: f32) {
     let w = width as usize;
     let h = height as usize;
     // Map strength → kernel radius. Min 4 px so "0%" is still slightly soft;
@@ -213,17 +204,19 @@ fn composite_image(frame: &mut [u8], bg_scaled: &[u8], mask: &[f32]) {
 
 /// Plain alpha composite of `frame` over `bg` using `mask`.
 fn blend(frame: &mut [u8], bg: &[u8], mask: &[f32]) {
-    let n = frame.len() / 4;
-    for i in 0..n {
-        let m = mask[i].clamp(0.0, 1.0);
+    for ((px, bg_px), &m) in frame
+        .chunks_exact_mut(4)
+        .zip(bg.chunks_exact(4))
+        .zip(mask.iter())
+    {
+        let m = m.clamp(0.0, 1.0);
         let inv = 1.0 - m;
-        let o = i * 4;
         for c in 0..3 {
-            let fg = frame[o + c] as f32;
-            let bg_c = bg[o + c] as f32;
-            frame[o + c] = (fg * m + bg_c * inv) as u8;
+            let fg = px[c] as f32;
+            let bg_c = bg_px[c] as f32;
+            px[c] = (fg * m + bg_c * inv) as u8;
         }
-        frame[o + 3] = 255;
+        px[3] = 255;
     }
 }
 
@@ -275,8 +268,7 @@ fn blur_vertical(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
                 dst[y * w * 4 + x * 4 + c] = (sum / win) as u8;
                 let y_out = (y as isize - r as isize).clamp(0, h as isize - 1) as usize;
                 let y_in = (y as isize + r as isize + 1).clamp(0, h as isize - 1) as usize;
-                sum += src[y_in * w * 4 + x * 4 + c] as f32
-                    - src[y_out * w * 4 + x * 4 + c] as f32;
+                sum += src[y_in * w * 4 + x * 4 + c] as f32 - src[y_out * w * 4 + x * 4 + c] as f32;
             }
         }
         for y in 0..h {

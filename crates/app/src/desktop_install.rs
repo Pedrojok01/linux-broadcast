@@ -27,8 +27,7 @@ fn install_icon(data: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("mkdir -p {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
     let icon = crate::icon::build();
     let img: image::ImageBuffer<image::Rgba<u8>, _> =
         image::ImageBuffer::from_raw(icon.width, icon.height, icon.rgba.clone())
@@ -70,8 +69,7 @@ fn install_desktop_file(data: &Path) -> Result<()> {
             return Ok(());
         }
     }
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("mkdir -p {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
     std::fs::write(&path, want).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }

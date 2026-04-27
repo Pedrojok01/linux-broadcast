@@ -164,7 +164,12 @@ impl Pipeline {
             &src_capsfilter,
             appsink.upcast_ref(),
         ])?;
-        gst::Element::link_many([appsrc.upcast_ref(), &sink_convert, &sink_capsfilter, &v4l2sink])?;
+        gst::Element::link_many([
+            appsrc.upcast_ref(),
+            &sink_convert,
+            &sink_capsfilter,
+            &v4l2sink,
+        ])?;
 
         // Shared state between the appsink callback, command receiver, and main thread.
         let segmenter = Arc::new(Mutex::new(
@@ -257,11 +262,13 @@ impl Pipeline {
                         // mask composites cleaner.
                         smoother_cb.lock().unwrap().smooth(&mut mask.data);
 
-                        if let Err(e) = compositor_cb
-                            .lock()
-                            .unwrap()
-                            .composite(&mut frame_rgba, frame_w, frame_h, &mask, &bg)
-                        {
+                        if let Err(e) = compositor_cb.lock().unwrap().composite(
+                            &mut frame_rgba,
+                            frame_w,
+                            frame_h,
+                            &mask,
+                            &bg,
+                        ) {
                             log::error!("composite: {e:#}");
                             return Err(gst::FlowError::Error);
                         }
@@ -278,24 +285,18 @@ impl Pipeline {
                         .map_err(|_| gst::FlowError::Error)?;
                     {
                         let out_mut = out.get_mut().ok_or(gst::FlowError::Error)?;
-                        let pts = gst::ClockTime::from_nseconds(
-                            frame_idx * 1_000_000_000 / fps as u64,
-                        );
+                        let pts =
+                            gst::ClockTime::from_nseconds(frame_idx * 1_000_000_000 / fps as u64);
                         out_mut.set_pts(pts);
                         out_mut.set_duration(gst::ClockTime::from_nseconds(
                             1_000_000_000 / fps as u64,
                         ));
-                        let mut wmap = out_mut
-                            .map_writable()
-                            .map_err(|_| gst::FlowError::Error)?;
+                        let mut wmap = out_mut.map_writable().map_err(|_| gst::FlowError::Error)?;
                         wmap.copy_from_slice(&frame_rgba);
                     }
                     frame_idx += 1;
-                    if frame_idx == 1 || frame_idx.is_multiple_of(fps as u64) {
-                        log::info!(
-                            "pushed frame #{} ({}x{} RGBA)",
-                            frame_idx, frame_w, frame_h
-                        );
+                    if frame_idx == 1 || frame_idx % fps as u64 == 0 {
+                        log::info!("pushed frame #{} ({}x{} RGBA)", frame_idx, frame_w, frame_h);
                     }
                     if let Some(tx) = preview_tx_cb.as_ref() {
                         // try_send so we silently drop if the GUI hasn't
@@ -306,7 +307,9 @@ impl Pipeline {
                             rgba: frame_rgba.clone(),
                         });
                     }
-                    appsrc_clone.push_buffer(out).map_err(|_| gst::FlowError::Error)?;
+                    appsrc_clone
+                        .push_buffer(out)
+                        .map_err(|_| gst::FlowError::Error)?;
 
                     Ok(gst::FlowSuccess::Ok)
                 })
@@ -320,13 +323,17 @@ impl Pipeline {
                 match msg.view() {
                     gst::MessageView::Error(err) => log::error!(
                         "GST {} :: {} (debug: {})",
-                        err.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                        err.src()
+                            .map(|s| s.path_string().to_string())
+                            .unwrap_or_default(),
                         err.error(),
                         err.debug().unwrap_or_default(),
                     ),
                     gst::MessageView::Warning(w) => log::warn!(
                         "GST {} :: {}",
-                        w.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                        w.src()
+                            .map(|s| s.path_string().to_string())
+                            .unwrap_or_default(),
                         w.error(),
                     ),
                     _ => {}
@@ -335,21 +342,19 @@ impl Pipeline {
             });
         }
 
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| {
-                let bus_errs = drain_bus_errors(&pipeline);
-                if bus_errs.is_empty() {
-                    anyhow!("set pipeline to Playing: {e}")
-                } else {
-                    anyhow!("set pipeline to Playing: {e}\n{}", bus_errs.join("\n"))
-                }
-            })?;
+        pipeline.set_state(gst::State::Playing).map_err(|e| {
+            let bus_errs = drain_bus_errors(&pipeline);
+            if bus_errs.is_empty() {
+                anyhow!("set pipeline to Playing: {e}")
+            } else {
+                anyhow!("set pipeline to Playing: {e}\n{}", bus_errs.join("\n"))
+            }
+        })?;
 
         // Sanity log of negotiated caps.
         if let Some(pad) = appsink.static_pad("sink") {
             if let Some(caps) = pad.current_caps() {
-                if let Some(info) = gst_video::VideoInfo::from_caps(&caps).ok() {
+                if let Ok(info) = gst_video::VideoInfo::from_caps(&caps) {
                     log::info!(
                         "negotiated input: {}x{} @ {}/{} fps, format {:?}",
                         info.width(),
@@ -411,7 +416,9 @@ fn drain_bus_errors(pipeline: &gst::Pipeline) -> Vec<String> {
             if let gst::MessageView::Error(err) = msg.view() {
                 out.push(format!(
                     "  ↳ {} :: {} (debug: {})",
-                    err.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                    err.src()
+                        .map(|s| s.path_string().to_string())
+                        .unwrap_or_default(),
                     err.error(),
                     err.debug().unwrap_or_default(),
                 ));

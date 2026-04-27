@@ -86,8 +86,7 @@ pub fn remove(path: &Path) -> Result<()> {
             path.display()
         ));
     }
-    std::fs::remove_file(path)
-        .with_context(|| format!("rm {}", path.display()))?;
+    std::fs::remove_file(path).with_context(|| format!("rm {}", path.display()))?;
     Ok(())
 }
 

@@ -24,7 +24,12 @@ pub fn run_headless() -> Result<()> {
         pcfg.height,
         pcfg.framerate,
     );
-    let pipeline = Pipeline::start(pcfg, MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX)?;
+    let pipeline = Pipeline::start(
+        pcfg,
+        MODEL_BINARY_ONNX,
+        MODEL_MULTICLASS_ONNX,
+        MODEL_RVM_ONNX,
+    )?;
     pipeline.run_until_done()?;
     Ok(())
 }
@@ -54,10 +59,7 @@ pub fn run_gui() -> Result<()> {
     .map_err(|e| anyhow!("eframe: {e}"))
 }
 
-fn pipeline_config_from(
-    cfg: &Config,
-    preview_tx: Option<Sender<PreviewFrame>>,
-) -> PipelineConfig {
+fn pipeline_config_from(cfg: &Config, preview_tx: Option<Sender<PreviewFrame>>) -> PipelineConfig {
     PipelineConfig {
         source_device: cfg.source_device.clone(),
         sink_device: cfg.sink_device.clone(),
@@ -157,7 +159,12 @@ impl App {
         }
         let (tx, rx) = crossbeam_channel::bounded::<PreviewFrame>(2);
         let pcfg = pipeline_config_from(&self.cfg, Some(tx));
-        match Pipeline::start(pcfg, MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX) {
+        match Pipeline::start(
+            pcfg,
+            MODEL_BINARY_ONNX,
+            MODEL_MULTICLASS_ONNX,
+            MODEL_RVM_ONNX,
+        ) {
             Ok(p) => {
                 self.cmd_tx = Some(p.cmd_sender());
                 self.pipeline = Some(p);
@@ -285,63 +292,49 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.add_space(0.0);
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_space(space::LG);
+                    // Brand mark — frame-within-a-frame logo
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    // outer rounded square
+                    p.rect(
+                        rect.shrink(2.0),
+                        Rounding::same(7.0),
+                        color::PANEL_INSET,
+                        Stroke::new(1.25, color::STROKE_STRONG),
+                    );
+                    // inner square
+                    p.rect_stroke(
+                        egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0)),
+                        Rounding::same(3.5),
+                        Stroke::new(2.0, color::TEXT),
+                    );
+                    // accent dot
+                    p.circle_filled(rect.right_top() + egui::vec2(-7.0, 7.0), 2.4, color::ACCENT);
+
+                    ui.add_space(space::MD);
+                    ui.label(
+                        egui::RichText::new("LinuxBroadcast")
+                            .strong()
+                            .size(14.0)
+                            .color(color::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new("· virtual webcam")
+                            .size(13.0)
+                            .color(color::TEXT_WEAK),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(space::LG);
-                        // Brand mark — frame-within-a-frame logo
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                        let p = ui.painter();
-                        // outer rounded square
-                        p.rect(
-                            rect.shrink(2.0),
-                            Rounding::same(7.0),
-                            color::PANEL_INSET,
-                            Stroke::new(1.25, color::STROKE_STRONG),
-                        );
-                        // inner square
-                        p.rect_stroke(
-                            egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0)),
-                            Rounding::same(3.5),
-                            Stroke::new(2.0, color::TEXT),
-                        );
-                        // accent dot
-                        p.circle_filled(
-                            rect.right_top() + egui::vec2(-7.0, 7.0),
-                            2.4,
-                            color::ACCENT,
-                        );
-
-                        ui.add_space(space::MD);
-                        ui.label(
-                            egui::RichText::new("LinuxBroadcast")
-                                .strong()
-                                .size(14.0)
-                                .color(color::TEXT),
-                        );
-                        ui.label(
-                            egui::RichText::new("· virtual webcam")
-                                .size(13.0)
-                                .color(color::TEXT_WEAK),
-                        );
-
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(space::LG);
-                                if let Some(err) = &self.error {
-                                    let err = err.clone();
-                                    ui.label(
-                                        egui::RichText::new(err)
-                                            .small()
-                                            .color(color::DANGER),
-                                    );
-                                }
-                            },
-                        );
-                    },
-                );
+                        if let Some(err) = &self.error {
+                            let err = err.clone();
+                            ui.label(egui::RichText::new(err).small().color(color::DANGER));
+                        }
+                    });
+                });
             });
     }
 
@@ -354,58 +347,44 @@ impl App {
                     .stroke(Stroke::new(1.0, color::STROKE)),
             )
             .show(ctx, |ui| {
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(space::LG);
-                        if self.running() {
-                            ui.label(egui::RichText::new("●").color(color::SUCCESS).small());
-                            ui.add_space(space::XS);
-                            ui.label(
-                                egui::RichText::new("Running")
-                                    .small()
-                                    .color(color::SUCCESS),
-                            );
-                        } else {
-                            ui.label(egui::RichText::new("●").color(color::TEXT_MUTED).small());
-                            ui.add_space(space::XS);
-                            ui.label(
-                                egui::RichText::new("Idle")
-                                    .small()
-                                    .color(color::TEXT_MUTED),
-                            );
-                        }
-                        ui.add_space(space::MD);
-                        sep(ui);
-                        ui.add_space(space::MD);
-                        ui.label(
-                            egui::RichText::new(format!("in  {}", self.cfg.source_device))
-                                .monospace()
-                                .small()
-                                .color(color::TEXT_MUTED),
-                        );
-                        ui.add_space(space::MD);
-                        ui.label(
-                            egui::RichText::new(format!("→ {}", self.cfg.sink_device))
-                                .monospace()
-                                .small()
-                                .color(color::TEXT_MUTED),
-                        );
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_space(space::LG);
+                    if self.running() {
+                        ui.label(egui::RichText::new("●").color(color::SUCCESS).small());
+                        ui.add_space(space::XS);
+                        ui.label(egui::RichText::new("Running").small().color(color::SUCCESS));
+                    } else {
+                        ui.label(egui::RichText::new("●").color(color::TEXT_MUTED).small());
+                        ui.add_space(space::XS);
+                        ui.label(egui::RichText::new("Idle").small().color(color::TEXT_MUTED));
+                    }
+                    ui.add_space(space::MD);
+                    sep(ui);
+                    ui.add_space(space::MD);
+                    ui.label(
+                        egui::RichText::new(format!("in  {}", self.cfg.source_device))
+                            .monospace()
+                            .small()
+                            .color(color::TEXT_MUTED),
+                    );
+                    ui.add_space(space::MD);
+                    ui.label(
+                        egui::RichText::new(format!("→ {}", self.cfg.sink_device))
+                            .monospace()
+                            .small()
+                            .color(color::TEXT_MUTED),
+                    );
 
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(space::LG);
-                                ui.label(
-                                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                        .monospace()
-                                        .small()
-                                        .color(color::TEXT_MUTED),
-                                );
-                            },
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(space::LG);
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .monospace()
+                                .small()
+                                .color(color::TEXT_MUTED),
                         );
-                    },
-                );
+                    });
+                });
             });
     }
 
@@ -428,12 +407,9 @@ impl App {
                 self.sidebar_scene(ui);
 
                 // Push primary action to the bottom.
-                ui.with_layout(
-                    egui::Layout::bottom_up(egui::Align::Center),
-                    |ui| {
-                        self.primary_action(ui);
-                    },
-                );
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    self.primary_action(ui);
+                });
             });
     }
 
@@ -455,29 +431,26 @@ impl App {
                             .strong()
                             .color(color::TEXT_WEAK),
                     );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            pill(
-                                ui,
-                                &format!("→ {}", self.cfg.sink_device),
-                                color::TEXT_WEAK,
-                                None,
-                            );
-                            pill(
-                                ui,
-                                &format!(
-                                    "{}×{} · {} fps",
-                                    self.cfg.width, self.cfg.height, self.cfg.framerate
-                                ),
-                                color::TEXT_WEAK,
-                                None,
-                            );
-                            if self.running() {
-                                pill(ui, "LIVE", color::TEXT, Some(color::DANGER));
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        pill(
+                            ui,
+                            &format!("→ {}", self.cfg.sink_device),
+                            color::TEXT_WEAK,
+                            None,
+                        );
+                        pill(
+                            ui,
+                            &format!(
+                                "{}×{} · {} fps",
+                                self.cfg.width, self.cfg.height, self.cfg.framerate
+                            ),
+                            color::TEXT_WEAK,
+                            None,
+                        );
+                        if self.running() {
+                            pill(ui, "LIVE", color::TEXT, Some(color::DANGER));
+                        }
+                    });
                 });
 
                 // Preview surface
@@ -489,7 +462,11 @@ impl App {
                     Rounding::same(radius::LG),
                     color::PANEL_INSET, // letterbox
                 );
-                p.rect_stroke(rect, Rounding::same(radius::LG), Stroke::new(1.0, color::STROKE));
+                p.rect_stroke(
+                    rect,
+                    Rounding::same(radius::LG),
+                    Stroke::new(1.0, color::STROKE),
+                );
 
                 if let Some(tex) = &self.preview_tex {
                     let [tw, th] = self.last_preview_size.unwrap_or([1280, 720]);
@@ -500,10 +477,7 @@ impl App {
                         h = rect.height();
                         w = h * aspect;
                     }
-                    let centered = egui::Rect::from_center_size(
-                        rect.center(),
-                        egui::vec2(w, h),
-                    );
+                    let centered = egui::Rect::from_center_size(rect.center(), egui::vec2(w, h));
                     let mut mesh = egui::Mesh::with_texture(tex.id());
                     mesh.add_rect_with_uv(
                         centered,
@@ -534,36 +508,29 @@ impl App {
                         rect.right_bottom() + egui::vec2(-pad, -pad),
                     );
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
-                        ui.with_layout(
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                floating_pill(
-                                    ui,
-                                    &format!("● Sending to {}", self.cfg.sink_device),
-                                    color::DANGER,
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let mirror_label = if self.cfg.mirror {
-                                            "↔ Mirror ON"
-                                        } else {
-                                            "↔ Mirror"
-                                        };
-                                        if floating_pill_button(
-                                            ui,
-                                            mirror_label,
-                                            self.cfg.mirror,
-                                        )
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            floating_pill(
+                                ui,
+                                &format!("● Sending to {}", self.cfg.sink_device),
+                                color::DANGER,
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let mirror_label = if self.cfg.mirror {
+                                        "↔ Mirror ON"
+                                    } else {
+                                        "↔ Mirror"
+                                    };
+                                    if floating_pill_button(ui, mirror_label, self.cfg.mirror)
                                         .clicked()
-                                        {
-                                            self.cfg.mirror = !self.cfg.mirror;
-                                            self.save_settings();
-                                        }
-                                    },
-                                );
-                            },
-                        );
+                                    {
+                                        self.cfg.mirror = !self.cfg.mirror;
+                                        self.save_settings();
+                                    }
+                                },
+                            );
+                        });
                     });
                 }
             });
@@ -652,18 +619,24 @@ impl App {
             ui.memory_mut(|m| m.toggle_popup(popup_id));
         }
         let mut camera_changed = false;
-        egui::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-            ui.set_min_width(rect.width());
-            ui.set_max_height(280.0);
-            for cam in &self.cameras {
-                let selected = cam.path == self.cfg.source_device;
-                let resp = ui.selectable_label(selected, &cam.label);
-                if resp.clicked() && !selected {
-                    self.cfg.source_device = cam.path.clone();
-                    camera_changed = true;
+        egui::popup_below_widget(
+            ui,
+            popup_id,
+            &resp,
+            egui::PopupCloseBehavior::CloseOnClick,
+            |ui| {
+                ui.set_min_width(rect.width());
+                ui.set_max_height(280.0);
+                for cam in &self.cameras {
+                    let selected = cam.path == self.cfg.source_device;
+                    let resp = ui.selectable_label(selected, &cam.label);
+                    if resp.clicked() && !selected {
+                        self.cfg.source_device = cam.path.clone();
+                        camera_changed = true;
+                    }
                 }
-            }
-        });
+            },
+        );
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -726,10 +699,8 @@ impl App {
                 ("Replace", Mode::Replace),
             ] {
                 let active = self.cfg.mode == mode;
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(cell_w, 30.0),
-                    egui::Sense::click(),
-                );
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(cell_w, 30.0), egui::Sense::click());
                 let p = ui.painter();
                 let bg = if active {
                     color::PANEL_ALT
@@ -776,20 +747,17 @@ impl App {
                         .small()
                         .color(color::TEXT_WEAK),
                 );
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}%",
-                                (self.cfg.blur_strength * 100.0).round() as i32
-                            ))
-                            .monospace()
-                            .small()
-                            .color(color::TEXT),
-                        );
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}%",
+                            (self.cfg.blur_strength * 100.0).round() as i32
+                        ))
+                        .monospace()
+                        .small()
+                        .color(color::TEXT),
+                    );
+                });
             });
             // slim track + accent fill
             let (track_rect, resp) = ui.allocate_exact_size(
@@ -917,6 +885,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_library_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -1077,7 +1046,11 @@ impl App {
         // tally / start dot
         let dot = rect.left_center() + egui::vec2(16.0, 0.0);
         p.circle_filled(dot, 4.0, stroke_color);
-        p.circle_stroke(dot, 7.0, Stroke::new(1.0, stroke_color.linear_multiply(0.35)));
+        p.circle_stroke(
+            dot,
+            7.0,
+            Stroke::new(1.0, stroke_color.linear_multiply(0.35)),
+        );
         p.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -1202,7 +1175,11 @@ fn floating_pill_button(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Re
         egui::Align2::CENTER_CENTER,
         text,
         font,
-        if active { color::ACCENT } else { color::TEXT_WEAK },
+        if active {
+            color::ACCENT
+        } else {
+            color::TEXT_WEAK
+        },
     );
     resp
 }
@@ -1236,8 +1213,11 @@ fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 fn sep(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
-    ui.painter()
-        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0, color::STROKE_STRONG));
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        Stroke::new(1.0, color::STROKE_STRONG),
+    );
 }
 
 fn truncate(s: &str, max: usize) -> String {

@@ -35,11 +35,7 @@ impl Model {
             Model::Rvm => ModelKind::Rvm,
         }
     }
-    pub const ALL: &'static [Model] = &[
-        Model::SelfieBinary,
-        Model::SelfieMulticlass,
-        Model::Rvm,
-    ];
+    pub const ALL: &'static [Model] = &[Model::SelfieBinary, Model::SelfieMulticlass, Model::Rvm];
 }
 
 const QUALIFIER: &str = "io";
@@ -114,8 +110,8 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let s = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let s =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&s).with_context(|| format!("parse {}", path.display()))
     }
 

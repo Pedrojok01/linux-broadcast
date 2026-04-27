@@ -10,8 +10,7 @@ use anyhow::Result;
 
 /// Bundled MediaPipe Selfie Segmentation ONNX (binary, ~450 KB).
 /// Sourced from `onnx-community/mediapipe_selfie_segmentation` on Hugging Face.
-pub(crate) const MODEL_BINARY_ONNX: &[u8] =
-    include_bytes!("../../../models/selfie_segmenter.onnx");
+pub(crate) const MODEL_BINARY_ONNX: &[u8] = include_bytes!("../../../models/selfie_segmenter.onnx");
 
 /// Bundled MediaPipe Selfie Multiclass ONNX (6 classes: bg/hair/body/face/clothes/other,
 /// ~16 MB). Converted via tf2onnx from the official MediaPipe TFLite.

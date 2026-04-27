@@ -1,8 +1,8 @@
 //! Design tokens (colors, spacing, radii, control sizes) applied to egui.
 
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Rounding, Stroke,
-    Style, TextStyle, Visuals,
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Rounding, Stroke, Style,
+    TextStyle, Visuals,
 };
 
 const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Variable.ttf");
@@ -82,11 +82,23 @@ fn install_style(ctx: &egui::Context) {
     let mut style: Style = (*ctx.style()).clone();
 
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(20.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(20.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(11.0, FontFamily::Monospace)),
+        (
+            TextStyle::Button,
+            FontId::new(13.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(11.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(11.0, FontFamily::Monospace),
+        ),
     ]
     .into();
 

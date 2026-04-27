@@ -142,12 +142,7 @@ fn resize_to_model(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize
 //  Binary (MediaPipe Selfie Segmentation, single channel, NCHW 256×256)
 // -----------------------------------------------------------------------
 
-fn segment_binary(
-    inner: &mut MpInner,
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-) -> Result<Mask> {
+fn segment_binary(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize) -> Result<Mask> {
     resize_to_model(inner, rgba, width, height)?;
 
     let plane = MODEL_H * MODEL_W;
@@ -210,7 +205,7 @@ fn segment_multiclass(
     let plane = MODEL_H * MODEL_W;
     for i in 0..plane {
         let o = i * 3;
-        inner.input_buf[o]     = inner.rgba_resized[i * 4]     as f32 / 255.0;
+        inner.input_buf[o] = inner.rgba_resized[i * 4] as f32 / 255.0;
         inner.input_buf[o + 1] = inner.rgba_resized[i * 4 + 1] as f32 / 255.0;
         inner.input_buf[o + 2] = inner.rgba_resized[i * 4 + 2] as f32 / 255.0;
     }
@@ -231,9 +226,7 @@ fn segment_multiclass(
     let mut mask = vec![0.0_f32; n];
     match &out_shape[..] {
         [1, h, w, 6] if *h as usize == MODEL_H && *w as usize == MODEL_W => {
-            for i in 0..n {
-                let o = i * 6;
-                let logits = &data[o..o + 6];
+            for (out, logits) in mask.iter_mut().zip(data.chunks_exact(6)) {
                 let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
                 let mut sum = 0.0_f32;
                 let mut exp_bg = 0.0_f32;
@@ -244,7 +237,7 @@ fn segment_multiclass(
                     }
                     sum += e;
                 }
-                mask[i] = (1.0 - exp_bg / sum).clamp(0.0, 1.0);
+                *out = (1.0 - exp_bg / sum).clamp(0.0, 1.0);
             }
         }
         other => {
@@ -379,9 +372,10 @@ impl RvmInner {
             .map_err(|e| anyhow!("extract pha: {e}"))?;
 
         let mask = match &pha_shape[..] {
-            [1, 1, h, w] if *h as usize == height && *w as usize == width => {
-                pha_data.iter().map(|v| v.clamp(0.0, 1.0)).collect::<Vec<f32>>()
-            }
+            [1, 1, h, w] if *h as usize == height && *w as usize == width => pha_data
+                .iter()
+                .map(|v| v.clamp(0.0, 1.0))
+                .collect::<Vec<f32>>(),
             other => {
                 return Err(anyhow!(
                     "unexpected rvm pha shape {:?}, want [1,1,{},{}]",
@@ -416,6 +410,5 @@ fn num_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
-        .min(4)
-        .max(1)
+        .clamp(1, 4)
 }
