@@ -15,6 +15,9 @@ pub enum Model {
     /// MediaPipe Selfie Multiclass (~16 MB) — segments hair / face / body /
     /// clothes / others separately, gives sharper edges.
     SelfieMulticlass,
+    /// Robust Video Matting (MobileNetV3, ~15 MB) — recurrent, frame-rate
+    /// alpha matte. Best edges; slowest.
+    Rvm,
 }
 
 impl Model {
@@ -22,15 +25,21 @@ impl Model {
         match self {
             Model::SelfieBinary => "Selfie (binary, fast)",
             Model::SelfieMulticlass => "Selfie multiclass (sharper)",
+            Model::Rvm => "RVM (best edges, slower)",
         }
     }
     pub fn into_kind(self) -> ModelKind {
         match self {
             Model::SelfieBinary => ModelKind::SelfieBinary,
             Model::SelfieMulticlass => ModelKind::SelfieMulticlass,
+            Model::Rvm => ModelKind::Rvm,
         }
     }
-    pub const ALL: &'static [Model] = &[Model::SelfieBinary, Model::SelfieMulticlass];
+    pub const ALL: &'static [Model] = &[
+        Model::SelfieBinary,
+        Model::SelfieMulticlass,
+        Model::Rvm,
+    ];
 }
 
 const QUALIFIER: &str = "io";

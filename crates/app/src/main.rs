@@ -18,6 +18,10 @@ pub(crate) const MODEL_BINARY_ONNX: &[u8] =
 pub(crate) const MODEL_MULTICLASS_ONNX: &[u8] =
     include_bytes!("../../../models/selfie_multiclass.onnx");
 
+/// Bundled Robust Video Matting ONNX (MobileNetV3 backbone, fp32, ~15 MB).
+/// Sourced from PeterL1n/RobustVideoMatting v1.0.0 release.
+pub(crate) const MODEL_RVM_ONNX: &[u8] = include_bytes!("../../../models/rvm.onnx");
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 

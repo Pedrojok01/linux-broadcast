@@ -71,6 +71,7 @@ impl Pipeline {
         cfg: PipelineConfig,
         binary_onnx: &'static [u8],
         multiclass_onnx: &'static [u8],
+        rvm_onnx: &'static [u8],
     ) -> Result<Self> {
         gst::init().context("gst::init")?;
 
@@ -172,6 +173,7 @@ impl Pipeline {
                 match cfg.model {
                     ModelKind::SelfieBinary => binary_onnx,
                     ModelKind::SelfieMulticlass => multiclass_onnx,
+                    ModelKind::Rvm => rvm_onnx,
                 },
             )
             .context("load segmentation model")?,
@@ -253,7 +255,7 @@ impl Pipeline {
                         // (smoothstep, feather, light wrap) was tried and
                         // hurt perceptual quality on this model — the raw
                         // mask composites cleaner.
-                        smoother_cb.lock().unwrap().smooth(&mut mask);
+                        smoother_cb.lock().unwrap().smooth(&mut mask.data);
 
                         if let Err(e) = compositor_cb
                             .lock()
@@ -264,9 +266,11 @@ impl Pipeline {
                             return Err(gst::FlowError::Error);
                         }
                     } else {
-                        // Reset the temporal smoother so the next non-None
-                        // frame starts clean, not anchored to a stale mask.
+                        // Reset both the temporal smoother and any segmenter
+                        // recurrent state (RVM keeps inter-frame state) so
+                        // the next non-None frame starts clean.
                         smoother_cb.lock().unwrap().reset();
+                        segmenter_cb.lock().unwrap().reset();
                     }
 
                     // Push out.

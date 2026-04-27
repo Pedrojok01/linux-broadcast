@@ -10,7 +10,7 @@ use crate::backgrounds::{self, LibraryEntry};
 use crate::cameras::{enumerate, CameraEntry};
 use crate::config::{Config, Mode, Model};
 use crate::theme::{self, color, control, radius, space};
-use crate::{MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX};
+use crate::{MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX};
 
 /// Headless mode (no GUI) — same blocking behaviour as the v1 CLI binary.
 pub fn run_headless() -> Result<()> {
@@ -24,7 +24,7 @@ pub fn run_headless() -> Result<()> {
         pcfg.height,
         pcfg.framerate,
     );
-    let pipeline = Pipeline::start(pcfg, MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX)?;
+    let pipeline = Pipeline::start(pcfg, MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX)?;
     pipeline.run_until_done()?;
     Ok(())
 }
@@ -157,7 +157,7 @@ impl App {
         }
         let (tx, rx) = crossbeam_channel::bounded::<PreviewFrame>(2);
         let pcfg = pipeline_config_from(&self.cfg, Some(tx));
-        match Pipeline::start(pcfg, MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX) {
+        match Pipeline::start(pcfg, MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX) {
             Ok(p) => {
                 self.cmd_tx = Some(p.cmd_sender());
                 self.pipeline = Some(p);

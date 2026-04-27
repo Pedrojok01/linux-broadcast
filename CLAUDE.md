@@ -72,7 +72,8 @@ v4l2src device=$SOURCE
                         ▼
    Segmenter (ort) — one of:
      ├─ ModelKind::SelfieBinary     (256×256 NCHW, prob output)
-     └─ ModelKind::SelfieMulticlass (256×256 NHWC, 6-class logits)
+     ├─ ModelKind::SelfieMulticlass (256×256 NHWC, 6-class logits)
+     └─ ModelKind::Rvm              (frame-resolution, recurrent state)
                         │
                         ▼
    MaskSmoother (EMA α=0.7 across frames)
@@ -107,18 +108,20 @@ The callback also drains a `crossbeam-channel` of `Command`s from the GUI so liv
 
 ### Models
 
-Two ONNX files, both bundled at compile time via `include_bytes!` in `crates/app/src/main.rs`:
+Three ONNX files, all bundled at compile time via `include_bytes!` in `crates/app/src/main.rs`:
 
 - **`models/selfie_segmenter.onnx`** (~450 KB). Sourced from `onnx-community/mediapipe_selfie_segmentation` on Hugging Face — pre-converted, no `tf2onnx` step needed. Input `[batch, 3, 256, 256]` NCHW, output `[batch, 1, 256, 256]` NCHW. The single-channel output is **already a probability** (final sigmoid baked into the graph) — `Segmenter::segment` clamps to `[0,1]` and forwards it. *Applying a second sigmoid was an early bug that clamped masks to `[0.5, 0.731]` and made the blur invisible — leaving this note here as a caution.*
 - **`models/selfie_multiclass.onnx`** (~16 MB). Converted locally from MediaPipe's `selfie_multiclass_256x256.tflite` via `tf2onnx` (one-time, executed via `uvx`/`uv run`; no permanent Python deps). Input `[1, 256, 256, 3]` NHWC, output `[1, 256, 256, 6]` NHWC of raw logits. Six classes: `0` background, `1` hair, `2` body-skin, `3` face-skin, `4` clothes, `5` others. Foreground = `1 - softmax(logits)[0]` per pixel. Edge quality is noticeably better than the binary model on tricky scenes (similar luminance, hair detail).
+- **`models/rvm.onnx`** (~15 MB). Robust Video Matting (MobileNetV3 backbone, fp32) from PeterL1n/RobustVideoMatting v1.0.0. Recurrent video matting: 6 inputs (`src` plus 4 recurrent state tensors `r1i…r4i` plus a `downsample_ratio` scalar), 6 outputs (`fgr`, `pha`, and the 4 next-frame states `r1o…r4o`). We use only `pha` as the mask; `fgr` is discarded. The output mask is at the *frame* resolution — the compositor's `prepare_mask` skips upsampling when the mask already matches the frame. Internal compute is scaled by `RVM_DOWNSAMPLE_RATIO = 0.4` (in `segmenter.rs`) which keeps compute around 480×270 internally on a 720p frame, ~30–40 ms/frame on a single x86 core. The recurrent state is held on the segmenter and reset by `Segmenter::reset()` whenever the user switches to `Background::None` or changes input dimensions, so re-engaging starts clean.
+
+`Mask` is a public type carrying `(data, width, height)` so each model can declare its native mask resolution. The MediaPipe variants emit 256×256, RVM emits frame-resolution. The Compositor handles either.
 
 The active model is chosen via `lb_pipeline::ModelKind` (re-exported as the GUI's serde-friendly `config::Model`). The GUI dropdown drives a Stop+Start cycle on change.
 
-#### Re-running the multiclass conversion
-
-If you ever need to regenerate the multiclass ONNX:
+#### Re-fetching the bundled models
 
 ```bash
+# Multiclass (TFLite → ONNX, one-time conversion via uv-managed Python).
 curl -L -o /tmp/selfie_multiclass.tflite \
   https://huggingface.co/yolain/selfie_multiclass_256x256/resolve/main/selfie_multiclass_256x256.tflite
 uv run --python 3.10 --with "tf2onnx==1.16.1" --with "tensorflow==2.14.0" --with "numpy<2" \
@@ -126,12 +129,16 @@ uv run --python 3.10 --with "tf2onnx==1.16.1" --with "tensorflow==2.14.0" --with
     --tflite /tmp/selfie_multiclass.tflite \
     --output models/selfie_multiclass.onnx \
     --opset 18
+
+# RVM (already ONNX from upstream).
+curl -L -o models/rvm.onnx \
+  https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx
 ```
 
 ### Files at a glance
 
 Pipeline (`crates/pipeline/src/`):
-- `segmenter.rs` — `Segmenter` enum dispatching to a binary or multiclass `ort::Session`. Shared resize-to-model step; per-variant pre/post (NCHW vs NHWC, sigmoid vs softmax).
+- `segmenter.rs` — `Segmenter` enum dispatching to a binary, multiclass, or RVM `ort::Session`. MediaPipe variants share a resize-to-256×256 step and differ on layout (NCHW vs NHWC) and post (clamp vs softmax). RVM holds 4 recurrent state tensors across calls and exposes `reset()` for clean re-engagement.
 - `compositor.rs` — bilinear mask upsample, two-pass separable box blur (radius 4–32 px from `Background::Blur { strength }`), plain alpha composite via `blend()`.
 - `temporal.rs` — `MaskSmoother` (EMA across frames). Note: experimental `sharpen_mask` / `feather_mask` / `light_wrap` were tried and reverted — the raw mask composites cleaner perceptually.
 - `pipeline.rs` — GStreamer graph + appsink callback + bus sync handler + `Command` channel.
@@ -171,7 +178,7 @@ Design assets:
 
 - **Phase 0** ✅ — Python preserved on `legacy-python`, `main` wiped.
 - **Phase 1** ✅ — vertical slice live: 30 fps at 1280×720, blur + image backgrounds, headless mode.
-- **Phase 2** ✅ — `egui` GUI: camera dropdown, model picker (binary / multiclass), mode tabs, blur-intensity slider, saved-background library, live preview pane, themed to the design tokens.
+- **Phase 2** ✅ — `egui` GUI: camera dropdown, model picker (binary / multiclass / RVM), mode tabs, blur-intensity slider, saved-background library, live preview pane, themed to the design tokens.
 - **Phase 3** ⏳ — quality polish: mostly held until model swap saturates. Remaining: real horizontal-mirror toggle (UI exists, plumbing TODO), CPU/GPU usage in footer.
 - **Phase 4** — `.deb` (with `v4l2loopback-dkms` postinst modprobe + `/etc/modules-load.d/`) and Flatpak (`flatpak-spawn --host pkexec modprobe …` first-run wizard, OBS PR #4552 pattern). The `desktop_install` module already handles per-user icon registration ahead of full packaging.
 - **Phase 5** — GitHub Actions release workflow + benchmarks.

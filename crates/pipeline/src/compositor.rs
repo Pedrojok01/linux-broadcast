@@ -5,7 +5,7 @@ use fast_image_resize::{
     FilterType, ResizeAlg, ResizeOptions,
 };
 
-use crate::{MODEL_H, MODEL_W};
+use crate::Mask;
 
 /// Background mode the compositor should produce behind the foreground mask.
 #[derive(Debug, Clone)]
@@ -56,21 +56,29 @@ impl Compositor {
 
     /// Composite an RGBA frame in place using the given mask and background.
     ///
-    /// `mask` is `MODEL_W * MODEL_H` foreground probabilities in `[0,1]`.
-    /// `frame` is mutated to hold the composited output.
+    /// `mask.data` is foreground probabilities in `[0,1]`, sized
+    /// `mask.width × mask.height`. The compositor handles upsampling to
+    /// frame resolution if needed; if the mask already matches the frame
+    /// (e.g. RVM at frame size) the upsample is a borrow.
     pub fn composite(
         &mut self,
         frame: &mut [u8],
         width: u32,
         height: u32,
-        mask: &[f32],
+        mask: &Mask,
         background: &Background,
     ) -> Result<()> {
         if frame.len() != (width as usize) * (height as usize) * 4 {
             return Err(anyhow!("frame buffer size mismatch"));
         }
-        if mask.len() != MODEL_W * MODEL_H {
-            return Err(anyhow!("mask size {} != {}", mask.len(), MODEL_W * MODEL_H));
+        let expected = (mask.width as usize) * (mask.height as usize);
+        if mask.data.len() != expected {
+            return Err(anyhow!(
+                "mask data {} != {}*{}",
+                mask.data.len(),
+                mask.width,
+                mask.height
+            ));
         }
 
         // Short-circuit: passthrough mode skips the upsample + blend entirely.
@@ -78,7 +86,7 @@ impl Compositor {
             return Ok(());
         }
 
-        self.upsample_mask(mask, width, height)?;
+        self.prepare_mask(mask, width, height)?;
 
         match background {
             Background::None => unreachable!(),
@@ -97,33 +105,41 @@ impl Compositor {
         Ok(())
     }
 
-    fn upsample_mask(&mut self, mask: &[f32], width: u32, height: u32) -> Result<()> {
+    /// Make sure `self.upsampled_mask` holds the mask at frame resolution.
+    /// If the source already matches the frame size we just copy the slice;
+    /// otherwise bilinear-upsample.
+    fn prepare_mask(&mut self, mask: &Mask, width: u32, height: u32) -> Result<()> {
         let target = (width as usize) * (height as usize);
         if self.upsampled_mask.len() != target {
             self.upsampled_mask.resize(target, 0.0);
         }
-        // Bilinear sampling from the 256x144 mask into the frame-sized buffer.
-        let src_w = MODEL_W as f32;
-        let src_h = MODEL_H as f32;
+        if mask.width == width && mask.height == height {
+            self.upsampled_mask.copy_from_slice(&mask.data);
+            return Ok(());
+        }
+        let src_w = mask.width as usize;
+        let src_h = mask.height as usize;
+        let src_w_f = src_w as f32;
+        let src_h_f = src_h as f32;
         let dst_w = width as f32;
         let dst_h = height as f32;
         for y in 0..height {
-            let sy = (y as f32 + 0.5) * src_h / dst_h - 0.5;
-            let y0 = sy.floor().clamp(0.0, src_h - 1.0) as usize;
-            let y1 = (y0 + 1).min(MODEL_H - 1);
+            let sy = (y as f32 + 0.5) * src_h_f / dst_h - 0.5;
+            let y0 = sy.floor().clamp(0.0, src_h_f - 1.0) as usize;
+            let y1 = (y0 + 1).min(src_h - 1);
             let fy = (sy - y0 as f32).clamp(0.0, 1.0);
             let row_dst = (y as usize) * (width as usize);
-            let row0 = y0 * MODEL_W;
-            let row1 = y1 * MODEL_W;
+            let row0 = y0 * src_w;
+            let row1 = y1 * src_w;
             for x in 0..width {
-                let sx = (x as f32 + 0.5) * src_w / dst_w - 0.5;
-                let x0 = sx.floor().clamp(0.0, src_w - 1.0) as usize;
-                let x1 = (x0 + 1).min(MODEL_W - 1);
+                let sx = (x as f32 + 0.5) * src_w_f / dst_w - 0.5;
+                let x0 = sx.floor().clamp(0.0, src_w_f - 1.0) as usize;
+                let x1 = (x0 + 1).min(src_w - 1);
                 let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-                let a = mask[row0 + x0];
-                let b = mask[row0 + x1];
-                let c = mask[row1 + x0];
-                let d = mask[row1 + x1];
+                let a = mask.data[row0 + x0];
+                let b = mask.data[row0 + x1];
+                let c = mask.data[row1 + x0];
+                let d = mask.data[row1 + x1];
                 let top = a * (1.0 - fx) + b * fx;
                 let bot = c * (1.0 - fx) + d * fx;
                 self.upsampled_mask[row_dst + x as usize] = top * (1.0 - fy) + bot * fy;

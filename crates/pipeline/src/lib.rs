@@ -12,7 +12,7 @@ pub mod temporal;
 
 pub use compositor::{Background, Compositor};
 pub use pipeline::{Command, Pipeline, PipelineConfig, PreviewFrame};
-pub use segmenter::{ModelKind, Segmenter};
+pub use segmenter::{Mask, ModelKind, Segmenter};
 
 /// Native input resolution of the MediaPipe Selfie Segmentation (general) model.
 /// The "landscape" variant is 256×144 but isn't on the `onnx-community` HF repo;

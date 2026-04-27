@@ -3,10 +3,11 @@
 A small, background-replacement virtual webcam for Linux. Captures your camera, segments the foreground with MediaPipe, blurs or replaces the background, and exposes the result as a regular webcam that Zoom, Meet, Teams, OBS and Firefox just pick up.
 
 - **No CUDA, no PyTorch, no Python.** Single Rust binary.
-- Two MediaPipe models bundled, switchable at runtime in the GUI:
-  - **Selfie binary** — fast (~450 KB, ~5 ms inference).
+- Three segmentation models bundled, switchable at runtime in the GUI:
+  - **Selfie binary** — fast, ~5 ms inference (~450 KB).
   - **Selfie multiclass** — sharper edges (~16 MB, six-class output).
-- Holds 30 fps at 1280×720 on a Logitech C920 with a single x86 core.
+  - **RVM** — Robust Video Matting, recurrent video model, best edges (~15 MB, ~15 fps at 720p on one CPU core).
+- Holds 30 fps at 1280×720 on a Logitech C920 with a single x86 core for the MediaPipe models; ~15 fps for RVM at `downsample_ratio=0.4`.
 - Native `egui` UI: live preview pane, blur-intensity slider, saved background-image library, model picker.
 
 ## Status
@@ -53,7 +54,7 @@ The MediaPipe ONNXs (binary + multiclass) and the Inter / JetBrains Mono TTFs sh
 
 1. Run `cargo run --release -p linux-broadcast`.
 2. Pick your physical camera in the **Camera** dropdown.
-3. Pick a model in the **Model** dropdown — multiclass is sharper, binary is faster. Switching restarts the pipeline automatically.
+3. Pick a model in the **Model** dropdown — binary is fastest, multiclass sharper, RVM gives the cleanest hair/edges at the cost of ~half the fps. Switching restarts the pipeline automatically.
 4. **Set the scene** — pick `None` (passthrough), `Blur` (slider for intensity), or `Replace` (uses the active library tile).
 5. Drop background images via the **+ Import** tile in the Library; they're copied to `~/.local/share/linux-broadcast/backgrounds/` so they're available next time. Click any tile to switch live; right-click → Remove deletes it.
 6. **Start broadcasting**. The preview pane fills with the composited frame, and any conferencing app picking `Linux Broadcast` as its camera sees the same stream.

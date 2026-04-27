@@ -13,24 +13,37 @@ use crate::{MODEL_H, MODEL_W};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelKind {
     /// MediaPipe Selfie Segmentation, single-channel output.
-    /// 256×256, NCHW input/output, output is already a probability.
+    /// 256×256, NCHW, output is already a probability.
     #[default]
     SelfieBinary,
-    /// MediaPipe Selfie Multiclass (6 classes: background, hair, body-skin,
-    /// face-skin, clothes, others). 256×256, NHWC input/output, raw logits.
+    /// MediaPipe Selfie Multiclass — 6 classes, 256×256 NHWC, raw logits.
     /// Foreground = `1 - softmax(logits)[bg]` per pixel.
     SelfieMulticlass,
+    /// Robust Video Matting (MobileNetV3) — recurrent video matting.
+    /// Frame-resolution alpha output, internal compute scaled by
+    /// `downsample_ratio`. Best edge fidelity.
+    Rvm,
+}
+
+/// A segmentation mask with its native resolution. Variants of `Segmenter`
+/// may return masks at different sizes — RVM at frame size, MediaPipe at
+/// the model's native 256×256 — so callers must respect `width`/`height`.
+pub struct Mask {
+    pub data: Vec<f32>,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Public segmenter — internal implementation switches on `ModelKind`.
 pub enum Segmenter {
-    Binary(Inner),
-    Multiclass(Inner),
+    Binary(MpInner),
+    Multiclass(MpInner),
+    Rvm(RvmInner),
 }
 
-/// Shared session + reusable buffers. The actual layout (NCHW/NHWC) lives in
-/// the `segment` arm.
-pub struct Inner {
+/// Shared session + reusable buffers for the two MediaPipe models. Layout
+/// (NCHW vs NHWC) is handled per variant in `segment_*`.
+pub struct MpInner {
     session: Session,
     input_name: String,
     resizer: fr::Resizer,
@@ -41,55 +54,67 @@ pub struct Inner {
 
 impl Segmenter {
     pub fn from_bytes(kind: ModelKind, onnx: &[u8]) -> Result<Self> {
-        let session = Session::builder()
-            .map_err(|e| anyhow!("ort Session::builder: {e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow!("set optimization level: {e}"))?
-            .with_intra_threads(num_threads())
-            .map_err(|e| anyhow!("set intra threads: {e}"))?
-            .commit_from_memory(onnx)
-            .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))?;
+        match kind {
+            ModelKind::SelfieBinary => Ok(Segmenter::Binary(MpInner::new(onnx)?)),
+            ModelKind::SelfieMulticlass => Ok(Segmenter::Multiclass(MpInner::new(onnx)?)),
+            ModelKind::Rvm => Ok(Segmenter::Rvm(RvmInner::new(onnx)?)),
+        }
+    }
+
+    pub fn segment(&mut self, rgba: &[u8], width: usize, height: usize) -> Result<Mask> {
+        match self {
+            Segmenter::Binary(inner) => segment_binary(inner, rgba, width, height),
+            Segmenter::Multiclass(inner) => segment_multiclass(inner, rgba, width, height),
+            Segmenter::Rvm(inner) => inner.segment(rgba, width, height),
+        }
+    }
+
+    /// Drop any temporal state (used when toggling to passthrough or when
+    /// the source frame size changes).
+    pub fn reset(&mut self) {
+        if let Segmenter::Rvm(inner) = self {
+            inner.reset();
+        }
+    }
+}
+
+impl MpInner {
+    fn new(onnx: &[u8]) -> Result<Self> {
+        let session = build_session(onnx)?;
         let input_name = session
             .inputs()
             .first()
             .ok_or_else(|| anyhow!("model has no inputs"))?
             .name()
             .to_string();
-
-        // Both models are 256×256×3 input — one NCHW, one NHWC. Same buffer
-        // size, just different element ordering.
-        let inner = Inner {
+        Ok(MpInner {
             session,
             input_name,
             resizer: fr::Resizer::new(),
             input_buf: vec![0.0_f32; MODEL_H * MODEL_W * 3],
             rgba_resized: vec![0_u8; MODEL_H * MODEL_W * 4],
-        };
-        Ok(match kind {
-            ModelKind::SelfieBinary => Segmenter::Binary(inner),
-            ModelKind::SelfieMulticlass => Segmenter::Multiclass(inner),
         })
     }
+}
 
-    pub fn segment(
-        &mut self,
-        rgba: &[u8],
-        width: usize,
-        height: usize,
-    ) -> Result<Vec<f32>> {
-        match self {
-            Segmenter::Binary(inner) => segment_binary(inner, rgba, width, height),
-            Segmenter::Multiclass(inner) => segment_multiclass(inner, rgba, width, height),
-        }
-    }
+fn build_session(onnx: &[u8]) -> Result<Session> {
+    Session::builder()
+        .map_err(|e| anyhow!("ort Session::builder: {e}"))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| anyhow!("set optimization level: {e}"))?
+        .with_intra_threads(num_threads())
+        .map_err(|e| anyhow!("set intra threads: {e}"))?
+        .commit_from_memory(onnx)
+        .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))
 }
 
 fn resize_opts() -> ResizeOptions {
     ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
 }
 
-/// Resize + drop-alpha shared step: produces 256×256 RGBA in `rgba_resized`.
-fn resize_to_model(inner: &mut Inner, rgba: &[u8], width: usize, height: usize) -> Result<()> {
+/// Resize source RGBA into the model's native 256×256, in-place into
+/// `inner.rgba_resized`. Used by the two MediaPipe variants.
+fn resize_to_model(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize) -> Result<()> {
     if rgba.len() != width * height * 4 {
         return Err(anyhow!(
             "rgba buffer size {} != {}*{}*4",
@@ -114,18 +139,17 @@ fn resize_to_model(inner: &mut Inner, rgba: &[u8], width: usize, height: usize) 
 }
 
 // -----------------------------------------------------------------------
-//  Binary (MediaPipe Selfie Segmentation, single channel, NCHW)
+//  Binary (MediaPipe Selfie Segmentation, single channel, NCHW 256×256)
 // -----------------------------------------------------------------------
 
 fn segment_binary(
-    inner: &mut Inner,
+    inner: &mut MpInner,
     rgba: &[u8],
     width: usize,
     height: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Mask> {
     resize_to_model(inner, rgba, width, height)?;
 
-    // NCHW preprocessing — R-plane, G-plane, B-plane.
     let plane = MODEL_H * MODEL_W;
     for i in 0..plane {
         inner.input_buf[i] = inner.rgba_resized[i * 4] as f32 / 255.0;
@@ -149,7 +173,6 @@ fn segment_binary(
     let mut mask = vec![0.0_f32; n];
     match &out_shape[..] {
         [1, 1, h, w] if *h as usize == MODEL_H && *w as usize == MODEL_W => {
-            // Output is already a probability (sigmoid is part of the graph).
             for (i, &v) in data.iter().enumerate() {
                 mask[i] = v.clamp(0.0, 1.0);
             }
@@ -163,24 +186,27 @@ fn segment_binary(
             ));
         }
     }
-    Ok(mask)
+    Ok(Mask {
+        data: mask,
+        width: MODEL_W as u32,
+        height: MODEL_H as u32,
+    })
 }
 
 // -----------------------------------------------------------------------
-//  Multiclass (MediaPipe Selfie Multiclass, 6 channels, NHWC)
+//  Multiclass (MediaPipe Selfie Multiclass, 6 channels, NHWC 256×256)
 // -----------------------------------------------------------------------
 
 const MULTICLASS_BG: usize = 0;
 
 fn segment_multiclass(
-    inner: &mut Inner,
+    inner: &mut MpInner,
     rgba: &[u8],
     width: usize,
     height: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Mask> {
     resize_to_model(inner, rgba, width, height)?;
 
-    // NHWC preprocessing — interleaved R,G,B per pixel.
     let plane = MODEL_H * MODEL_W;
     for i in 0..plane {
         let o = i * 3;
@@ -205,7 +231,6 @@ fn segment_multiclass(
     let mut mask = vec![0.0_f32; n];
     match &out_shape[..] {
         [1, h, w, 6] if *h as usize == MODEL_H && *w as usize == MODEL_W => {
-            // NHWC, 6 raw logits per pixel. Foreground = 1 - softmax[bg].
             for i in 0..n {
                 let o = i * 6;
                 let logits = &data[o..o + 6];
@@ -231,7 +256,160 @@ fn segment_multiclass(
             ));
         }
     }
-    Ok(mask)
+    Ok(Mask {
+        data: mask,
+        width: MODEL_W as u32,
+        height: MODEL_H as u32,
+    })
+}
+
+// -----------------------------------------------------------------------
+//  Robust Video Matting (RVM)
+// -----------------------------------------------------------------------
+
+/// Internal compute resolution = input × downsample_ratio. The official
+/// recommendation is 0.375–0.4 at 720p and 0.25 at 1080p; we stay at 0.4
+/// which gives ~480×270 internal compute on a 1280×720 frame — about
+/// 30–40 ms / frame on a single x86 core.
+const RVM_DOWNSAMPLE_RATIO: f32 = 0.4;
+
+pub struct RvmInner {
+    session: Session,
+    /// Recurrent states from the previous frame — fed back as r1i…r4i on
+    /// the next call. Stored as `(shape, data)` per state, in order
+    /// `[r1, r2, r3, r4]`.
+    prev_states: Option<[(Vec<i64>, Vec<f32>); 4]>,
+    /// Reusable f32 input buffer in NCHW layout.
+    input_buf: Vec<f32>,
+    last_dims: (u32, u32),
+}
+
+impl RvmInner {
+    fn new(onnx: &[u8]) -> Result<Self> {
+        Ok(RvmInner {
+            session: build_session(onnx)?,
+            prev_states: None,
+            input_buf: Vec::new(),
+            last_dims: (0, 0),
+        })
+    }
+
+    fn reset(&mut self) {
+        self.prev_states = None;
+    }
+
+    fn segment(&mut self, rgba: &[u8], width: usize, height: usize) -> Result<Mask> {
+        if rgba.len() != width * height * 4 {
+            return Err(anyhow!(
+                "rgba buffer size {} != {}*{}*4",
+                rgba.len(),
+                width,
+                height
+            ));
+        }
+
+        // Reset recurrent state if the source dimensions change.
+        if self.last_dims != (width as u32, height as u32) {
+            self.prev_states = None;
+            self.last_dims = (width as u32, height as u32);
+        }
+
+        // 1. Pack RGBA → NCHW f32 in [0, 1]. Plane order R, G, B.
+        let plane = width * height;
+        let needed = plane * 3;
+        if self.input_buf.len() != needed {
+            self.input_buf.resize(needed, 0.0);
+        }
+        for i in 0..plane {
+            self.input_buf[i] = rgba[i * 4] as f32 / 255.0;
+            self.input_buf[plane + i] = rgba[i * 4 + 1] as f32 / 255.0;
+            self.input_buf[2 * plane + i] = rgba[i * 4 + 2] as f32 / 255.0;
+        }
+
+        // 2. Build inputs: src + 4 recurrent states + downsample_ratio scalar.
+        let src_shape: [i64; 4] = [1, 3, height as i64, width as i64];
+        let src_value = Value::from_array((src_shape, self.input_buf.clone()))
+            .map_err(|e| anyhow!("ort Value src: {e}"))?;
+
+        // First-frame initial states: shape [1, C, 1, 1] of zeros for each
+        // recurrent input. RVM's graph accepts any spatial size for r*i —
+        // it broadcasts/upsamples internally as needed. After the first
+        // call we feed the previous outputs back at their native shapes.
+        let initial_states: [(Vec<i64>, Vec<f32>); 4] = [
+            (vec![1, 16, 1, 1], vec![0.0; 16]),
+            (vec![1, 20, 1, 1], vec![0.0; 20]),
+            (vec![1, 40, 1, 1], vec![0.0; 40]),
+            (vec![1, 64, 1, 1], vec![0.0; 64]),
+        ];
+        let states = self.prev_states.as_ref().unwrap_or(&initial_states);
+
+        let mut state_values = Vec::with_capacity(4);
+        for (shape, data) in states {
+            // Convert Vec<i64> shape into a fixed-size array for ort.
+            let shape_vec = shape.clone();
+            let v = Value::from_array((shape_vec, data.clone()))
+                .map_err(|e| anyhow!("ort Value state: {e}"))?;
+            state_values.push(v);
+        }
+        let [r1i, r2i, r3i, r4i] = state_values
+            .try_into()
+            .map_err(|_| anyhow!("expected 4 state values"))?;
+
+        let ratio = vec![RVM_DOWNSAMPLE_RATIO];
+        let ratio_value = Value::from_array(([1_i64], ratio))
+            .map_err(|e| anyhow!("ort Value downsample_ratio: {e}"))?;
+
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                "src" => src_value,
+                "r1i" => r1i,
+                "r2i" => r2i,
+                "r3i" => r3i,
+                "r4i" => r4i,
+                "downsample_ratio" => ratio_value,
+            ])
+            .map_err(|e| anyhow!("ort run rvm: {e}"))?;
+
+        // 3. Pull `pha` (alpha matte) and the four `r*o` for next frame.
+        let (pha_shape, pha_data) = outputs
+            .get("pha")
+            .ok_or_else(|| anyhow!("rvm output `pha` missing"))?
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("extract pha: {e}"))?;
+
+        let mask = match &pha_shape[..] {
+            [1, 1, h, w] if *h as usize == height && *w as usize == width => {
+                pha_data.iter().map(|v| v.clamp(0.0, 1.0)).collect::<Vec<f32>>()
+            }
+            other => {
+                return Err(anyhow!(
+                    "unexpected rvm pha shape {:?}, want [1,1,{},{}]",
+                    other,
+                    height,
+                    width
+                ));
+            }
+        };
+
+        // 4. Capture next-frame recurrent states.
+        let mut next_states: [(Vec<i64>, Vec<f32>); 4] = Default::default();
+        for (i, name) in ["r1o", "r2o", "r3o", "r4o"].iter().enumerate() {
+            let (shape, data) = outputs
+                .get(*name)
+                .ok_or_else(|| anyhow!("rvm output `{name}` missing"))?
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("extract {name}: {e}"))?;
+            next_states[i] = (shape.iter().copied().collect(), data.to_vec());
+        }
+        self.prev_states = Some(next_states);
+
+        Ok(Mask {
+            data: mask,
+            width: width as u32,
+            height: height as u32,
+        })
+    }
 }
 
 fn num_threads() -> usize {
