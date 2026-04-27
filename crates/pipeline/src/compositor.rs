@@ -10,10 +10,21 @@ use crate::{MODEL_H, MODEL_W};
 /// Background mode the compositor should produce behind the foreground mask.
 #[derive(Debug, Clone)]
 pub enum Background {
+    /// Pass the input frame through unchanged. Useful as the "off" state and
+    /// for diagnostics. The compositor short-circuits both the segmentation
+    /// upsample and the per-pixel blend.
+    None,
     /// Gaussian-blur the original frame and use that as the background.
-    Blur,
+    /// `strength` is in `[0.0, 1.0]` and maps to a kernel radius from a
+    /// barely-visible 4 px (0.0) to a strong ~32 px (1.0).
+    Blur { strength: f32 },
     /// Composite over a static RGBA image, scaled to cover the frame.
     Image { rgba: Vec<u8>, width: u32, height: u32 },
+}
+
+impl Background {
+    /// Default blur intensity (mid-strength).
+    pub const DEFAULT_BLUR_STRENGTH: f32 = 0.62;
 }
 
 pub struct Compositor {
@@ -62,10 +73,18 @@ impl Compositor {
             return Err(anyhow!("mask size {} != {}", mask.len(), MODEL_W * MODEL_H));
         }
 
+        // Short-circuit: passthrough mode skips the upsample + blend entirely.
+        if matches!(background, Background::None) {
+            return Ok(());
+        }
+
         self.upsample_mask(mask, width, height)?;
 
         match background {
-            Background::Blur => composite_blur(frame, width, height, &self.upsampled_mask),
+            Background::None => unreachable!(),
+            Background::Blur { strength } => {
+                composite_blur(frame, width, height, &self.upsampled_mask, *strength);
+            }
             Background::Image {
                 rgba: bg_rgba,
                 width: bw,
@@ -145,40 +164,48 @@ impl Default for Compositor {
 }
 
 /// Box-blur approximation good enough for a "Broadcast-like" backdrop blur.
-/// Two passes of a separable 1D kernel, radius 12. Done on RGBA in place into
-/// a scratch buffer that is then used as the background plane.
-fn composite_blur(frame: &mut [u8], width: u32, height: u32, mask: &[f32]) {
+/// Two passes of a separable box kernel approximate a Gaussian with σ ≈
+/// 1.5×radius. `strength` ∈ [0,1] maps to a radius from 4 to 32 px.
+fn composite_blur(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    mask: &[f32],
+    strength: f32,
+) {
     let w = width as usize;
     let h = height as usize;
-    // Scratch: blurred copy of the frame.
+    // Map strength → kernel radius. Min 4 px so "0%" is still slightly soft;
+    // max 32 px is well into "you can't read text" territory.
+    let s = strength.clamp(0.0, 1.0);
+    let radius = (4.0 + s * 28.0).round() as usize;
+    // Two passes → quasi-Gaussian. Skip second pass for very small radii.
     let mut blurred = frame.to_vec();
-    box_blur_rgba(&mut blurred, w, h, 12);
-
-    // Composite: out = fg*mask + blurred*(1-mask).
-    for i in 0..(w * h) {
-        let m = mask[i].clamp(0.0, 1.0);
-        let inv = 1.0 - m;
-        let o = i * 4;
-        for c in 0..3 {
-            let fg = frame[o + c] as f32;
-            let bg = blurred[o + c] as f32;
-            frame[o + c] = (fg * m + bg * inv) as u8;
-        }
-        frame[o + 3] = 255;
+    box_blur_rgba(&mut blurred, w, h, radius);
+    if radius >= 8 {
+        box_blur_rgba(&mut blurred, w, h, radius);
     }
+
+    // Plain alpha composite: out = fg*mask + blurred*(1-mask).
+    blend(frame, &blurred, mask);
 }
 
 fn composite_image(frame: &mut [u8], bg_scaled: &[u8], mask: &[f32]) {
-    let n = frame.len() / 4;
     debug_assert_eq!(bg_scaled.len(), frame.len());
+    blend(frame, bg_scaled, mask);
+}
+
+/// Plain alpha composite of `frame` over `bg` using `mask`.
+fn blend(frame: &mut [u8], bg: &[u8], mask: &[f32]) {
+    let n = frame.len() / 4;
     for i in 0..n {
         let m = mask[i].clamp(0.0, 1.0);
         let inv = 1.0 - m;
         let o = i * 4;
         for c in 0..3 {
             let fg = frame[o + c] as f32;
-            let bg = bg_scaled[o + c] as f32;
-            frame[o + c] = (fg * m + bg * inv) as u8;
+            let bg_c = bg[o + c] as f32;
+            frame[o + c] = (fg * m + bg_c * inv) as u8;
         }
         frame[o + 3] = 255;
     }

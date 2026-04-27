@@ -7,7 +7,7 @@ use gstreamer_video as gst_video;
 use std::sync::{Arc, Mutex};
 
 use crate::compositor::{Background, Compositor};
-use crate::segmenter::Segmenter;
+use crate::segmenter::{ModelKind, Segmenter};
 use crate::temporal::MaskSmoother;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,12 @@ pub struct PipelineConfig {
     pub height: u32,
     pub framerate: u32,
     pub background: Background,
+    /// Which segmentation model to load.
+    pub model: ModelKind,
+    /// If `Some`, each composited frame is forwarded (RGBA) to this sender for
+    /// the GUI's preview pane. Bounded; sends use `try_send` and silently drop
+    /// when the GUI is slow.
+    pub preview_tx: Option<Sender<PreviewFrame>>,
 }
 
 impl Default for PipelineConfig {
@@ -30,9 +36,21 @@ impl Default for PipelineConfig {
             width: 1280,
             height: 720,
             framerate: 30,
-            background: Background::Blur,
+            background: Background::Blur {
+                strength: Background::DEFAULT_BLUR_STRENGTH,
+            },
+            model: ModelKind::SelfieBinary,
+            preview_tx: None,
         }
     }
+}
+
+/// A composited RGBA frame published to the GUI for preview.
+#[derive(Debug, Clone)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 /// Live commands from the GUI thread to the running pipeline.
@@ -49,7 +67,11 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Build and start the pipeline. Returns once `Playing` is reached.
-    pub fn start(cfg: PipelineConfig, model_onnx: &'static [u8]) -> Result<Self> {
+    pub fn start(
+        cfg: PipelineConfig,
+        binary_onnx: &'static [u8],
+        multiclass_onnx: &'static [u8],
+    ) -> Result<Self> {
         gst::init().context("gst::init")?;
 
         let pipeline = gst::Pipeline::new();
@@ -145,7 +167,14 @@ impl Pipeline {
 
         // Shared state between the appsink callback, command receiver, and main thread.
         let segmenter = Arc::new(Mutex::new(
-            Segmenter::from_bytes(model_onnx).context("load segmentation model")?,
+            Segmenter::from_bytes(
+                cfg.model,
+                match cfg.model {
+                    ModelKind::SelfieBinary => binary_onnx,
+                    ModelKind::SelfieMulticlass => multiclass_onnx,
+                },
+            )
+            .context("load segmentation model")?,
         ));
         let compositor = Arc::new(Mutex::new(Compositor::new()));
         let smoother = Arc::new(Mutex::new(MaskSmoother::new(0.7)));
@@ -176,6 +205,7 @@ impl Pipeline {
         let compositor_cb = Arc::clone(&compositor);
         let smoother_cb = Arc::clone(&smoother);
         let bg_cb = Arc::clone(&background);
+        let preview_tx_cb = cfg.preview_tx.clone();
         let frame_w = cfg.width;
         let frame_h = cfg.height;
         let fps = cfg.framerate;
@@ -200,31 +230,43 @@ impl Pipeline {
                     // Copy to a writable scratch we can composite into.
                     let mut frame_rgba = in_bytes.to_vec();
 
-                    // Segmentation.
-                    let mask_res = {
-                        let mut seg = segmenter_cb.lock().unwrap();
-                        seg.segment(&frame_rgba, frame_w as usize, frame_h as usize)
-                    };
-                    let mut mask = match mask_res {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log::error!("segment: {e:#}");
+                    // Snapshot the current background once — used to decide
+                    // whether segmentation can be skipped entirely (None mode
+                    // is pure passthrough).
+                    let bg = bg_cb.lock().unwrap().clone();
+
+                    if !matches!(bg, Background::None) {
+                        // Segmentation.
+                        let mask_res = {
+                            let mut seg = segmenter_cb.lock().unwrap();
+                            seg.segment(&frame_rgba, frame_w as usize, frame_h as usize)
+                        };
+                        let mut mask = match mask_res {
+                            Ok(m) => m,
+                            Err(e) => {
+                                log::error!("segment: {e:#}");
+                                return Err(gst::FlowError::Error);
+                            }
+                        };
+
+                        // EMA across frames to damp shimmer. Other post
+                        // (smoothstep, feather, light wrap) was tried and
+                        // hurt perceptual quality on this model — the raw
+                        // mask composites cleaner.
+                        smoother_cb.lock().unwrap().smooth(&mut mask);
+
+                        if let Err(e) = compositor_cb
+                            .lock()
+                            .unwrap()
+                            .composite(&mut frame_rgba, frame_w, frame_h, &mask, &bg)
+                        {
+                            log::error!("composite: {e:#}");
                             return Err(gst::FlowError::Error);
                         }
-                    };
-
-                    // Temporal smoothing.
-                    smoother_cb.lock().unwrap().smooth(&mut mask);
-
-                    // Composite.
-                    let bg = bg_cb.lock().unwrap().clone();
-                    if let Err(e) = compositor_cb
-                        .lock()
-                        .unwrap()
-                        .composite(&mut frame_rgba, frame_w, frame_h, &mask, &bg)
-                    {
-                        log::error!("composite: {e:#}");
-                        return Err(gst::FlowError::Error);
+                    } else {
+                        // Reset the temporal smoother so the next non-None
+                        // frame starts clean, not anchored to a stale mask.
+                        smoother_cb.lock().unwrap().reset();
                     }
 
                     // Push out.
@@ -250,6 +292,15 @@ impl Pipeline {
                             "pushed frame #{} ({}x{} RGBA)",
                             frame_idx, frame_w, frame_h
                         );
+                    }
+                    if let Some(tx) = preview_tx_cb.as_ref() {
+                        // try_send so we silently drop if the GUI hasn't
+                        // consumed the previous frame yet.
+                        let _ = tx.try_send(PreviewFrame {
+                            width: frame_w,
+                            height: frame_h,
+                            rgba: frame_rgba.clone(),
+                        });
                     }
                     appsrc_clone.push_buffer(out).map_err(|_| gst::FlowError::Error)?;
 

@@ -1,14 +1,17 @@
 # Linux Broadcast
 
-A small, NVIDIA Broadcast-style virtual webcam for Linux. Blurs your background or replaces it with an image, and exposes the result as a regular webcam that Zoom, Meet, Teams, OBS and Firefox just pick up.
+A small, background-replacement virtual webcam for Linux. Captures your camera, segments the foreground with MediaPipe, blurs or replaces the background, and exposes the result as a regular webcam that Zoom, Meet, Teams, OBS and Firefox just pick up.
 
 - **No CUDA, no PyTorch, no Python.** Single Rust binary.
-- Runs MediaPipe Selfie Segmentation on CPU — ~5 ms per frame at 256×144 inference.
-- ~25 MB binary, no system Python or Qt runtime to install.
+- Two MediaPipe models bundled, switchable at runtime in the GUI:
+  - **Selfie binary** — fast (~450 KB, ~5 ms inference).
+  - **Selfie multiclass** — sharper edges (~16 MB, six-class output).
+- Holds 30 fps at 1280×720 on a Logitech C920 with a single x86 core.
+- Native `egui` UI: live preview pane, blur-intensity slider, saved background-image library, model picker.
 
 ## Status
 
-Early. Phase 1 (headless vertical slice) is scaffolded but not yet smoke-tested end-to-end. The previous Python prototype is preserved on the [`legacy-python`](https://github.com/Pedrojok01/linux-broadcast/tree/legacy-python) branch.
+Phase 2 done — fully usable end-to-end. The previous Python prototype is preserved on the [`legacy-python`](https://github.com/Pedrojok01/linux-broadcast/tree/legacy-python) branch.
 
 ## Try it from source
 
@@ -23,29 +26,48 @@ sudo apt install -y \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 
 # 2. Virtual camera device (until the .deb postinst exists)
-sudo modprobe v4l2loopback video_nr=10 card_label="Linux Broadcast" exclusive_caps=1 max_buffers=2
+#    NB: a stale module load is the most common cause of /dev/video10 not
+#    appearing — `modprobe -r v4l2loopback` first if you change params.
+sudo modprobe -r v4l2loopback 2>/dev/null
+sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Linux Broadcast" \
+  exclusive_caps=1 max_buffers=2
 
-# 3. Drop the model in place (one-time; ~450 KB)
-mkdir -p models
-curl -L -o models/selfie_segmenter.onnx \
-  https://huggingface.co/onnx-community/mediapipe_selfie_segmentation/resolve/main/onnx/model.onnx
+# 3. Build & run the GUI
+cargo run --release -p linux-broadcast
 
-# 4. Run
-cargo run --release
-# In another terminal, verify:
-cheese -d /dev/video10
+# 4. Or run headless (no window, hard-loops on the saved config)
+LB_HEADLESS=1 cargo run --release -p linux-broadcast
+
+# 5. Quick visual check from another terminal
+ffplay -fflags nobuffer -f v4l2 -input_format yuyv422 \
+  -video_size 1280x720 /dev/video10
 ```
 
-> **Kernel 6.8+ note:** if `apt install v4l2loopback-dkms` fails to build, you have version 0.12.7 — install 0.12.8+ from upstream or your distro backports.
+The MediaPipe ONNXs (binary + multiclass) and the Inter / JetBrains Mono TTFs ship in-tree, so there's no separate download step. ONNX Runtime's `libonnxruntime.so` is fetched automatically the first time you build (`ort` crate, `download-binaries` feature).
 
-## Where the quality comes from
+> **Kernel 6.8+ note:** if `apt install v4l2loopback-dkms` fails to build, you have the broken 0.12.7 — install ≥ 0.12.8 from upstream or your distro backports.
 
-| Lever | What it does |
-|---|---|
-| MediaPipe Selfie Segmentation | Per-pixel matting at 256×256, designed for exactly this use case. |
-| EMA mask smoothing across frames | Removes ~80% of flicker without needing a video-recurrent model. |
-| Inference at native model resolution | Only the upsample + composite touches full-res pixels — keeps CPU low at 720p/1080p. |
-| `tract` pure-Rust ONNX runtime | Zero native deps → tiny binary, simple packaging, no `libonnxruntime.so`. |
+> **`/dev/video10` is "busy" or "not a video capture device":** that's `exclusive_caps` doing its job — the device only exposes CAPTURE while linux-broadcast is producing frames. Apps see it correctly; raw `ffplay` may not until the producer is running.
+
+## Using it
+
+1. Run `cargo run --release -p linux-broadcast`.
+2. Pick your physical camera in the **Camera** dropdown.
+3. Pick a model in the **Model** dropdown — multiclass is sharper, binary is faster. Switching restarts the pipeline automatically.
+4. **Set the scene** — pick `None` (passthrough), `Blur` (slider for intensity), or `Replace` (uses the active library tile).
+5. Drop background images via the **+ Import** tile in the Library; they're copied to `~/.local/share/linux-broadcast/backgrounds/` so they're available next time. Click any tile to switch live; right-click → Remove deletes it.
+6. **Start broadcasting**. The preview pane fills with the composited frame, and any conferencing app picking `Linux Broadcast` as its camera sees the same stream.
+7. Settings persist automatically to `~/.config/linux-broadcast/config.toml`.
+
+## Design
+
+`DESIGN.md` documents the colour tokens, spacing scale, and type system. The actual values are hard-coded in `crates/app/src/theme.rs`.
+
+## Architecture (one-line tour)
+
+`v4l2src → videoconvert/scale → appsink → segmenter (binary | multiclass) → EMA smooth → composite → appsrc → videoconvert → v4l2sink → /dev/video10`
+
+The whole pipeline lives in `crates/pipeline`; the GUI is `crates/app`. See `CLAUDE.md` for the deeper map.
 
 ## License
 

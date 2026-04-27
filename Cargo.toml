@@ -34,7 +34,8 @@ directories = "5"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 glob = "0.3"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 
 [profile.release]
 opt-level = 3

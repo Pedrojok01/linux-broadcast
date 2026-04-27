@@ -2,7 +2,9 @@
 ///
 /// MediaPipe's selfie segmentation is per-frame, so the mask flickers slightly
 /// between adjacent frames. EMA `mask_t = α·m_now + (1-α)·m_prev` knocks
-/// down ~80% of perceptible flicker for two lines of code.
+/// down most of the perceptible flicker for two lines of code. With
+/// `α = 0.7` the present frame dominates so motion stays responsive and
+/// the tiny amount of history weight just damps shimmer at the silhouette.
 pub struct MaskSmoother {
     alpha: f32,
     prev: Option<Vec<f32>>,

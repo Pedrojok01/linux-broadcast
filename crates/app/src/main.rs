@@ -1,33 +1,41 @@
-use anyhow::Result;
-use lb_pipeline::{Background, Pipeline, PipelineConfig};
+mod backgrounds;
+mod cameras;
+mod config;
+mod desktop_install;
+mod icon;
+mod theme;
+mod ui;
 
-/// Bundled MediaPipe Selfie Segmentation ONNX model (~450 KB, general variant).
+use anyhow::Result;
+
+/// Bundled MediaPipe Selfie Segmentation ONNX (binary, ~450 KB).
 /// Sourced from `onnx-community/mediapipe_selfie_segmentation` on Hugging Face.
-const MODEL_ONNX: &[u8] = include_bytes!("../../../models/selfie_segmenter.onnx");
+pub(crate) const MODEL_BINARY_ONNX: &[u8] =
+    include_bytes!("../../../models/selfie_segmenter.onnx");
+
+/// Bundled MediaPipe Selfie Multiclass ONNX (6 classes: bg/hair/body/face/clothes/other,
+/// ~16 MB). Converted via tf2onnx from the official MediaPipe TFLite.
+pub(crate) const MODEL_MULTICLASS_ONNX: &[u8] =
+    include_bytes!("../../../models/selfie_multiclass.onnx");
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Phase 1 hardcoded config. Phase 2 will replace this with the GUI.
-    let cfg = PipelineConfig {
-        source_device: std::env::var("LB_SOURCE").unwrap_or_else(|_| "/dev/video0".into()),
-        sink_device: std::env::var("LB_SINK").unwrap_or_else(|_| "/dev/video10".into()),
-        width: 1280,
-        height: 720,
-        framerate: 30,
-        background: Background::Blur,
-    };
+    if std::env::var_os("LB_DUMP_ICON").is_some() {
+        let icon = icon::build();
+        let img: image::ImageBuffer<image::Rgba<u8>, _> =
+            image::ImageBuffer::from_raw(icon.width, icon.height, icon.rgba.clone())
+                .expect("icon buffer");
+        img.save("/tmp/lb-icon.png")?;
+        println!("wrote /tmp/lb-icon.png ({}×{})", icon.width, icon.height);
+        return Ok(());
+    }
 
-    log::info!(
-        "starting pipeline {} → {} ({}x{}@{}fps, blur background)",
-        cfg.source_device,
-        cfg.sink_device,
-        cfg.width,
-        cfg.height,
-        cfg.framerate,
-    );
-
-    let pipeline = Pipeline::start(cfg, MODEL_ONNX)?;
-    pipeline.run_until_done()?;
-    Ok(())
+    if std::env::var_os("LB_HEADLESS").is_some() {
+        return ui::run_headless();
+    }
+    if let Err(e) = desktop_install::ensure_desktop_entry() {
+        log::warn!("desktop entry install: {e:#}");
+    }
+    ui::run_gui()
 }
