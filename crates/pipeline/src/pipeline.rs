@@ -92,6 +92,10 @@ pub enum Command {
     SetBackground(Background),
     /// Pin the camera on regardless of consumer count. Sidebar toggle.
     SetForceOn(bool),
+    /// While false, the feeder skips forwarding frames to the GUI's
+    /// preview channel, avoiding the per-frame RGBA clone. The
+    /// downstream broadcast (`/dev/video10`) is unaffected.
+    SetPreviewEnabled(bool),
     Stop,
 }
 

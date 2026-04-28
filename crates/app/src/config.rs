@@ -74,10 +74,15 @@ pub struct Config {
     pub start_on_login: bool,
     /// When true, the camera is held on regardless of consumer count.
     /// Default off; the pipeline's lazy mode opens the camera only while
-    /// a real consumer is reading `/dev/video10` (or the GUI preview
-    /// pane is visible). Useful for streamer/rehearsal flows where the
-    /// camera LED should stay lit.
+    /// a real consumer is reading `/dev/video10`. Useful for streamer /
+    /// rehearsal flows where the camera LED should stay lit.
     pub force_on: bool,
+    /// When true, the GUI's preview pane renders live composited frames.
+    /// Off → preview pane shows a static placeholder; the pipeline stops
+    /// forwarding frames to the GUI (saves a per-frame RGBA clone). The
+    /// broadcast itself is unaffected — consumers of `/dev/video10` see
+    /// the same picture either way.
+    pub show_preview: bool,
 }
 
 impl Default for Config {
@@ -94,6 +99,7 @@ impl Default for Config {
             model: Model::default(),
             start_on_login: false,
             force_on: false,
+            show_preview: true,
         }
     }
 }

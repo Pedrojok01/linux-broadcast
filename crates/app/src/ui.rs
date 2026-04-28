@@ -291,11 +291,14 @@ impl App {
         ) {
             Ok(p) => {
                 let cmd_tx = p.cmd_sender();
-                // Push the saved force_on preference to the freshly
-                // started pipeline so the toggle survives Stop+Start
-                // cycles (model swaps, camera swaps).
+                // Push the saved toggle states to the freshly started
+                // pipeline so they survive Stop+Start cycles (model
+                // swaps, camera swaps).
                 if self.cfg.force_on {
                     let _ = cmd_tx.send(Command::SetForceOn(true));
+                }
+                if !self.cfg.show_preview {
+                    let _ = cmd_tx.send(Command::SetPreviewEnabled(false));
                 }
                 self.cmd_tx = Some(cmd_tx);
                 self.pipeline = Some(p);
@@ -350,6 +353,12 @@ impl App {
                     break;
                 }
             }
+        }
+        // Belt-and-braces: even if a frame slipped through the channel
+        // before the pipeline received SetPreviewEnabled(false), don't
+        // paint it.
+        if !self.cfg.show_preview {
+            return;
         }
         if let Some(frame) = latest {
             let size = [frame.width as usize, frame.height as usize];
@@ -734,7 +743,15 @@ impl App {
                     Stroke::new(1.0, color::STROKE),
                 );
 
-                if let Some(tex) = &self.preview_tex {
+                if !self.cfg.show_preview {
+                    p.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Preview hidden",
+                        egui::FontId::proportional(14.0),
+                        color::TEXT_MUTED,
+                    );
+                } else if let Some(tex) = &self.preview_tex {
                     let [tw, th] = self.last_preview_size.unwrap_or([1280, 720]);
                     let aspect = tw as f32 / th as f32;
                     let mut w = rect.width();
@@ -1300,9 +1317,9 @@ impl App {
 
         // Force-camera-on toggle. Default behaviour is lazy mode: the
         // physical camera lights only when something is reading
-        // /dev/video10 (or this GUI is open with the preview pane
-        // visible). Flipping this on pins the camera regardless —
-        // useful for streamer/rehearsal flows.
+        // /dev/video10. Flipping this on pins the camera regardless —
+        // useful for streamer/rehearsal flows or for previewing in this
+        // window without opening Meet.
         if toggle_row(
             ui,
             self.cfg.force_on,
@@ -1313,6 +1330,32 @@ impl App {
             self.save_settings();
             if let Some(tx) = &self.cmd_tx {
                 let _ = tx.send(Command::SetForceOn(self.cfg.force_on));
+            }
+        }
+
+        ui.add_space(space::SM);
+
+        // Show-preview toggle. Off → the preview pane shows a static
+        // placeholder and the pipeline stops forwarding frames to the
+        // GUI (saves a per-frame RGBA clone). The broadcast itself is
+        // unaffected: consumers of /dev/video10 see the same picture.
+        if toggle_row(
+            ui,
+            self.cfg.show_preview,
+            "Show preview",
+            "Render live frames in this window",
+        ) {
+            self.cfg.show_preview = !self.cfg.show_preview;
+            self.save_settings();
+            if let Some(tx) = &self.cmd_tx {
+                let _ = tx.send(Command::SetPreviewEnabled(self.cfg.show_preview));
+            }
+            // Drop the cached texture so the placeholder renders cleanly
+            // (otherwise the last-painted frame would linger until the
+            // next pane resize).
+            if !self.cfg.show_preview {
+                self.preview_tex = None;
+                self.last_preview_size = None;
             }
         }
     }

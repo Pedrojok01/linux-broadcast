@@ -124,6 +124,7 @@ pub(crate) fn spawn_feeder(
                 source: None,
                 consumers: Vec::new(),
                 force_on: false,
+                preview_enabled: true,
                 state: State::Idle,
                 state_pub,
                 frame_idx: 0,
@@ -152,6 +153,11 @@ struct Feeder {
     source: Option<(gst::Pipeline, gst_app::AppSink)>,
     consumers: Vec<Consumer>,
     force_on: bool,
+    /// Mirrors the GUI's "Show preview" toggle. When false, frames are
+    /// not forwarded to `preview_tx` (skips a 1280×720 RGBA clone per
+    /// frame). Defaults to true so any standalone consumer of the
+    /// pipeline (tests, future headless tooling) gets frames by default.
+    preview_enabled: bool,
     state: State,
     state_pub: Arc<Mutex<PipelineState>>,
     frame_idx: u64,
@@ -241,6 +247,7 @@ impl Feeder {
         match cmd {
             Command::SetBackground(bg) => self.background = bg,
             Command::SetForceOn(v) => self.force_on = v,
+            Command::SetPreviewEnabled(v) => self.preview_enabled = v,
             Command::Stop => unreachable!("handled in run()"),
         }
     }
@@ -472,13 +479,15 @@ impl Feeder {
             self.segmenter.reset();
         }
 
-        if let Some(tx) = &self.preview_tx {
-            // try_send so we silently drop when the GUI lags.
-            let _ = tx.try_send(PreviewFrame {
-                width: frame_w,
-                height: frame_h,
-                rgba: frame_rgba.clone(),
-            });
+        if self.preview_enabled {
+            if let Some(tx) = &self.preview_tx {
+                // try_send so we silently drop when the GUI lags.
+                let _ = tx.try_send(PreviewFrame {
+                    width: frame_w,
+                    height: frame_h,
+                    rgba: frame_rgba.clone(),
+                });
+            }
         }
 
         let pushed = self.push_to_sink(&frame_rgba);
