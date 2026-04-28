@@ -58,9 +58,13 @@ fn is_minimized(ctx: &egui::Context) -> bool {
 
 /// Single entry point. `headless` collapses what used to be `run_gui` /
 /// `run_headless` into one eframe loop:
-/// - GUI mode: window visible, pipeline waits for the user to press Start.
-/// - Headless mode: window starts hidden in the tray, pipeline auto-starts
-///   so apps see `/dev/video10` immediately on login.
+/// - GUI mode: window visible.
+/// - Headless mode: window starts hidden in the tray.
+///
+/// In both modes the pipeline auto-starts at launch so consumers
+/// (Meet, browsers, OBS) immediately see `/dev/video10` as a CAPTURE
+/// device. The lazy state machine still keeps the physical camera
+/// (`/dev/video0`, LED) released until a real consumer reads.
 ///
 /// The window's close button always hides (minimises to tray); only the
 /// tray's Quit menu actually exits. This lets a single instance own
@@ -155,9 +159,6 @@ struct App {
     /// with consumer list). Refreshed every `update()` call from
     /// `Pipeline::state()`. Used by the footer.
     pipeline_state: PipelineState,
-    /// Last value sent for `Command::SetGuiPreviewActive`. We only push
-    /// a fresh command on edges so the feeder isn't spammed.
-    last_preview_active: bool,
     error: Option<String>,
     /// System tray handle. Held for the whole process lifetime. `None`
     /// only if the OS has no working tray host (logged at install time);
@@ -229,7 +230,6 @@ impl App {
             preview_tex: None,
             last_preview_size: None,
             pipeline_state: PipelineState::default(),
-            last_preview_active: false,
             error: initial_error,
             tray,
             quit_requested: false,
@@ -237,21 +237,24 @@ impl App {
             headless_minimize_pending,
         };
 
-        if headless {
-            // Headless = login auto-start. Wait briefly for the v4l2
-            // sink to appear (cold boot may have us racing against
-            // systemd-modules-load.service), then start the pipeline.
-            let sink = app.cfg.sink_device.clone();
-            if wait_for_device(&sink, HEADLESS_DEVICE_WAIT) {
-                app.start_pipeline();
-            } else {
-                let msg = format!(
-                    "headless start: {} did not appear within {:?} — is v4l2loopback loaded?",
-                    sink, HEADLESS_DEVICE_WAIT,
-                );
-                log::error!("{msg}");
-                app.error = Some(msg);
-            }
+        // Always start the pipeline at launch — both GUI and headless.
+        // The sink graph is what advertises `/dev/video10` as a CAPTURE
+        // device to consumers (Meet, browsers, OBS); without it,
+        // `exclusive_caps=1` hides the loopback from camera lists. The
+        // physical camera (`/dev/video0`, LED) stays released until a
+        // real consumer reads — that's `lazy.rs`'s job, not this one.
+        // On cold boot we may be racing `systemd-modules-load.service`,
+        // so wait briefly for the v4l2 sink device to appear first.
+        let sink = app.cfg.sink_device.clone();
+        if wait_for_device(&sink, HEADLESS_DEVICE_WAIT) {
+            app.start_pipeline();
+        } else {
+            let msg = format!(
+                "{} did not appear within {:?} — is v4l2loopback loaded?",
+                sink, HEADLESS_DEVICE_WAIT,
+            );
+            log::error!("{msg}");
+            app.error = Some(msg);
         }
 
         app
@@ -299,7 +302,6 @@ impl App {
                 self.preview_rx = Some(rx);
                 self.preview_tex = None;
                 self.last_preview_size = None;
-                self.last_preview_active = false;
                 self.pipeline_state = PipelineState::default();
                 self.error = None;
             }
@@ -321,7 +323,6 @@ impl App {
         self.preview_tex = None;
         self.last_preview_size = None;
         self.pipeline_state = PipelineState::default();
-        self.last_preview_active = false;
     }
 
     fn restart_pipeline(&mut self) {
@@ -334,20 +335,6 @@ impl App {
     fn update_background_live(&mut self) {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(Command::SetBackground(build_background(&self.cfg)));
-        }
-    }
-
-    /// Edge-triggered heartbeat: only sends a `SetGuiPreviewActive`
-    /// command when the value differs from the last one. eframe calls
-    /// `update()` ~30×/sec while the window is being painted, so flood
-    /// protection matters.
-    fn send_preview_heartbeat(&mut self, active: bool) {
-        if active == self.last_preview_active {
-            return;
-        }
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(Command::SetGuiPreviewActive(active));
-            self.last_preview_active = active;
         }
     }
 
@@ -439,16 +426,11 @@ impl eframe::App for App {
             self.set_visible(ctx, false);
         }
 
-        // 3. Read the *compositor-reported* minimized state and gate the
-        //    GUI preview heartbeat on it. Unlike a client-side bool, this
-        //    can't desync from reality: when the user un-minimizes via
-        //    the taskbar, the next frame correctly reports `false` and
-        //    we resume normal painting. Egui has no `viewport.visible`
-        //    field — `Visible(false)` on Wayland is a no-op and on
-        //    other platforms eframe pauses redraws anyway, so minimized
-        //    is the only meaningful signal here.
+        // 3. Read the *compositor-reported* minimized state. Egui has
+        //    no `viewport.visible` analogue — `Visible(false)` on Wayland
+        //    is a no-op and on other platforms eframe pauses redraws
+        //    anyway, so minimized is the only meaningful signal.
         let minimized = is_minimized(ctx) || starting_headless_hidden;
-        self.send_preview_heartbeat(!minimized);
 
         // 4. While minimized, skip layout entirely. eframe's repaint
         //    request keeps the loop ticking so tray events still land.
@@ -481,10 +463,6 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Tell the running pipeline we no longer count as a consumer
-        // before tearing it down — the brief drop is a no-op since stop
-        // immediately follows, but it's the right ordering.
-        self.send_preview_heartbeat(false);
         self.stop_pipeline();
         self.save_settings();
     }
@@ -524,14 +502,6 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         } else {
-            // Belt-and-braces against `update()` going silent on some
-            // Wayland compositors after a hide: push the heartbeat-false
-            // edge *now*, synchronously, so the lazy pipeline learns
-            // the GUI stopped watching even if no further frame arrives.
-            // The per-frame heartbeat in `update()` is the other half
-            // of the same story (covers OS-minimize without a hide call).
-            self.send_preview_heartbeat(false);
-
             // `Visible(false)` is a no-op on Wayland (xdg-shell has no
             // "hide toplevel" verb — only destroy or minimize), so we
             // pair it with `Minimized(true)`, which xdg-shell *does*

@@ -76,11 +76,10 @@ enum State {
 struct Demand {
     consumers_present: bool,
     force_on: bool,
-    gui_preview_active: bool,
 }
 impl Demand {
     fn signal(&self) -> bool {
-        self.force_on || self.gui_preview_active || self.consumers_present
+        self.force_on || self.consumers_present
     }
 }
 
@@ -125,7 +124,6 @@ pub(crate) fn spawn_feeder(
                 source: None,
                 consumers: Vec::new(),
                 force_on: false,
-                gui_preview_active: false,
                 state: State::Idle,
                 state_pub,
                 frame_idx: 0,
@@ -154,7 +152,6 @@ struct Feeder {
     source: Option<(gst::Pipeline, gst_app::AppSink)>,
     consumers: Vec<Consumer>,
     force_on: bool,
-    gui_preview_active: bool,
     state: State,
     state_pub: Arc<Mutex<PipelineState>>,
     frame_idx: u64,
@@ -244,7 +241,6 @@ impl Feeder {
         match cmd {
             Command::SetBackground(bg) => self.background = bg,
             Command::SetForceOn(v) => self.force_on = v,
-            Command::SetGuiPreviewActive(v) => self.gui_preview_active = v,
             Command::Stop => unreachable!("handled in run()"),
         }
     }
@@ -270,7 +266,6 @@ impl Feeder {
         let demand = Demand {
             consumers_present: !self.consumers.is_empty(),
             force_on: self.force_on,
-            gui_preview_active: self.gui_preview_active,
         };
         let signal = demand.signal();
 
@@ -403,9 +398,8 @@ impl Feeder {
                 .collect::<Vec<_>>()
                 .join(",");
             log::info!(
-                "lazy state → {label} (consumers=[{consumer_summary}], force_on={}, gui={})",
+                "lazy state → {label} (consumers=[{consumer_summary}], force_on={})",
                 self.force_on,
-                self.gui_preview_active
             );
             self.last_state_log = Some(label);
         }

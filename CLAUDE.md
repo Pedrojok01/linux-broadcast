@@ -113,12 +113,13 @@ The pipeline runs in **lazy producer mode**: the physical camera (`/dev/video0`)
 
 Key non-obvious settings:
 
-- **Sink stays in PLAYING permanently.** The sink graph never gets torn down: that keeps `/dev/video10` advertised as a CAPTURE device so it never blinks out of conferencing-app device lists. While Idle, the feeder simply stops calling `push_buffer`; with `sync=false` + `async=false` on `v4l2sink`, that's a clean stall (no buffers downstream, no error spam).
+- **Sink stays in PLAYING permanently, and the feeder keeps pushing.** The sink graph never gets torn down: that keeps `/dev/video10` advertised as a CAPTURE device so it never blinks out of conferencing-app device lists. With `exclusive_caps=1`, **PLAYING alone is not enough** — v4l2loopback only flips on `V4L2_CAP_VIDEO_CAPTURE` after `v4l2sink` has called `VIDIOC_STREAMON`, which only happens once at least one buffer has flowed through. So while Idle the feeder still re-pushes the last composited frame (or a black frame on cold start) at `IDLE_PUSH_INTERVAL` (5 Hz). After the first push the kernel's `ready_for_capture` flag is sticky for the lifetime of the producer fd, so the rate could in principle be much lower; 5 Hz is just slow enough to be free and fast enough to dodge any WebRTC consumer's "no frames" timeout.
+- **Pipeline starts at app launch, regardless of mode.** The sink graph is what makes `/dev/video10` visible to Meet/Chrome/OBS, so it must run from the moment the app starts — both `--headless` autostart and the GUI launch invoke `Pipeline::start` immediately. The lazy state machine still keeps `/dev/video0` (the LED) released until a real consumer reads. There is no "Start broadcasting" gesture for the sink anymore; the closest equivalent is **Force camera on** in the sidebar, which only forces the *source* camera engagement (e.g. for previewing without a consumer attached).
 - **`v4l2sink async=false`** — without it the pipeline deadlocks on the PLAYING transition: v4l2sink waits for a preroll buffer that the lazy feeder may never push (we go to PLAYING immediately, before any consumer arrives).
 - **`v4l2src do-timestamp=true`** — without it the output stream's PTS is wrong and v4l2sink's pacing slips.
 - **Caps strategy:** the source-side capsfilter pins **only RGBA + width/height** (no framerate). Forcing 30/1 caused negotiation failures with the C920 (camera reports `30000/1001`). The appsrc-side caps **do** declare framerate, otherwise the sink-side videoconvert asserts `fps_n == out_fps_n`.
 
-Live setting changes (background mode swap, blur strength, picking a new image, **Force camera on** toggle, GUI preview heartbeat) flow over the existing `crossbeam-channel` of `Command`s and are applied by the feeder on the next tick — no graph rebuild. Camera, resolution, and **model** changes still require a Stop+Start cycle from the GUI.
+Live setting changes (background mode swap, blur strength, picking a new image, **Force camera on** toggle) flow over the existing `crossbeam-channel` of `Command`s and are applied by the feeder on the next tick — no graph rebuild. Camera, resolution, and **model** changes still require a Stop+Start cycle from the GUI.
 
 #### Lazy mode constants and consumer detection
 
@@ -126,7 +127,7 @@ Live setting changes (background mode swap, blur strength, picking a new image, 
 - **Deactivation debounce: 3 s** (`lazy::DEACTIVATION_DEBOUNCE`). After the last consumer leaves, we wait this long before releasing `/dev/video0`. Absorbs in-call camera-switcher flicker (the user toggles between cameras in Meet's picker).
 - **Watcher poll interval: 800 ms** (`pipeline::WATCH_POLL_INTERVAL`). Fast enough that a real consumer is observed inside the activation debounce window.
 - **Consumer detection mechanism: walk `/proc/*/fd/*`** in `consumer_watch::current_consumers`. Follows each fd symlink and counts those targeting `/dev/video10`, excluding our own PID. v4l2loopback does not expose a sysfs consumer-count attribute and the kernel does not fire fsnotify events on character-device opens, so userspace polling is the only portable signal. Cost: ~1–3 ms per poll.
-- The `force_on` and `gui_preview_active` flags act as **synthetic consumers**: either being true is sufficient to keep the camera lit. The GUI sends `Command::SetGuiPreviewActive(true)` from `App::update` (eframe stops calling `update` when the window is fully occluded / minimised) and resets it in `on_exit`.
+- The `force_on` flag acts as a **synthetic consumer**: while true, the camera stays lit even with no real consumer attached (used for previewing in the GUI without opening Meet). There is intentionally no "GUI window is open ⇒ camera on" coupling — that would defeat the NVIDIA-Broadcast-style "camera only runs when actually being used" promise the lazy mode exists to deliver.
 
 ### Cross-cutting conventions
 

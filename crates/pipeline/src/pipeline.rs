@@ -92,10 +92,6 @@ pub enum Command {
     SetBackground(Background),
     /// Pin the camera on regardless of consumer count. Sidebar toggle.
     SetForceOn(bool),
-    /// GUI heartbeat: while true, the GUI counts as a synthetic
-    /// consumer (preview pane visible). Cleared when the window is
-    /// minimised or closed.
-    SetGuiPreviewActive(bool),
     Stop,
 }
 
@@ -128,8 +124,7 @@ impl Pipeline {
     /// Build the sink graph, start the consumer watcher and the feeder
     /// thread, and return. The physical camera is **not** opened until
     /// either a consumer attaches to `/dev/video10` or the caller asserts
-    /// demand via [`Command::SetForceOn`] /
-    /// [`Command::SetGuiPreviewActive`].
+    /// demand via [`Command::SetForceOn`].
     pub fn start(
         cfg: PipelineConfig,
         binary_onnx: &'static [u8],
