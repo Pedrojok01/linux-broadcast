@@ -1,49 +1,85 @@
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use eframe::egui::{self, Color32, Margin, Rounding, Stroke};
+use eframe::egui::{self, Color32, Margin, Rounding, Stroke, ViewportCommand};
 use lb_pipeline::{Background, Command, Pipeline, PipelineConfig, PreviewFrame};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use lb_pipeline::PipelineState;
+
+use crate::autostart;
 use crate::backgrounds::{self, LibraryEntry};
 use crate::cameras::{enumerate, CameraEntry};
 use crate::config::{Config, Mode, Model};
 use crate::theme::{self, color, control, radius, space};
+use crate::tray::{Tray, TrayEvent};
 use crate::{MODEL_BINARY_ONNX, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX};
 
-/// Headless mode (no GUI) — same blocking behaviour as the v1 CLI binary.
-pub fn run_headless() -> Result<()> {
-    let cfg = Config::load();
-    let pcfg = pipeline_config_from(&cfg, None);
-    log::info!(
-        "starting headless pipeline {} → {} ({}x{}@{}fps)",
-        pcfg.source_device,
-        pcfg.sink_device,
-        pcfg.width,
-        pcfg.height,
-        pcfg.framerate,
-    );
-    let pipeline = Pipeline::start(
-        pcfg,
-        MODEL_BINARY_ONNX,
-        MODEL_MULTICLASS_ONNX,
-        MODEL_RVM_ONNX,
-    )?;
-    pipeline.run_until_done()?;
-    Ok(())
+const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 850.0];
+const MIN_WINDOW_SIZE: [f32; 2] = [820.0, 560.0];
+/// Bounded preview channel capacity: drop old frames if the GUI lags so
+/// the segmentation thread never blocks.
+const PREVIEW_CHANNEL_CAP: usize = 2;
+/// Repaint roughly every 33 ms (~30 Hz) while running. Frame arrival
+/// already drives texture updates; this just guarantees overlay redraws.
+const PREVIEW_REPAINT_MS: u64 = 33;
+const THUMBNAIL_PX: u32 = 160;
+
+/// Maximum time `run_headless` is willing to wait for the sink device to
+/// appear before erroring out. Sized to absorb the worst-case race between
+/// XDG autostart firing and `systemd-modules-load.service` finishing on a
+/// cold boot, while still failing fast when the module genuinely isn't
+/// loaded.
+const HEADLESS_DEVICE_WAIT: Duration = Duration::from_secs(10);
+
+fn wait_for_device(path: &str, timeout: Duration) -> bool {
+    let p = Path::new(path);
+    let start = Instant::now();
+    while !p.exists() {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
-pub fn run_gui() -> Result<()> {
+/// Read the compositor-reported minimized state. `unwrap_or(false)` is
+/// intentional: pre-first-frame and on platforms that don't supply the
+/// field, treat as "not minimized" so a fresh window paints rather than
+/// silently going blank. egui has no `viewport.visible` analogue —
+/// `Visible(false)` is a no-op on Wayland and on other platforms eframe
+/// pauses redraws anyway, so minimized is the only meaningful "is the
+/// surface on the user's screen" signal we get from the toolkit.
+fn is_minimized(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().minimized).unwrap_or(false)
+}
+
+/// Single entry point. `headless` collapses what used to be `run_gui` /
+/// `run_headless` into one eframe loop:
+/// - GUI mode: window visible, pipeline waits for the user to press Start.
+/// - Headless mode: window starts hidden in the tray, pipeline auto-starts
+///   so apps see `/dev/video10` immediately on login.
+///
+/// The window's close button always hides (minimises to tray); only the
+/// tray's Quit menu actually exits. This lets a single instance own
+/// `/dev/video10` for the whole session, addressing the "I autostarted
+/// it on login and now have no way to stop it" pain point.
+pub fn run(headless: bool) -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1000.0, 720.0])
-        .with_min_inner_size([820.0, 560.0])
+        .with_inner_size(INITIAL_WINDOW_SIZE)
+        .with_min_inner_size(MIN_WINDOW_SIZE)
         .with_title("LinuxBroadcast")
         // app_id is required on Wayland for the compositor to match the
         // window to its desktop entry / icon. Must mirror the .desktop
         // file we ship at packaging time.
-        .with_app_id("io.Pedrojok01.LinuxBroadcast")
-        .with_icon(crate::icon::build());
+        .with_app_id("LinuxBroadcast")
+        .with_icon(crate::icon::build())
+        // In headless mode, start hidden so the autostart never flashes
+        // a window. The tray's Show menu (or the user picking
+        // LinuxBroadcast from the launcher) brings it up later.
+        .with_visible(!headless);
     let opts = eframe::NativeOptions {
         viewport,
         ..Default::default()
@@ -51,9 +87,9 @@ pub fn run_gui() -> Result<()> {
     eframe::run_native(
         "linux-broadcast",
         opts,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc)))
+            Ok(Box::new(App::new(cc, headless)))
         }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
@@ -115,15 +151,74 @@ struct App {
     preview_rx: Option<Receiver<PreviewFrame>>,
     preview_tex: Option<egui::TextureHandle>,
     last_preview_size: Option<[usize; 2]>,
+    /// Cached snapshot of the pipeline's lazy-mode state (Idle / Live
+    /// with consumer list). Refreshed every `update()` call from
+    /// `Pipeline::state()`. Used by the footer.
+    pipeline_state: PipelineState,
+    /// Last value sent for `Command::SetGuiPreviewActive`. We only push
+    /// a fresh command on edges so the feeder isn't spammed.
+    last_preview_active: bool,
     error: Option<String>,
+    /// System tray handle. Held for the whole process lifetime. `None`
+    /// only if the OS has no working tray host (logged at install time);
+    /// the rest of the app continues to work — Quit just becomes
+    /// "close the window with the Quit menu in the GUI".
+    tray: Option<Tray>,
+    /// Set to true by the tray's Quit handler. Without this, our
+    /// close-requested intercept would refuse the close and hide instead.
+    quit_requested: bool,
+    /// Headless launches start with the window hidden. If the tray fails
+    /// to install, the user has no way to interact, so we promote the
+    /// window to visible on the first frame. Consumed (cleared) once.
+    force_unhide_on_first_frame: bool,
+    /// One-shot belt-and-braces for headless cold-start on Wayland:
+    /// `with_visible(false)` set on the ViewportBuilder is best-effort
+    /// (xdg-shell has no formal "start hidden" verb), so we explicitly
+    /// send `Minimized(true)` from the first `update()` tick to make
+    /// sure the surface is actually off-screen. Mutually exclusive with
+    /// `force_unhide_on_first_frame` (only one can be true).
+    headless_minimize_pending: bool,
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, headless: bool) -> Self {
         let cfg = Config::load();
+        // Bring the on-disk autostart entry in line with the saved
+        // preference. Cheap to call, no-op when in sync.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Err(e) = autostart::reconcile(cfg.start_on_login, &exe) {
+                log::warn!("autostart reconcile: {e:#}");
+            }
+        }
         let cameras = enumerate(&cfg.sink_device);
         let library = backgrounds::list();
-        Self {
+
+        let tray = match Tray::install() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::warn!("tray icon install failed: {e:#} — Quit only via menu inside the GUI");
+                None
+            }
+        };
+
+        // Headless + tray-init failure would otherwise leave the user
+        // with no way to interact: window starts hidden, no tray menu,
+        // and InstanceLock blocks any second launch. Promote the window
+        // to visible on the first frame and surface a hint in the
+        // header.
+        let tray_missing = tray.is_none();
+        let force_unhide_on_first_frame = headless && tray_missing;
+        let headless_minimize_pending = headless && !force_unhide_on_first_frame;
+        let initial_error = if force_unhide_on_first_frame {
+            Some(
+                "Tray icon unavailable — close button hides the window; use Quit to exit."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let mut app = Self {
             cfg,
             cameras,
             library,
@@ -133,8 +228,33 @@ impl App {
             preview_rx: None,
             preview_tex: None,
             last_preview_size: None,
-            error: None,
+            pipeline_state: PipelineState::default(),
+            last_preview_active: false,
+            error: initial_error,
+            tray,
+            quit_requested: false,
+            force_unhide_on_first_frame,
+            headless_minimize_pending,
+        };
+
+        if headless {
+            // Headless = login auto-start. Wait briefly for the v4l2
+            // sink to appear (cold boot may have us racing against
+            // systemd-modules-load.service), then start the pipeline.
+            let sink = app.cfg.sink_device.clone();
+            if wait_for_device(&sink, HEADLESS_DEVICE_WAIT) {
+                app.start_pipeline();
+            } else {
+                let msg = format!(
+                    "headless start: {} did not appear within {:?} — is v4l2loopback loaded?",
+                    sink, HEADLESS_DEVICE_WAIT,
+                );
+                log::error!("{msg}");
+                app.error = Some(msg);
+            }
         }
+
+        app
     }
 
     fn save_settings(&self) {
@@ -157,7 +277,8 @@ impl App {
         if self.running() {
             return;
         }
-        let (tx, rx) = crossbeam_channel::bounded::<PreviewFrame>(2);
+
+        let (tx, rx) = crossbeam_channel::bounded::<PreviewFrame>(PREVIEW_CHANNEL_CAP);
         let pcfg = pipeline_config_from(&self.cfg, Some(tx));
         match Pipeline::start(
             pcfg,
@@ -166,11 +287,20 @@ impl App {
             MODEL_RVM_ONNX,
         ) {
             Ok(p) => {
-                self.cmd_tx = Some(p.cmd_sender());
+                let cmd_tx = p.cmd_sender();
+                // Push the saved force_on preference to the freshly
+                // started pipeline so the toggle survives Stop+Start
+                // cycles (model swaps, camera swaps).
+                if self.cfg.force_on {
+                    let _ = cmd_tx.send(Command::SetForceOn(true));
+                }
+                self.cmd_tx = Some(cmd_tx);
                 self.pipeline = Some(p);
                 self.preview_rx = Some(rx);
                 self.preview_tex = None;
                 self.last_preview_size = None;
+                self.last_preview_active = false;
+                self.pipeline_state = PipelineState::default();
                 self.error = None;
             }
             Err(e) => {
@@ -190,6 +320,8 @@ impl App {
         self.preview_rx = None;
         self.preview_tex = None;
         self.last_preview_size = None;
+        self.pipeline_state = PipelineState::default();
+        self.last_preview_active = false;
     }
 
     fn restart_pipeline(&mut self) {
@@ -202,6 +334,20 @@ impl App {
     fn update_background_live(&mut self) {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(Command::SetBackground(build_background(&self.cfg)));
+        }
+    }
+
+    /// Edge-triggered heartbeat: only sends a `SetGuiPreviewActive`
+    /// command when the value differs from the last one. eframe calls
+    /// `update()` ~30×/sec while the window is being painted, so flood
+    /// protection matters.
+    fn send_preview_heartbeat(&mut self, active: bool) {
+        if active == self.last_preview_active {
+            return;
+        }
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(Command::SetGuiPreviewActive(active));
+            self.last_preview_active = active;
         }
     }
 
@@ -237,7 +383,10 @@ impl App {
         if let Some(t) = self.thumbnails.get(path) {
             return Some(t.clone());
         }
-        let img = image::open(path).ok()?.thumbnail(160, 160).to_rgba8();
+        let img = image::open(path)
+            .ok()?
+            .thumbnail(THUMBNAIL_PX, THUMBNAIL_PX)
+            .to_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
         let tex = ctx.load_texture(
@@ -256,6 +405,66 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 0a. One-shot: headless cold start. `with_visible(false)` on the
+        //     ViewportBuilder is best-effort on Wayland; explicitly send
+        //     `Minimized(true)` from the first frame so the compositor
+        //     reliably puts the surface off-screen. We also treat this
+        //     frame as "hidden" for heartbeat purposes (see below) so a
+        //     spurious activation doesn't fire while the command is in
+        //     flight.
+        let starting_headless_hidden = self.headless_minimize_pending;
+        if self.headless_minimize_pending {
+            self.headless_minimize_pending = false;
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        }
+
+        // 0b. One-shot: if we started headless but the tray failed to
+        //     install, promote the window to visible so the user can
+        //     actually interact with the app. Mutually exclusive with 0a.
+        if self.force_unhide_on_first_frame {
+            self.force_unhide_on_first_frame = false;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+
+        // 1. Tray events first — they may toggle visibility or quit, and
+        //    we want both effects applied before we lay out a frame.
+        self.handle_tray_events(ctx);
+
+        // 2. Close-button intercept: turn the close request into a hide
+        //    unless `quit_requested` is set (i.e. the tray's Quit just
+        //    fired).
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.set_visible(ctx, false);
+        }
+
+        // 3. Read the *compositor-reported* minimized state and gate the
+        //    GUI preview heartbeat on it. Unlike a client-side bool, this
+        //    can't desync from reality: when the user un-minimizes via
+        //    the taskbar, the next frame correctly reports `false` and
+        //    we resume normal painting. Egui has no `viewport.visible`
+        //    field — `Visible(false)` on Wayland is a no-op and on
+        //    other platforms eframe pauses redraws anyway, so minimized
+        //    is the only meaningful signal here.
+        let minimized = is_minimized(ctx) || starting_headless_hidden;
+        self.send_preview_heartbeat(!minimized);
+
+        // 4. While minimized, skip layout entirely. eframe's repaint
+        //    request keeps the loop ticking so tray events still land.
+        if minimized {
+            ctx.request_repaint_after(Duration::from_millis(150));
+            return;
+        }
+
+        // Refresh the cached pipeline state for the footer; this also
+        // doubles as cheap evidence that the pipeline is still alive.
+        // Done after the early-return so we don't pay it on minimized
+        // ticks.
+        if let Some(p) = &self.pipeline {
+            self.pipeline_state = p.state();
+        }
+
         self.drain_preview(ctx);
 
         // Whole window fill (otherwise the area outside panels uses defaults).
@@ -267,13 +476,77 @@ impl eframe::App for App {
         self.preview_pane(ctx);
 
         if self.running() {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(PREVIEW_REPAINT_MS));
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Tell the running pipeline we no longer count as a consumer
+        // before tearing it down — the brief drop is a no-op since stop
+        // immediately follows, but it's the right ordering.
+        self.send_preview_heartbeat(false);
         self.stop_pipeline();
         self.save_settings();
+    }
+}
+
+impl App {
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else { return };
+        // Collect first so we don't borrow `self.tray` across the
+        // mutating calls below.
+        let events: Vec<TrayEvent> = tray.drain().collect();
+        for evt in events {
+            match evt {
+                TrayEvent::Show => self.set_visible(ctx, true),
+                TrayEvent::Hide => self.set_visible(ctx, false),
+                TrayEvent::Quit => {
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Idempotent visibility request. Doesn't track local state — every
+    /// call just emits the appropriate viewport commands and lets the
+    /// compositor be the source of truth (read back via
+    /// `is_minimized(ctx)` in `update()`). Sending `Visible(true)` to
+    /// an already-visible window is a harmless re-assert; same for the
+    /// other direction.
+    fn set_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        if visible {
+            // Un-minimize first so the compositor remaps the surface,
+            // then ask for visibility (X11/Win/macOS), then take focus.
+            // Order matters on KDE Plasma: focus on a still-minimized
+            // toplevel is silently dropped.
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        } else {
+            // Belt-and-braces against `update()` going silent on some
+            // Wayland compositors after a hide: push the heartbeat-false
+            // edge *now*, synchronously, so the lazy pipeline learns
+            // the GUI stopped watching even if no further frame arrives.
+            // The per-frame heartbeat in `update()` is the other half
+            // of the same story (covers OS-minimize without a hide call).
+            self.send_preview_heartbeat(false);
+
+            // `Visible(false)` is a no-op on Wayland (xdg-shell has no
+            // "hide toplevel" verb — only destroy or minimize), so we
+            // pair it with `Minimized(true)`, which xdg-shell *does*
+            // honor:
+            // - X11 / Windows / macOS: Visible(false) takes effect, the
+            //   window vanishes from the taskbar entirely; the Minimized
+            //   request lands harmlessly on an unmapped window.
+            // - Wayland: Visible(false) is dropped, but Minimized takes
+            //   the surface off-screen. The taskbar entry stays — that
+            //   compromise is unavoidable without compositor-specific
+            //   protocol extensions, and it's the same UX every other
+            //   "minimize to tray" Wayland app ships with today.
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
     }
 }
 
@@ -329,6 +602,13 @@ impl App {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(space::LG);
+                        // No tray host (or it failed to install) → keep a
+                        // reachable Quit button in the header so the user
+                        // is never stranded.
+                        if self.tray.is_none() && ghost_button(ui, "Quit").clicked() {
+                            self.quit_requested = true;
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        }
                         if let Some(err) = &self.error {
                             let err = err.clone();
                             ui.label(egui::RichText::new(err).small().color(color::DANGER));
@@ -349,15 +629,11 @@ impl App {
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(space::LG);
-                    if self.running() {
-                        ui.label(egui::RichText::new("●").color(color::SUCCESS).small());
-                        ui.add_space(space::XS);
-                        ui.label(egui::RichText::new("Running").small().color(color::SUCCESS));
-                    } else {
-                        ui.label(egui::RichText::new("●").color(color::TEXT_MUTED).small());
-                        ui.add_space(space::XS);
-                        ui.label(egui::RichText::new("Idle").small().color(color::TEXT_MUTED));
-                    }
+                    let (dot_color, label, label_color) =
+                        footer_status(self.running(), &self.pipeline_state, self.cfg.force_on);
+                    ui.label(egui::RichText::new("●").color(dot_color).small());
+                    ui.add_space(space::XS);
+                    ui.label(egui::RichText::new(label).small().color(label_color));
                     ui.add_space(space::MD);
                     sep(ui);
                     ui.add_space(space::MD);
@@ -399,15 +675,35 @@ impl App {
                     .inner_margin(Margin::symmetric(space::LG, space::PANEL_PAD_Y)),
             )
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = space::SECTION_GAP;
-                ui.style_mut().spacing.item_spacing.y = space::SECTION_GAP;
+                // Reserve a fixed bottom strip for the primary action so it
+                // can never be pushed off-screen by tall sections (Library,
+                // Settings, …). The remaining top region holds the sections
+                // inside a ScrollArea so short windows stay usable.
+                let panel_rect = ui.max_rect();
+                let action_h = control::PRIMARY_HEIGHT;
+                let action_rect = egui::Rect::from_min_max(
+                    egui::pos2(panel_rect.min.x, panel_rect.max.y - action_h),
+                    panel_rect.max,
+                );
+                let scroll_rect = egui::Rect::from_min_max(
+                    panel_rect.min,
+                    egui::pos2(panel_rect.max.x, action_rect.min.y - space::MD),
+                );
 
-                self.sidebar_camera(ui);
-                self.sidebar_model(ui);
-                self.sidebar_scene(ui);
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = space::SECTION_GAP;
+                            ui.style_mut().spacing.item_spacing.y = space::SECTION_GAP;
+                            self.sidebar_camera(ui);
+                            self.sidebar_model(ui);
+                            self.sidebar_scene(ui);
+                            self.sidebar_settings(ui);
+                        });
+                });
 
-                // Push primary action to the bottom.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(action_rect), |ui| {
                     self.primary_action(ui);
                 });
             });
@@ -513,22 +809,6 @@ impl App {
                                 ui,
                                 &format!("● Sending to {}", self.cfg.sink_device),
                                 color::DANGER,
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let mirror_label = if self.cfg.mirror {
-                                        "↔ Mirror ON"
-                                    } else {
-                                        "↔ Mirror"
-                                    };
-                                    if floating_pill_button(ui, mirror_label, self.cfg.mirror)
-                                        .clicked()
-                                    {
-                                        self.cfg.mirror = !self.cfg.mirror;
-                                        self.save_settings();
-                                    }
-                                },
                             );
                         });
                     });
@@ -1015,6 +1295,58 @@ impl App {
         });
     }
 
+    /// Small settings panel under the scene controls. Right now it only
+    /// holds the Start-on-login toggle, but the section caption keeps it
+    /// extensible for future per-user preferences (fps, …).
+    fn sidebar_settings(&mut self, ui: &mut egui::Ui) {
+        theme::section_caption(ui, "Settings");
+        ui.add_space(space::SM);
+
+        // Start-on-login toggle.
+        if toggle_row(
+            ui,
+            self.cfg.start_on_login,
+            "Start on login",
+            "Run headless at login so apps see the cam",
+        ) {
+            self.cfg.start_on_login = !self.cfg.start_on_login;
+            self.save_settings();
+            // Match the on-disk autostart entry to the new preference.
+            // Failure here is non-fatal — surface it to the user via the
+            // header so they know the setting didn't take.
+            let exe = std::env::current_exe().ok();
+            let result = match (self.cfg.start_on_login, exe.as_deref()) {
+                (true, Some(p)) => autostart::install(p),
+                (true, None) => Err(anyhow!("could not resolve current binary path")),
+                (false, _) => autostart::uninstall(),
+            };
+            if let Err(e) = result {
+                log::warn!("autostart toggle: {e:#}");
+                self.error = Some(format!("Autostart toggle failed: {e:#}"));
+            }
+        }
+
+        ui.add_space(space::SM);
+
+        // Force-camera-on toggle. Default behaviour is lazy mode: the
+        // physical camera lights only when something is reading
+        // /dev/video10 (or this GUI is open with the preview pane
+        // visible). Flipping this on pins the camera regardless —
+        // useful for streamer/rehearsal flows.
+        if toggle_row(
+            ui,
+            self.cfg.force_on,
+            "Force camera on",
+            "Keep camera lit even when no app is reading",
+        ) {
+            self.cfg.force_on = !self.cfg.force_on;
+            self.save_settings();
+            if let Some(tx) = &self.cmd_tx {
+                let _ = tx.send(Command::SetForceOn(self.cfg.force_on));
+            }
+        }
+    }
+
     fn primary_action(&mut self, ui: &mut egui::Ui) {
         let running = self.running();
         let label = if running {
@@ -1151,39 +1483,6 @@ fn floating_pill(ui: &mut egui::Ui, text: &str, accent: Color32) {
     );
 }
 
-fn floating_pill_button(ui: &mut egui::Ui, text: &str, active: bool) -> egui::Response {
-    let font = egui::FontId::proportional(11.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font.clone(), color::TEXT));
-    let pad = egui::vec2(12.0, 7.0);
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
-    let p = ui.painter();
-    let stroke_color = if active {
-        color::ACCENT
-    } else if resp.hovered() {
-        color::STROKE_STRONG
-    } else {
-        color::STROKE_STRONG.linear_multiply(0.7)
-    };
-    p.rect(
-        rect,
-        Rounding::same(999.0),
-        Color32::from_rgba_premultiplied(0x08, 0x0A, 0x0E, 0xC0),
-        Stroke::new(1.0, stroke_color),
-    );
-    p.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        font,
-        if active {
-            color::ACCENT
-        } else {
-            color::TEXT_WEAK
-        },
-    );
-    resp
-}
-
 fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let font = egui::FontId::proportional(11.0);
     let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font.clone(), color::TEXT_WEAK));
@@ -1209,6 +1508,116 @@ fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         text_color,
     );
     resp
+}
+
+/// Settings-section toggle row: title + subtitle on the left, pill
+/// switch on the right. Returns `true` on click so the caller can flip
+/// the underlying value and run any side effects.
+fn toggle_row(ui: &mut egui::Ui, active: bool, title: &str, subtitle: &str) -> bool {
+    let row_h = 36.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_h),
+        egui::Sense::click(),
+    );
+    let p = ui.painter();
+    let stroke_color = if active {
+        color::ACCENT.linear_multiply(0.6)
+    } else if resp.hovered() {
+        color::STROKE_STRONG
+    } else {
+        color::STROKE
+    };
+    p.rect(
+        rect,
+        Rounding::same(radius::MD),
+        color::PANEL_INSET,
+        Stroke::new(1.0, stroke_color),
+    );
+    p.text(
+        rect.left_center() + egui::vec2(12.0, -6.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(13.0),
+        color::TEXT,
+    );
+    p.text(
+        rect.left_center() + egui::vec2(12.0, 8.0),
+        egui::Align2::LEFT_CENTER,
+        subtitle,
+        egui::FontId::proportional(10.5),
+        color::TEXT_MUTED,
+    );
+    let switch_w = 32.0;
+    let switch_h = 18.0;
+    let switch_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 12.0 - switch_w / 2.0, rect.center().y),
+        egui::vec2(switch_w, switch_h),
+    );
+    let track_color = if active {
+        color::ACCENT
+    } else {
+        color::STROKE_STRONG
+    };
+    p.rect_filled(switch_rect, Rounding::same(switch_h / 2.0), track_color);
+    let knob_x = if active {
+        switch_rect.right() - switch_h / 2.0
+    } else {
+        switch_rect.left() + switch_h / 2.0
+    };
+    p.circle_filled(
+        egui::pos2(knob_x, switch_rect.center().y),
+        switch_h / 2.0 - 2.0,
+        color::TEXT,
+    );
+    resp.clicked()
+}
+
+/// Compute the footer status indicator for the current pipeline state.
+/// Returns `(dot_color, label, label_color)`.
+///
+/// Three layers of nuance:
+/// - pipeline not running at all → grey "Idle".
+/// - running but lazy state is Idle (no consumer, no force-on) → blue
+///   "Standby" so the user sees the difference between "the app is on
+///   but the camera is off" and "the app is off".
+/// - running and Live → green "LIVE → name(pid)" if there's a real
+///   consumer, otherwise green "LIVE (force-on)" / "LIVE (preview)".
+fn footer_status(
+    running: bool,
+    state: &PipelineState,
+    force_on: bool,
+) -> (Color32, String, Color32) {
+    if !running {
+        return (color::TEXT_MUTED, "Idle".to_string(), color::TEXT_MUTED);
+    }
+    match state {
+        PipelineState::Live { consumers } if !consumers.is_empty() => {
+            // Show the first consumer; if there are several, append a count.
+            let first = &consumers[0];
+            let label = if consumers.len() == 1 {
+                format!("LIVE → {} ({})", first.name, first.pid)
+            } else {
+                format!(
+                    "LIVE → {} ({}) + {}",
+                    first.name,
+                    first.pid,
+                    consumers.len() - 1
+                )
+            };
+            (color::SUCCESS, label, color::SUCCESS)
+        }
+        PipelineState::Live { .. } => {
+            // Live without external consumers: GUI preview heartbeat or
+            // force-on is the demand source.
+            let reason = if force_on { "force-on" } else { "preview" };
+            (color::SUCCESS, format!("LIVE ({reason})"), color::SUCCESS)
+        }
+        PipelineState::Idle => (
+            color::ACCENT,
+            "Standby (no consumer)".to_string(),
+            color::ACCENT,
+        ),
+    }
 }
 
 fn sep(ui: &mut egui::Ui) {

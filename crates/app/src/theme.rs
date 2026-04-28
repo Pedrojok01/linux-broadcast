@@ -8,7 +8,7 @@ use eframe::egui::{
 const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Variable.ttf");
 const JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
-/// Token palette — matches `tokens.json#color`.
+/// Token palette — see `DESIGN.md` for the colour rationale.
 pub mod color {
     use super::Color32;
     pub const BG: Color32 = Color32::from_rgb(0x0B, 0x0E, 0x13);
@@ -31,7 +31,7 @@ pub mod color {
     pub const SUCCESS: Color32 = Color32::from_rgb(0x7F, 0xCB, 0x8E);
 }
 
-/// Token spacing — matches `tokens.json#spacing`.
+/// Token spacing — see `DESIGN.md` for the scale.
 pub mod space {
     pub const XS: f32 = 4.0;
     pub const SM: f32 = 8.0;

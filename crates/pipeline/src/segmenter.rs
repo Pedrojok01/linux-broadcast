@@ -406,9 +406,15 @@ impl RvmInner {
     }
 }
 
+/// Hard cap on intra-op threads. ORT + CPU EP gets diminishing returns
+/// past 4 threads on the workloads we run (256×256 conv stacks), and
+/// burning more cores hurts when other apps share the host.
+const MAX_INTRA_THREADS: usize = 4;
+const FALLBACK_THREADS: usize = 2;
+
 fn num_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(2)
-        .clamp(1, 4)
+        .unwrap_or(FALLBACK_THREADS)
+        .clamp(1, MAX_INTRA_THREADS)
 }

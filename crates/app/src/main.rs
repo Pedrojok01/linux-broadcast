@@ -1,12 +1,17 @@
+mod autostart;
 mod backgrounds;
 mod cameras;
 mod config;
 mod desktop_install;
 mod icon;
+mod lock;
 mod theme;
+mod tray;
 mod ui;
 
 use anyhow::Result;
+
+use crate::lock::InstanceLock;
 
 /// Bundled MediaPipe Selfie Segmentation ONNX (binary, ~450 KB).
 /// Sourced from `onnx-community/mediapipe_selfie_segmentation` on Hugging Face.
@@ -34,11 +39,33 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if std::env::var_os("LB_HEADLESS").is_some() {
-        return ui::run_headless();
+    // Process-level single-instance lock. With lazy mode, the pipeline
+    // can sit idle (no v4l2sink contention) for arbitrarily long, so we
+    // need a real lock that covers the whole LB process — otherwise two
+    // LB instances would both poll for consumers and race when one
+    // arrives. Held until `main` returns.
+    let _instance_lock = match InstanceLock::try_acquire()? {
+        Some(l) => l,
+        None => {
+            log::info!("another LinuxBroadcast instance is already running; exiting");
+            return Ok(());
+        }
+    };
+
+    // Headless mode = same eframe loop, but starts with the window
+    // hidden in the tray and auto-starts the pipeline. Same UX as the
+    // old separate code path (autostart on login, no window flash), but
+    // a single, testable code path. Triggered by `--headless` (used by
+    // the autostart .desktop) or `LB_HEADLESS=1` (kept for back-compat).
+    let argv: Vec<String> = std::env::args().collect();
+    let headless =
+        argv.iter().any(|a| a == "--headless") || std::env::var_os("LB_HEADLESS").is_some();
+
+    if !headless {
+        if let Err(e) = desktop_install::ensure_desktop_entry() {
+            log::warn!("desktop entry install: {e:#}");
+        }
     }
-    if let Err(e) = desktop_install::ensure_desktop_entry() {
-        log::warn!("desktop entry install: {e:#}");
-    }
-    ui::run_gui()
+
+    ui::run(headless)
 }

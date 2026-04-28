@@ -7,6 +7,16 @@ use fast_image_resize::{
 
 use crate::Mask;
 
+/// Minimum kernel radius (px) at `strength = 0.0`. Below this the blur is
+/// imperceptible and the foreground edge stops being legible.
+pub const BLUR_MIN_RADIUS: usize = 4;
+/// Maximum kernel radius (px) at `strength = 1.0`. Past ~32 px the
+/// background becomes unreadable for any text or facial cues.
+pub const BLUR_MAX_RADIUS: usize = 32;
+/// Radius (px) at and above which the second blur pass kicks in to push
+/// the box-kernel output closer to a Gaussian.
+const BLUR_TWO_PASS_THRESHOLD: usize = 8;
+
 /// Background mode the compositor should produce behind the foreground mask.
 #[derive(Debug, Clone)]
 pub enum Background {
@@ -15,8 +25,8 @@ pub enum Background {
     /// upsample and the per-pixel blend.
     None,
     /// Gaussian-blur the original frame and use that as the background.
-    /// `strength` is in `[0.0, 1.0]` and maps to a kernel radius from a
-    /// barely-visible 4 px (0.0) to a strong ~32 px (1.0).
+    /// `strength` is in `[0.0, 1.0]` and maps to a kernel radius from
+    /// `BLUR_MIN_RADIUS` (barely-visible) to `BLUR_MAX_RADIUS` (strong).
     Blur { strength: f32 },
     /// Composite over a static RGBA image, scaled to cover the frame.
     Image {
@@ -176,20 +186,19 @@ impl Default for Compositor {
     }
 }
 
-/// Box-blur approximation good enough for a "Broadcast-like" backdrop blur.
 /// Two passes of a separable box kernel approximate a Gaussian with σ ≈
-/// 1.5×radius. `strength` ∈ [0,1] maps to a radius from 4 to 32 px.
+/// 1.5×radius. `strength` ∈ [0,1] maps to a radius from
+/// `BLUR_MIN_RADIUS` to `BLUR_MAX_RADIUS` px.
 fn composite_blur(frame: &mut [u8], width: u32, height: u32, mask: &[f32], strength: f32) {
     let w = width as usize;
     let h = height as usize;
-    // Map strength → kernel radius. Min 4 px so "0%" is still slightly soft;
-    // max 32 px is well into "you can't read text" territory.
     let s = strength.clamp(0.0, 1.0);
-    let radius = (4.0 + s * 28.0).round() as usize;
+    let span = (BLUR_MAX_RADIUS - BLUR_MIN_RADIUS) as f32;
+    let radius = (BLUR_MIN_RADIUS as f32 + s * span).round() as usize;
     // Two passes → quasi-Gaussian. Skip second pass for very small radii.
     let mut blurred = frame.to_vec();
     box_blur_rgba(&mut blurred, w, h, radius);
-    if radius >= 8 {
+    if radius >= BLUR_TWO_PASS_THRESHOLD {
         box_blur_rgba(&mut blurred, w, h, radius);
     }
 

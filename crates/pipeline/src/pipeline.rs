@@ -1,20 +1,53 @@
+//! Public pipeline facade.
+//!
+//! The pipeline is split into:
+//! - a **sink** GStreamer graph (`appsrc → videoconvert → v4l2sink`) that
+//!   stays in PLAYING for the entire lifetime of the process. It owns
+//!   `/dev/video10` so the virtual cam never blinks out of conferencing
+//!   apps' device lists.
+//! - a **source** GStreamer graph (`v4l2src → … → appsink`) that is
+//!   built on demand when a real consumer attaches and torn down again
+//!   on idle. This is the only branch that actually opens
+//!   `/dev/video0`, so dropping it lets the kernel close the camera and
+//!   the LED goes off.
+//!
+//! Both graphs are glued together by a single feeder thread (in
+//! [`crate::lazy`]) which also owns the segmenter / compositor / EMA
+//! smoother and the lazy-mode state machine. Callers never see this
+//! split — the public [`Pipeline`] handle behaves like a single object.
+
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 
-use crate::compositor::{Background, Compositor};
-use crate::segmenter::{ModelKind, Segmenter};
-use crate::temporal::MaskSmoother;
+use crate::compositor::Background;
+use crate::consumer_watch::{Consumer, Watcher};
+use crate::lazy::spawn_feeder;
+use crate::segmenter::ModelKind;
+
+pub(crate) const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// How often the consumer watcher polls `/proc/*/fd`. Tuned against the
+/// activation debounce: we want at least one poll cycle inside the
+/// debounce window so a real consumer is observed before the timeout.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Source v4l2 device, e.g. `/dev/video0`.
     pub source_device: String,
-    /// Sink v4l2loopback device, e.g. `/dev/video10`.
+    /// Sink v4l2loopback device, e.g. `/dev/video10`. The `.deb` ships
+    /// conffiles in `/etc/modprobe.d/` + `/etc/modules-load.d/` that
+    /// guarantee this exists at boot; source builds need a manual
+    /// `modprobe v4l2loopback`.
     pub sink_device: String,
     pub width: u32,
     pub height: u32,
@@ -22,9 +55,9 @@ pub struct PipelineConfig {
     pub background: Background,
     /// Which segmentation model to load.
     pub model: ModelKind,
-    /// If `Some`, each composited frame is forwarded (RGBA) to this sender for
-    /// the GUI's preview pane. Bounded; sends use `try_send` and silently drop
-    /// when the GUI is slow.
+    /// If `Some`, each composited frame is forwarded (RGBA) to this
+    /// sender for the GUI's preview pane. Bounded; sends use `try_send`
+    /// and silently drop when the GUI is slow.
     pub preview_tx: Option<Sender<PreviewFrame>>,
 }
 
@@ -57,16 +90,46 @@ pub struct PreviewFrame {
 #[derive(Debug, Clone)]
 pub enum Command {
     SetBackground(Background),
+    /// Pin the camera on regardless of consumer count. Sidebar toggle.
+    SetForceOn(bool),
+    /// GUI heartbeat: while true, the GUI counts as a synthetic
+    /// consumer (preview pane visible). Cleared when the window is
+    /// minimised or closed.
+    SetGuiPreviewActive(bool),
     Stop,
 }
 
+/// Public pipeline state, polled by the GUI for the footer indicator.
+#[derive(Debug, Clone, Default)]
+pub enum PipelineState {
+    /// Camera released. `/dev/video10` exists but no frames are flowing.
+    #[default]
+    Idle,
+    /// Camera engaged; one or more consumers are reading
+    /// `/dev/video10` (or the `force_on` / GUI preview heartbeat is
+    /// asserting demand).
+    Live { consumers: Vec<Consumer> },
+}
+
 pub struct Pipeline {
-    pipeline: gst::Pipeline,
+    /// Held only for its `Drop` side-effect (signalling its stop flag and
+    /// joining the watcher thread). Listed first so Rust's
+    /// declaration-order field drop runs the watcher's stop+join before
+    /// the rest of the pipeline tears down.
+    _watcher: Watcher,
+    sink_pipeline: gst::Pipeline,
     cmd_tx: Sender<Command>,
+    state: Arc<Mutex<PipelineState>>,
+    feeder: Option<std::thread::JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl Pipeline {
-    /// Build and start the pipeline. Returns once `Playing` is reached.
+    /// Build the sink graph, start the consumer watcher and the feeder
+    /// thread, and return. The physical camera is **not** opened until
+    /// either a consumer attaches to `/dev/video10` or the caller asserts
+    /// demand via [`Command::SetForceOn`] /
+    /// [`Command::SetGuiPreviewActive`].
     pub fn start(
         cfg: PipelineConfig,
         binary_onnx: &'static [u8],
@@ -75,311 +138,74 @@ impl Pipeline {
     ) -> Result<Self> {
         gst::init().context("gst::init")?;
 
-        let pipeline = gst::Pipeline::new();
-
-        // --- Source branch: v4l2src → videoscale → videoconvert → appsink ---
-        // Let v4l2src negotiate whatever format the camera prefers (YUYV,
-        // MJPEG-decoded, NV12, …). videoscale + videoconvert then bridge
-        // the camera-native caps to our RGBA target. Constraining only at
-        // the appsink end avoids 30/1-vs-30000/1001 framerate-fraction
-        // mismatches that fail v4l2src negotiation.
-        let src = gst::ElementFactory::make("v4l2src")
-            .property("device", &cfg.source_device)
-            .property("do-timestamp", true)
-            .build()?;
-        let src_scale = gst::ElementFactory::make("videoscale").build()?;
-        let src_convert = gst::ElementFactory::make("videoconvert").build()?;
-        // Caps between videoconvert and appsink: RGBA at our target size,
-        // framerate left open so the camera's native rate flows through.
-        let appsink_caps = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBA")
-            .field("width", cfg.width as i32)
-            .field("height", cfg.height as i32)
-            .build();
-        let src_capsfilter = gst::ElementFactory::make("capsfilter")
-            .property("caps", &appsink_caps)
-            .build()?;
-        let appsink = gst_app::AppSink::builder()
-            .caps(&appsink_caps)
-            .max_buffers(2)
-            .drop(true)
-            .sync(false)
-            .enable_last_sample(false)
-            .build();
-        // Belt-and-braces: also set sync=false explicitly post-build, since
-        // some gstreamer-rs builder properties don't always round-trip.
-        appsink.set_sync(false);
-        // Caps emitted by appsrc — same RGBA frames, but with an *explicit*
-        // framerate so the downstream videoconvert can match input/output
-        // fps (otherwise gst_video_converter_new asserts fps_n equality).
-        let appsrc_caps = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBA")
-            .field("width", cfg.width as i32)
-            .field("height", cfg.height as i32)
-            .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
-            .build();
-
-        // --- Sink branch: appsrc → videoconvert → v4l2sink ---
-        let appsrc = gst_app::AppSrc::builder()
-            .caps(&appsrc_caps)
-            .format(gst::Format::Time)
-            .is_live(true)
-            .build();
-        let sink_convert = gst::ElementFactory::make("videoconvert").build()?;
-        let sink_caps = gst::Caps::builder("video/x-raw")
-            .field("format", "YUY2") // most v4l2loopback consumers prefer YUY2
-            .field("width", cfg.width as i32)
-            .field("height", cfg.height as i32)
-            .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
-            .build();
-        let sink_capsfilter = gst::ElementFactory::make("capsfilter")
-            .property("caps", &sink_caps)
-            .build()?;
-        let v4l2sink = gst::ElementFactory::make("v4l2sink")
-            .property("device", &cfg.sink_device)
-            .property("sync", false)
-            // async=false → don't block pipeline in PAUSED waiting for a
-            // preroll buffer from appsrc. Without this, the pipeline
-            // deadlocks: v4l2sink waits for preroll, appsrc can't push
-            // because new_sample never fires while we're in PAUSED, and
-            // new_sample is what's *supposed* to push the first buffer.
-            .property("async", false)
-            .build()?;
-
-        pipeline.add_many([
-            &src,
-            &src_scale,
-            &src_convert,
-            &src_capsfilter,
-            appsink.upcast_ref(),
-            appsrc.upcast_ref(),
-            &sink_convert,
-            &sink_capsfilter,
-            &v4l2sink,
-        ])?;
-        gst::Element::link_many([
-            &src,
-            &src_scale,
-            &src_convert,
-            &src_capsfilter,
-            appsink.upcast_ref(),
-        ])?;
-        gst::Element::link_many([
-            appsrc.upcast_ref(),
-            &sink_convert,
-            &sink_capsfilter,
-            &v4l2sink,
-        ])?;
-
-        // Shared state between the appsink callback, command receiver, and main thread.
-        let segmenter = Arc::new(Mutex::new(
-            Segmenter::from_bytes(
-                cfg.model,
-                match cfg.model {
-                    ModelKind::SelfieBinary => binary_onnx,
-                    ModelKind::SelfieMulticlass => multiclass_onnx,
-                    ModelKind::Rvm => rvm_onnx,
-                },
-            )
-            .context("load segmentation model")?,
-        ));
-        let compositor = Arc::new(Mutex::new(Compositor::new()));
-        let smoother = Arc::new(Mutex::new(MaskSmoother::new(0.7)));
-        let background = Arc::new(Mutex::new(cfg.background.clone()));
-
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
-
-        // Command-handling: drain the channel inside the appsink callback so we
-        // don't need a second thread.
-        let bg_for_cmd = Arc::clone(&background);
-        let cmd_drain = move |rx: &Receiver<Command>| {
-            while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    Command::SetBackground(bg) => {
-                        if let Ok(mut slot) = bg_for_cmd.lock() {
-                            *slot = bg;
-                        }
-                    }
-                    Command::Stop => {
-                        // Stop is observed by the main run-loop checking the bus.
-                    }
-                }
-            }
-        };
-
-        let appsrc_clone = appsrc.clone();
-        let segmenter_cb = Arc::clone(&segmenter);
-        let compositor_cb = Arc::clone(&compositor);
-        let smoother_cb = Arc::clone(&smoother);
-        let bg_cb = Arc::clone(&background);
-        let preview_tx_cb = cfg.preview_tx.clone();
-        let frame_w = cfg.width;
-        let frame_h = cfg.height;
-        let fps = cfg.framerate;
-        let mut frame_idx: u64 = 0;
-        let cmd_rx_for_cb = cmd_rx.clone();
-
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_preroll(|sink| {
-                    log::info!("new_preroll fired");
-                    let _ = sink.pull_preroll();
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .new_sample(move |sink| {
-                    cmd_drain(&cmd_rx_for_cb);
-
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                    let in_bytes = map.as_slice();
-
-                    // Copy to a writable scratch we can composite into.
-                    let mut frame_rgba = in_bytes.to_vec();
-
-                    // Snapshot the current background once — used to decide
-                    // whether segmentation can be skipped entirely (None mode
-                    // is pure passthrough).
-                    let bg = bg_cb.lock().unwrap().clone();
-
-                    if !matches!(bg, Background::None) {
-                        // Segmentation.
-                        let mask_res = {
-                            let mut seg = segmenter_cb.lock().unwrap();
-                            seg.segment(&frame_rgba, frame_w as usize, frame_h as usize)
-                        };
-                        let mut mask = match mask_res {
-                            Ok(m) => m,
-                            Err(e) => {
-                                log::error!("segment: {e:#}");
-                                return Err(gst::FlowError::Error);
-                            }
-                        };
-
-                        // EMA across frames to damp shimmer. Other post
-                        // (smoothstep, feather, light wrap) was tried and
-                        // hurt perceptual quality on this model — the raw
-                        // mask composites cleaner.
-                        smoother_cb.lock().unwrap().smooth(&mut mask.data);
-
-                        if let Err(e) = compositor_cb.lock().unwrap().composite(
-                            &mut frame_rgba,
-                            frame_w,
-                            frame_h,
-                            &mask,
-                            &bg,
-                        ) {
-                            log::error!("composite: {e:#}");
-                            return Err(gst::FlowError::Error);
-                        }
-                    } else {
-                        // Reset both the temporal smoother and any segmenter
-                        // recurrent state (RVM keeps inter-frame state) so
-                        // the next non-None frame starts clean.
-                        smoother_cb.lock().unwrap().reset();
-                        segmenter_cb.lock().unwrap().reset();
-                    }
-
-                    // Push out.
-                    let mut out = gst::Buffer::with_size(frame_rgba.len())
-                        .map_err(|_| gst::FlowError::Error)?;
-                    {
-                        let out_mut = out.get_mut().ok_or(gst::FlowError::Error)?;
-                        let pts =
-                            gst::ClockTime::from_nseconds(frame_idx * 1_000_000_000 / fps as u64);
-                        out_mut.set_pts(pts);
-                        out_mut.set_duration(gst::ClockTime::from_nseconds(
-                            1_000_000_000 / fps as u64,
-                        ));
-                        let mut wmap = out_mut.map_writable().map_err(|_| gst::FlowError::Error)?;
-                        wmap.copy_from_slice(&frame_rgba);
-                    }
-                    frame_idx += 1;
-                    if frame_idx == 1 || frame_idx % fps as u64 == 0 {
-                        log::info!("pushed frame #{} ({}x{} RGBA)", frame_idx, frame_w, frame_h);
-                    }
-                    if let Some(tx) = preview_tx_cb.as_ref() {
-                        // try_send so we silently drop if the GUI hasn't
-                        // consumed the previous frame yet.
-                        let _ = tx.try_send(PreviewFrame {
-                            width: frame_w,
-                            height: frame_h,
-                            rgba: frame_rgba.clone(),
-                        });
-                    }
-                    appsrc_clone
-                        .push_buffer(out)
-                        .map_err(|_| gst::FlowError::Error)?;
-
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-
-        // Install a sync handler so element errors / warnings are visible
-        // immediately, not just when the main loop calls `iter_timed`.
-        if let Some(bus) = pipeline.bus() {
-            bus.set_sync_handler(|_, msg| {
-                match msg.view() {
-                    gst::MessageView::Error(err) => log::error!(
-                        "GST {} :: {} (debug: {})",
-                        err.src()
-                            .map(|s| s.path_string().to_string())
-                            .unwrap_or_default(),
-                        err.error(),
-                        err.debug().unwrap_or_default(),
-                    ),
-                    gst::MessageView::Warning(w) => log::warn!(
-                        "GST {} :: {}",
-                        w.src()
-                            .map(|s| s.path_string().to_string())
-                            .unwrap_or_default(),
-                        w.error(),
-                    ),
-                    _ => {}
-                }
-                gst::BusSyncReply::Pass
-            });
-        }
-
-        pipeline.set_state(gst::State::Playing).map_err(|e| {
-            let bus_errs = drain_bus_errors(&pipeline);
+        // 1. Sink graph (always-on owner of /dev/video10).
+        let (sink_pipeline, sink_appsrc) = build_sink_pipeline(&cfg)?;
+        install_bus_logger(&sink_pipeline, "sink");
+        sink_pipeline.set_state(gst::State::Playing).map_err(|e| {
+            let bus_errs = drain_bus_errors(&sink_pipeline);
             if bus_errs.is_empty() {
-                anyhow!("set pipeline to Playing: {e}")
+                anyhow!("set sink pipeline to Playing: {e}")
             } else {
-                anyhow!("set pipeline to Playing: {e}\n{}", bus_errs.join("\n"))
+                anyhow!("set sink pipeline to Playing: {e}\n{}", bus_errs.join("\n"))
             }
         })?;
 
-        // Sanity log of negotiated caps.
-        if let Some(pad) = appsink.static_pad("sink") {
-            if let Some(caps) = pad.current_caps() {
-                if let Ok(info) = gst_video::VideoInfo::from_caps(&caps) {
-                    log::info!(
-                        "negotiated input: {}x{} @ {}/{} fps, format {:?}",
-                        info.width(),
-                        info.height(),
-                        info.fps().numer(),
-                        info.fps().denom(),
-                        info.format(),
-                    );
-                }
-            }
-        }
+        // 2. Channels.
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
+        let state = Arc::new(Mutex::new(PipelineState::default()));
+        let stop_flag = Arc::new(AtomicBool::new(false));
 
-        Ok(Self { pipeline, cmd_tx })
+        // 3. Consumer watcher — excludes our own PID so we don't see
+        //    ourselves as a consumer (the v4l2sink holds /dev/video10
+        //    open as the *producer*, but `/proc/<our pid>/fd` lists it
+        //    too).
+        let watcher = Watcher::start(
+            cfg.sink_device.clone(),
+            std::process::id(),
+            WATCH_POLL_INTERVAL,
+        );
+        let watcher_rx = watcher.events().clone();
+
+        // 4. Feeder thread.
+        let feeder = spawn_feeder(
+            cfg,
+            binary_onnx,
+            multiclass_onnx,
+            rvm_onnx,
+            sink_appsrc,
+            cmd_rx,
+            watcher_rx,
+            Arc::clone(&state),
+            Arc::clone(&stop_flag),
+        )?;
+
+        Ok(Self {
+            sink_pipeline,
+            cmd_tx,
+            state,
+            feeder: Some(feeder),
+            stop_flag,
+            _watcher: watcher,
+        })
     }
 
     pub fn cmd_sender(&self) -> Sender<Command> {
         self.cmd_tx.clone()
     }
 
-    /// Block until EOS or error on the bus.
+    /// Snapshot the current public state. Cheap; backed by an
+    /// `Arc<Mutex<…>>` updated by the feeder on every state-machine
+    /// transition.
+    pub fn state(&self) -> PipelineState {
+        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Block until EOS or error on the sink bus. Used by `--headless`.
     pub fn run_until_done(&self) -> Result<()> {
         let bus = self
-            .pipeline
+            .sink_pipeline
             .bus()
-            .ok_or_else(|| anyhow!("pipeline has no bus"))?;
+            .ok_or_else(|| anyhow!("sink pipeline has no bus"))?;
         for msg in bus.iter_timed(gst::ClockTime::NONE) {
             match msg.view() {
                 gst::MessageView::Eos(_) => break,
@@ -398,14 +224,200 @@ impl Pipeline {
     }
 
     pub fn stop(&self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.stop_flag.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(Command::Stop);
+        let _ = self.sink_pipeline.set_state(gst::State::Null);
     }
 }
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        self.stop_flag.store(true, Ordering::Relaxed);
+        let _ = self.cmd_tx.send(Command::Stop);
+        // Join the feeder *before* tearing the sink down so its final
+        // `push_buffer` calls don't race a NULL appsrc and produce a
+        // burst of "sink appsrc push_buffer" warnings.
+        if let Some(h) = self.feeder.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = h.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
+        let _ = self.sink_pipeline.set_state(gst::State::Null);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Graph builders — used by `Pipeline::start` (sink) and `lazy::Feeder`
+//  (source, on every Live engagement).
+// ---------------------------------------------------------------------------
+
+/// Build the sink graph. The returned `AppSrc` is what the feeder pushes
+/// composited frames into; the pipeline must be set to PLAYING by the
+/// caller (we don't do it here so the caller can attach a bus handler
+/// first).
+pub(crate) fn build_sink_pipeline(
+    cfg: &PipelineConfig,
+) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    let pipeline = gst::Pipeline::new();
+
+    // Caps emitted by appsrc — RGBA at our target size with an *explicit*
+    // framerate so the downstream videoconvert can match input/output
+    // fps (otherwise gst_video_converter_new asserts fps_n equality).
+    let appsrc_caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGBA")
+        .field("width", cfg.width as i32)
+        .field("height", cfg.height as i32)
+        .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
+        .build();
+    let appsrc = gst_app::AppSrc::builder()
+        .caps(&appsrc_caps)
+        .format(gst::Format::Time)
+        .is_live(true)
+        .build();
+
+    let sink_convert = gst::ElementFactory::make("videoconvert").build()?;
+    let sink_caps = gst::Caps::builder("video/x-raw")
+        .field("format", "YUY2") // most v4l2loopback consumers prefer YUY2
+        .field("width", cfg.width as i32)
+        .field("height", cfg.height as i32)
+        .field("framerate", gst::Fraction::new(cfg.framerate as i32, 1))
+        .build();
+    let sink_capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &sink_caps)
+        .build()?;
+    let v4l2sink = gst::ElementFactory::make("v4l2sink")
+        .property("device", &cfg.sink_device)
+        .property("sync", false)
+        // async=false → don't block in PAUSED waiting for a preroll
+        // buffer. With lazy mode the appsrc may go long stretches with
+        // no buffers at all (Idle); blocking on preroll would deadlock
+        // the pipeline transition to PLAYING.
+        .property("async", false)
+        .build()?;
+
+    pipeline.add_many([
+        appsrc.upcast_ref(),
+        &sink_convert,
+        &sink_capsfilter,
+        &v4l2sink,
+    ])?;
+    gst::Element::link_many([
+        appsrc.upcast_ref(),
+        &sink_convert,
+        &sink_capsfilter,
+        &v4l2sink,
+    ])?;
+
+    Ok((pipeline, appsrc))
+}
+
+/// Build the source graph. Returned `AppSink` is pulled by the feeder.
+/// The caller is expected to set the pipeline to PLAYING immediately;
+/// see `lazy::Feeder::start_source`.
+pub(crate) fn build_source_pipeline(
+    cfg: &PipelineConfig,
+) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+    let pipeline = gst::Pipeline::new();
+
+    // Let v4l2src negotiate whatever format the camera prefers (YUYV,
+    // MJPEG-decoded, NV12, …). videoscale + videoconvert then bridge
+    // the camera-native caps to our RGBA target. Constraining only at
+    // the appsink end avoids 30/1-vs-30000/1001 framerate-fraction
+    // mismatches that fail v4l2src negotiation.
+    let src = gst::ElementFactory::make("v4l2src")
+        .property("device", &cfg.source_device)
+        .property("do-timestamp", true)
+        .build()?;
+    let src_scale = gst::ElementFactory::make("videoscale").build()?;
+    let src_convert = gst::ElementFactory::make("videoconvert").build()?;
+    let appsink_caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGBA")
+        .field("width", cfg.width as i32)
+        .field("height", cfg.height as i32)
+        .build();
+    let src_capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &appsink_caps)
+        .build()?;
+    let appsink = gst_app::AppSink::builder()
+        .caps(&appsink_caps)
+        .max_buffers(2)
+        .drop(true)
+        .sync(false)
+        .enable_last_sample(false)
+        .build();
+    appsink.set_sync(false);
+
+    pipeline.add_many([
+        &src,
+        &src_scale,
+        &src_convert,
+        &src_capsfilter,
+        appsink.upcast_ref(),
+    ])?;
+    gst::Element::link_many([
+        &src,
+        &src_scale,
+        &src_convert,
+        &src_capsfilter,
+        appsink.upcast_ref(),
+    ])?;
+
+    install_bus_logger(&pipeline, "source");
+
+    Ok((pipeline, appsink))
+}
+
+/// Read negotiated input caps from a source-pipeline appsink (only
+/// meaningful once the pipeline has reached PLAYING). Logs a one-shot
+/// info line; cheap to call multiple times. The feeder calls this once
+/// per Live engagement.
+pub(crate) fn log_negotiated_input(appsink: &gst_app::AppSink) {
+    let pad = match appsink.static_pad("sink") {
+        Some(p) => p,
+        None => return,
+    };
+    let caps = match pad.current_caps() {
+        Some(c) => c,
+        None => return,
+    };
+    if let Ok(info) = gst_video::VideoInfo::from_caps(&caps) {
+        log::info!(
+            "negotiated input: {}x{} @ {}/{} fps, format {:?}",
+            info.width(),
+            info.height(),
+            info.fps().numer(),
+            info.fps().denom(),
+            info.format(),
+        );
+    }
+}
+
+fn install_bus_logger(pipeline: &gst::Pipeline, tag: &'static str) {
+    if let Some(bus) = pipeline.bus() {
+        bus.set_sync_handler(move |_, msg| {
+            match msg.view() {
+                gst::MessageView::Error(err) => log::error!(
+                    "GST[{tag}] {} :: {} (debug: {})",
+                    err.src()
+                        .map(|s| s.path_string().to_string())
+                        .unwrap_or_default(),
+                    err.error(),
+                    err.debug().unwrap_or_default(),
+                ),
+                gst::MessageView::Warning(w) => log::warn!(
+                    "GST[{tag}] {} :: {}",
+                    w.src()
+                        .map(|s| s.path_string().to_string())
+                        .unwrap_or_default(),
+                    w.error(),
+                ),
+                _ => {}
+            }
+            gst::BusSyncReply::Pass
+        });
     }
 }
 

@@ -39,7 +39,7 @@ impl Model {
 }
 
 const QUALIFIER: &str = "io";
-const ORG: &str = "Pedrojok01";
+const ORG: &str = "linux-broadcast";
 const APP: &str = "linux-broadcast";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -65,8 +65,19 @@ pub struct Config {
     pub mode: Mode,
     pub blur_strength: f32,
     pub background_path: Option<PathBuf>,
-    pub mirror: bool,
     pub model: Model,
+    /// When true, the GUI keeps an XDG-autostart `.desktop` in
+    /// `~/.config/autostart/` so the headless pipeline runs at login and
+    /// `/dev/video10` is populated before any conferencing app starts.
+    /// Off by default — flipping the toggle in the sidebar writes/removes
+    /// the autostart file.
+    pub start_on_login: bool,
+    /// When true, the camera is held on regardless of consumer count.
+    /// Default off; the pipeline's lazy mode opens the camera only while
+    /// a real consumer is reading `/dev/video10` (or the GUI preview
+    /// pane is visible). Useful for streamer/rehearsal flows where the
+    /// camera LED should stay lit.
+    pub force_on: bool,
 }
 
 impl Default for Config {
@@ -75,13 +86,14 @@ impl Default for Config {
             source_device: "/dev/video0".to_string(),
             sink_device: "/dev/video10".to_string(),
             width: 1280,
-            height: 720,
+            height: 800,
             framerate: 30,
             mode: Mode::Blur,
             blur_strength: 0.62,
             background_path: None,
-            mirror: false,
             model: Model::default(),
+            start_on_login: false,
+            force_on: false,
         }
     }
 }

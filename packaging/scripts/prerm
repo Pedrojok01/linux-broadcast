@@ -1,0 +1,16 @@
+#!/bin/sh
+# prerm for linux-broadcast — best-effort module unload. Failure is fine
+# (another consumer may still be holding the device).
+set -e
+
+case "$1" in
+  remove|upgrade|deconfigure)
+    if lsmod 2>/dev/null | grep -q '^v4l2loopback'; then
+      modprobe -r v4l2loopback 2>/dev/null || true
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

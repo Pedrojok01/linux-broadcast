@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LinuxBroadcast
+GenericName=Virtual Webcam
+Comment=Background-replacement virtual webcam
+Exec=/usr/bin/linux-broadcast
+Icon=LinuxBroadcast
+Terminal=false
+StartupNotify=true
+StartupWMClass=LinuxBroadcast
+Categories=AudioVideo;Video;Utility;

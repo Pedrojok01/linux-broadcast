@@ -9,11 +9,10 @@ pub struct CameraEntry {
 /// Enumerate `/dev/video*` capture-capable nodes, excluding `sink_device`.
 ///
 /// We probe each `/dev/videoN` for a friendly name via
-/// `/sys/class/video4linux/videoN/name`; we *don't* try to open the device
-/// (cheap + non-disruptive). The same physical webcam often exposes several
-/// numbered nodes (capture, metadata, control); for v1 we list them all and
-/// let the user pick — Phase 3 can filter to capture-only via a v4l2 ioctl
-/// if it gets noisy.
+/// `/sys/class/video4linux/videoN/name` rather than opening the device —
+/// cheaper and non-disruptive. The same physical webcam often exposes
+/// several numbered nodes (capture, metadata, control) and they all show
+/// up here; filtering to capture-only would require a v4l2 ioctl probe.
 pub fn enumerate(sink_device: &str) -> Vec<CameraEntry> {
     let mut out = Vec::new();
     let glob = match glob::glob("/dev/video*") {

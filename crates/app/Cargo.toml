@@ -30,3 +30,46 @@ toml.workspace = true
 glob.workspace = true
 rfd.workspace = true
 image.workspace = true
+fs2 = "0.4"
+
+# System tray icon. On Linux this needs a GTK thread (spawned in tray.rs)
+# because egui/winit don't host GTK natively. Build deps: libgtk-3-dev,
+# libxdo-dev, libayatana-appindicator3-dev (see README / Debian deps below).
+tray-icon = "0.22"
+gtk = "0.18"
+
+# ---------------------------------------------------------------------------
+# Debian packaging — `cargo deb -p linux-broadcast` reads this block.
+#
+# postinst loads v4l2loopback with the options shipped in
+# /etc/modprobe.d/linux-broadcast.conf so /dev/video10 exists immediately,
+# and the modules-load.d drop-in keeps it loaded across reboots. Both files
+# are conffiles, so user edits survive upgrades.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "linux-broadcast"
+maintainer = "Pedrojok01 <pedrojok@pm.me>"
+copyright = "2026, Pedrojok01"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+LinuxBroadcast is a small virtual webcam that captures your real camera,
+segments the foreground with MediaPipe / RVM on CPU, blurs or replaces
+the background, and exposes the result on /dev/video10 so Zoom, Meet,
+Teams, OBS, Firefox, and Chrome all see it as a regular webcam."""
+section = "video"
+priority = "optional"
+depends = "$auto, v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libayatana-appindicator3-1"
+recommends = "v4l-utils"
+assets = [
+    ["target/release/linux-broadcast", "usr/bin/", "755"],
+    ["../../packaging/LinuxBroadcast.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/LinuxBroadcast.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/linux-broadcast.modprobe.conf", "etc/modprobe.d/linux-broadcast.conf", "644"],
+    ["../../packaging/linux-broadcast.modules-load.conf", "etc/modules-load.d/linux-broadcast.conf", "644"],
+    ["../../README.md", "usr/share/doc/linux-broadcast/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/scripts"
+conf-files = [
+    "/etc/modprobe.d/linux-broadcast.conf",
+    "/etc/modules-load.d/linux-broadcast.conf",
+]

@@ -1,0 +1,40 @@
+#!/bin/sh
+# postinst for linux-broadcast — wires v4l2loopback up so the user never
+# has to think about modprobe. Idempotent; safe to re-run on upgrade.
+set -e
+
+case "$1" in
+  configure)
+    # If the module is already loaded with stale options, drop it so the
+    # next modprobe picks up /etc/modprobe.d/linux-broadcast.conf. Failing
+    # silently here is fine — if anything is currently using the device
+    # we'll just leave it alone and let the next reboot apply our params.
+    if lsmod 2>/dev/null | grep -q '^v4l2loopback'; then
+      modprobe -r v4l2loopback 2>/dev/null || true
+    fi
+
+    # Load now so /dev/video10 exists immediately. If DKMS is still
+    # building the module (rare but happens on first install), this will
+    # fail — but the modules-load.d drop-in guarantees the next boot
+    # loads it cleanly, so we don't fail the install.
+    if ! modprobe v4l2loopback 2>/dev/null; then
+      echo "linux-broadcast: v4l2loopback not loadable yet; will load at next boot" >&2
+    fi
+
+    # Refresh desktop / icon caches so the menu entry shows up without
+    # logout. Both tools are best-effort — missing on some minimal images.
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -t /usr/share/icons/hicolor || true
+    fi
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

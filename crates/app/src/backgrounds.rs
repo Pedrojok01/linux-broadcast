@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const QUALIFIER: &str = "io";
-const ORG: &str = "Pedrojok01";
+const ORG: &str = "linux-broadcast";
 const APP: &str = "linux-broadcast";
 
 #[derive(Debug, Clone)]

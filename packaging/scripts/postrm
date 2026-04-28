@@ -1,0 +1,20 @@
+#!/bin/sh
+# postrm for linux-broadcast — refresh desktop / icon caches after the
+# .desktop and icon files are removed. Conffiles in /etc/modprobe.d and
+# /etc/modules-load.d are handled by dpkg on `purge`.
+set -e
+
+case "$1" in
+  remove|purge)
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -t /usr/share/icons/hicolor || true
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

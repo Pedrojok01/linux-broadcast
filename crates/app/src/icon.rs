@@ -1,5 +1,6 @@
-//! Render the LinuxBroadcast logo (`APP_DESIGN_TEMP/logo.svg`) into a 64×64
-//! RGBA byte buffer suitable for `eframe::egui::IconData`.
+//! Render the LinuxBroadcast logo into a 64×64 RGBA byte buffer suitable
+//! for `eframe::egui::IconData`. The original SVG is reproduced in
+//! `DESIGN.md`.
 //!
 //! No `usvg`/`tiny-skia` dep — the logo is four primitives. We draw them at
 //! 4× and downsample with `image::imageops` to get implicit anti-aliasing.

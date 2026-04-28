@@ -1,6 +1,6 @@
 # LinuxBroadcast
 
-A small, NVIDIA-Broadcast-style virtual webcam for Linux. Captures your camera, segments the foreground with MediaPipe / RVM, blurs or replaces the background, and exposes the result on a `v4l2loopback` device that Zoom, Meet, Teams, OBS, Firefox, and Chrome treat as a regular webcam.
+A small virtual webcam for Linux that segments the foreground with MediaPipe / RVM, blurs or replaces the background, and exposes the result on a `v4l2loopback` device that Zoom, Meet, Teams, OBS, Firefox, and Chrome treat as a regular webcam.
 
 ```
   v4l2src           appsink                appsrc           v4l2sink
@@ -10,7 +10,7 @@ A small, NVIDIA-Broadcast-style virtual webcam for Linux. Captures your camera, 
                    └────────┘             └────────┘
 ```
 
-**Why it exists.** Existing options on Linux are either heavy (Python + CUDA + OpenCV stacks) or shallow (basic chroma key with hard cuts). This is a single Rust binary that runs MediaPipe / RVM on CPU via ONNX Runtime, with a native `egui` UI, no Python, no CUDA, and edge quality close to NVIDIA Broadcast's.
+**Why it exists.** Existing options on Linux are either heavy (Python + CUDA + OpenCV stacks) or shallow (basic chroma key with hard cuts). This is a single Rust binary that runs MediaPipe / RVM on CPU via ONNX Runtime, with a native `egui` UI, no Python, no CUDA, and edge quality on par with the leading proprietary alternatives.
 
 ## Features
 
@@ -27,9 +27,29 @@ Out of scope: audio / microphone effects.
 
 ## Install & run
 
-### 1. System dependencies
+### Option A — `.deb` (recommended)
 
-Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The build needs GStreamer + a few X11/Wayland headers; the runtime additionally needs the `v4l2loopback` kernel module and the GStreamer plugin packages.
+Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The package depends on `v4l2loopback-dkms (≥ 0.12.8)` and the GStreamer plugin set; everything else is statically baked into the binary.
+
+```bash
+sudo apt install ./linux-broadcast_<version>_amd64.deb
+```
+
+That's it. Behind the scenes the package:
+
+- Installs the kernel module via DKMS and loads it now (`postinst` runs `modprobe v4l2loopback`), so `/dev/video10` is available immediately.
+- Drops `/etc/modprobe.d/linux-broadcast.conf` with the right options (`devices=1 video_nr=10 card_label="LinuxBroadcast" exclusive_caps=1 max_buffers=2`) and `/etc/modules-load.d/linux-broadcast.conf` so the module reloads on every boot — no manual `modprobe` ever required.
+- Registers the app menu entry and icon under `/usr/share/applications/` and `/usr/share/icons/hicolor/64x64/apps/`.
+
+`apt remove linux-broadcast` unloads the module and removes the launcher; `apt purge` additionally drops the `/etc/modprobe.d` and `/etc/modules-load.d` drop-ins (preserved as conffiles otherwise).
+
+Want it always running so Zoom / Meet / Signal / Firefox just see "LinuxBroadcast" in their camera list at every login? Open the GUI and flip **Start on login** in the sidebar — see [Start on login](#start-on-login) below.
+
+### Option B — Build from source
+
+Use this when hacking on the code; the `.deb` is the right choice for everyday use.
+
+#### 1. System dependencies
 
 ```bash
 sudo apt install -y \
@@ -41,7 +61,9 @@ sudo apt install -y \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
-### 2. Create the virtual camera device
+#### 2. Create the virtual camera device (development only)
+
+The `.deb` does this automatically; for source builds, set the module up by hand once:
 
 ```bash
 # Reload the module so our params actually take effect — modprobe is a
@@ -51,9 +73,9 @@ sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LinuxBroadcast" \
   exclusive_caps=1 max_buffers=2
 ```
 
-To make this survive reboots, drop the same options into `/etc/modprobe.d/linux-broadcast.conf` and `linux-broadcast` into `/etc/modules-load.d/`.
+To make this survive reboots, drop the same options into `/etc/modprobe.d/linux-broadcast.conf` and `linux-broadcast` into `/etc/modules-load.d/` (or just install the `.deb`, which ships these files for you).
 
-### 3. Build & run
+#### 3. Build & run
 
 ```bash
 git clone https://github.com/Pedrojok01/linux-broadcast.git
@@ -66,8 +88,32 @@ ONNX Runtime's `libonnxruntime.so` is fetched automatically the first time you b
 A headless mode is available for sanity checks and CI:
 
 ```bash
+cargo run --release -p linux-broadcast -- --headless
+# or, equivalently:
 LB_HEADLESS=1 cargo run --release -p linux-broadcast
 ```
+
+#### 4. Build a `.deb` locally
+
+```bash
+cargo install cargo-deb
+cargo deb -p linux-broadcast
+# artefact: target/debian/linux-broadcast_<version>_amd64.deb
+```
+
+### Start on login
+
+LinuxBroadcast can run silently in the background at every login so the virtual cam is already up by the time you open Zoom / Meet / Signal / Firefox. It's **off by default** — flip the toggle in the sidebar's *Settings* section to enable it. The GUI writes (or removes) `~/.config/autostart/LinuxBroadcast-autostart.desktop`, which runs `linux-broadcast --headless` on login. No system files are touched and no root is needed; uninstalling the `.deb` won't remove your autostart entry, and disabling the toggle will.
+
+### Lazy mode (camera on demand)
+
+By default LinuxBroadcast only opens your physical camera when **something is actually reading the virtual cam** — Meet / Zoom / Signal / Firefox / `ffplay`. The rest of the time the LED is off and CPU is at idle, even with the GUI open. The transition is fast: opening Meet lights the camera within ~2 s; closing it releases the camera ~3 s later. Both windows debounce browser capability-probes and in-call camera-switcher flicker.
+
+The footer shows what's happening: `● Idle` (no app reading), `● Standby (no consumer)` (LB is up but nothing wants the cam yet), or `● LIVE → firefox (12345)` while a real consumer is attached.
+
+When the LinuxBroadcast GUI is open and visible, the **preview pane counts as a consumer** so you can see your composited self while configuring backgrounds. Minimising the window drops that signal and the camera goes back to sleep (assuming nothing else is reading).
+
+For the streamer / rehearsal use case where you want the LED on regardless, flip **Force camera on** in the sidebar's *Settings* section. Default off.
 
 ## Using it
 
@@ -91,10 +137,10 @@ The MediaPipe variants leave plenty of headroom for 1080p; RVM at 1080p needs `d
 
 ## Troubleshooting
 
-- **`/dev/video10` doesn't appear.** Stale module load — run `sudo modprobe -r v4l2loopback` first, then re-`modprobe` with the params above.
+- **`/dev/video10` doesn't appear.** With the `.deb`, this is handled automatically: the postinst does `modprobe -r` first to drop any stale module, then reloads it with the right params. For source builds, run those two commands by hand (see [step 2 above](#2-create-the-virtual-camera-device-development-only)).
 - **`/dev/video10` is "busy" or "not a video capture device".** That's `exclusive_caps=1` doing its job: the device only exposes CAPTURE while LinuxBroadcast is producing frames. Real apps see it; raw `ffplay` may not until the producer is running.
 - **`apt install v4l2loopback-dkms` fails on kernel 6.8+.** You have the broken 0.12.7 — install ≥ 0.12.8 from upstream or your distro backports.
-- **The window icon shows in the title bar but the taskbar entry stays generic on Wayland.** First launch installs `~/.local/share/icons/.../io.Pedrojok01.LinuxBroadcast.png` and a matching `.desktop` file; KDE may need `kbuildsycoca6 --noincremental` once or a re-login to refresh its sycoca cache.
+- **The window icon shows in the title bar but the taskbar entry stays generic on Wayland.** First launch installs `~/.local/share/icons/.../LinuxBroadcast.png` and a matching `.desktop` file; KDE may need `kbuildsycoca6 --noincremental` once or a re-login to refresh its sycoca cache.
 
 ## Repo layout
 
