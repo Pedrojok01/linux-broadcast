@@ -99,3 +99,60 @@ fn is_image(p: &Path) -> bool {
         Some("png" | "jpg" | "jpeg" | "webp" | "bmp")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    fn with_temp_xdg<F: FnOnce(&Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        let prior = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        f(tmp.path());
+        match prior {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    /// Build a 1×1 PNG so `import` has a real image to copy. `is_image`
+    /// only checks the extension, so the bytes don't have to be valid.
+    fn write_fake_png(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn import_then_list_returns_entry() {
+        with_temp_xdg(|_| {
+            let src_dir = TempDir::new().unwrap();
+            let src = write_fake_png(src_dir.path(), "wave.png");
+            let dest = import(&src).unwrap();
+            assert!(dest.exists());
+
+            let entries = list();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, dest);
+            assert_eq!(entries[0].label, "wave");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn remove_clears_entry() {
+        with_temp_xdg(|_| {
+            let src_dir = TempDir::new().unwrap();
+            let src = write_fake_png(src_dir.path(), "studio.png");
+            let dest = import(&src).unwrap();
+            assert_eq!(list().len(), 1);
+
+            remove(&dest).unwrap();
+            assert!(!dest.exists());
+            assert!(list().is_empty());
+        });
+    }
+}

@@ -38,6 +38,10 @@ fs2 = "0.4"
 tray-icon = "0.22"
 gtk = "0.18"
 
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3"
+
 # ---------------------------------------------------------------------------
 # Debian packaging — `cargo deb -p linux-broadcast` reads this block.
 #

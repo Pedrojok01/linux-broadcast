@@ -46,3 +46,31 @@ jobs:
 
       - name: Build (release)
         run: cargo build --workspace --release
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Default test set: Phase 1 unit tests + Phase 2 synthetic-graph
+      # integration tests. Phase 3 model-smoke tests are #[ignore]d so
+      # they only run when explicitly requested with `--ignored`.
+      - name: cargo test
+        run: cargo test --workspace

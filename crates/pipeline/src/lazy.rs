@@ -36,8 +36,8 @@ use gstreamer_app as gst_app;
 use crate::compositor::{Background, Compositor};
 use crate::consumer_watch::Consumer;
 use crate::pipeline::{
-    build_source_pipeline, log_negotiated_input, Command, PipelineConfig, PipelineState,
-    PreviewFrame, NS_PER_SEC,
+    log_negotiated_input, Command, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
+    NS_PER_SEC,
 };
 use crate::segmenter::{ModelKind, Segmenter};
 use crate::temporal::{MaskSmoother, DEFAULT_ALPHA};
@@ -64,8 +64,8 @@ const IDLE_TICK: Duration = Duration::from_millis(100);
 /// "no frames" timeout (typically 1–3 s).
 const IDLE_PUSH_INTERVAL: Duration = Duration::from_millis(200);
 
-#[derive(Debug, Clone, Copy)]
-enum State {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
     Idle,
     Activating { since: Instant },
     Live,
@@ -73,13 +73,50 @@ enum State {
 }
 
 /// Inputs that drive the state machine, computed once per tick.
-struct Demand {
-    consumers_present: bool,
-    force_on: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Demand {
+    pub consumers_present: bool,
+    pub force_on: bool,
+    /// True while the GUI's preview pane is visible. Treated as a
+    /// synthetic consumer so opening the preview lights the camera even
+    /// when no real client is attached to `/dev/video10`.
+    pub gui_preview_active: bool,
 }
 impl Demand {
-    fn signal(&self) -> bool {
-        self.force_on || self.consumers_present
+    pub(crate) fn signal(&self) -> bool {
+        self.force_on || self.consumers_present || self.gui_preview_active
+    }
+}
+
+/// Pure state-transition function. No side effects. Extracted from
+/// `Feeder::step_state` so the debounce logic can be exercised on a
+/// synthetic `Instant` timeline without booting GStreamer.
+pub(crate) fn next_state(state: State, demand: Demand, now: Instant) -> State {
+    let signal = demand.signal();
+    match (state, signal) {
+        (State::Idle, true) => State::Activating { since: now },
+        (State::Idle, false) => State::Idle,
+
+        (State::Activating { since }, true) => {
+            if now.duration_since(since) >= ACTIVATION_DEBOUNCE {
+                State::Live
+            } else {
+                State::Activating { since }
+            }
+        }
+        (State::Activating { .. }, false) => State::Idle,
+
+        (State::Live, true) => State::Live,
+        (State::Live, false) => State::Deactivating { since: now },
+
+        (State::Deactivating { .. }, true) => State::Live,
+        (State::Deactivating { since }, false) => {
+            if now.duration_since(since) >= DEACTIVATION_DEBOUNCE {
+                State::Idle
+            } else {
+                State::Deactivating { since }
+            }
+        }
     }
 }
 
@@ -98,6 +135,7 @@ pub(crate) fn spawn_feeder(
     watcher_rx: Receiver<Vec<Consumer>>,
     state_pub: Arc<Mutex<PipelineState>>,
     stop_flag: Arc<AtomicBool>,
+    source_builder: SourceBuilder,
 ) -> Result<std::thread::JoinHandle<()>> {
     let segmenter = Segmenter::from_bytes(
         cfg.model,
@@ -122,9 +160,11 @@ pub(crate) fn spawn_feeder(
                 preview_tx: cfg.preview_tx.clone(),
                 sink_appsrc,
                 source: None,
+                source_builder,
                 consumers: Vec::new(),
                 force_on: false,
                 preview_enabled: true,
+                gui_preview_active: false,
                 state: State::Idle,
                 state_pub,
                 frame_idx: 0,
@@ -149,6 +189,10 @@ struct Feeder {
     background: Background,
     preview_tx: Option<Sender<PreviewFrame>>,
     sink_appsrc: gst_app::AppSrc,
+    /// Builder for the source GST graph. Production wires
+    /// `pipeline::build_source_pipeline`; tests substitute a synthetic
+    /// builder. Called on every Live engagement.
+    source_builder: SourceBuilder,
     /// Source GST graph + its appsink; only `Some` while Live.
     source: Option<(gst::Pipeline, gst_app::AppSink)>,
     consumers: Vec<Consumer>,
@@ -158,6 +202,11 @@ struct Feeder {
     /// frame). Defaults to true so any standalone consumer of the
     /// pipeline (tests, future headless tooling) gets frames by default.
     preview_enabled: bool,
+    /// True while the GUI's preview pane is visible (window visible AND
+    /// `show_preview` toggle on). Acts as a synthetic consumer in the
+    /// lazy state machine. Defaults to false so headless launches and
+    /// any non-GUI caller don't keep the camera lit by accident.
+    gui_preview_active: bool,
     state: State,
     state_pub: Arc<Mutex<PipelineState>>,
     frame_idx: u64,
@@ -248,6 +297,7 @@ impl Feeder {
             Command::SetBackground(bg) => self.background = bg,
             Command::SetForceOn(v) => self.force_on = v,
             Command::SetPreviewEnabled(v) => self.preview_enabled = v,
+            Command::SetGuiPreviewActive(v) => self.gui_preview_active = v,
             Command::Stop => unreachable!("handled in run()"),
         }
     }
@@ -273,34 +323,10 @@ impl Feeder {
         let demand = Demand {
             consumers_present: !self.consumers.is_empty(),
             force_on: self.force_on,
+            gui_preview_active: self.gui_preview_active,
         };
-        let signal = demand.signal();
 
-        let next = match (self.state, signal) {
-            (State::Idle, true) => State::Activating { since: now },
-            (State::Idle, false) => State::Idle,
-
-            (State::Activating { since }, true) => {
-                if now.duration_since(since) >= ACTIVATION_DEBOUNCE {
-                    State::Live
-                } else {
-                    State::Activating { since }
-                }
-            }
-            (State::Activating { .. }, false) => State::Idle,
-
-            (State::Live, true) => State::Live,
-            (State::Live, false) => State::Deactivating { since: now },
-
-            (State::Deactivating { .. }, true) => State::Live,
-            (State::Deactivating { since }, false) => {
-                if now.duration_since(since) >= DEACTIVATION_DEBOUNCE {
-                    State::Idle
-                } else {
-                    State::Deactivating { since }
-                }
-            }
-        };
+        let next = next_state(self.state, demand, now);
 
         // Side effects only fire when the *category* of state changes
         // (Idle/Activating/Live/Deactivating), not on every tick.
@@ -345,7 +371,7 @@ impl Feeder {
     }
 
     fn start_source(&mut self) -> Result<()> {
-        let (pipeline, appsink) = build_source_pipeline(&self.cfg)?;
+        let (pipeline, appsink) = (self.source_builder)(&self.cfg)?;
         pipeline
             .set_state(gst::State::Playing)
             .context("source pipeline → Playing")?;
@@ -405,8 +431,9 @@ impl Feeder {
                 .collect::<Vec<_>>()
                 .join(",");
             log::info!(
-                "lazy state → {label} (consumers=[{consumer_summary}], force_on={})",
+                "lazy state → {label} (consumers=[{consumer_summary}], force_on={}, gui_preview={})",
                 self.force_on,
+                self.gui_preview_active,
             );
             self.last_state_log = Some(label);
         }
@@ -581,4 +608,145 @@ impl Feeder {
 #[allow(dead_code)]
 pub(crate) fn pids(consumers: &[Consumer]) -> HashSet<u32> {
     consumers.iter().map(|c| c.pid).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demand(consumers: bool, force: bool, preview: bool) -> Demand {
+        Demand {
+            consumers_present: consumers,
+            force_on: force,
+            gui_preview_active: preview,
+        }
+    }
+
+    /// Drive `next_state` through a sequence of (Δt, Demand) steps,
+    /// returning the final state. Useful for asserting end-state across
+    /// a synthetic timeline without booting any GStreamer machinery.
+    fn run(start: State, steps: &[(Duration, Demand)]) -> State {
+        let mut now = Instant::now();
+        let mut state = start;
+        for (dt, d) in steps {
+            now += *dt;
+            state = next_state(state, *d, now);
+        }
+        state
+    }
+
+    #[test]
+    fn idle_with_no_demand_stays_idle() {
+        let off = demand(false, false, false);
+        let final_state = run(State::Idle, &[(Duration::from_secs(1), off); 10]);
+        assert!(matches!(final_state, State::Idle));
+    }
+
+    #[test]
+    fn brief_consumer_under_2s_never_lights_camera() {
+        // Demand on for 1.5 s, then off. Must never reach Live.
+        let on = demand(true, false, false);
+        let off = demand(false, false, false);
+        let mut state = State::Idle;
+        let mut now = Instant::now();
+        // 1.5 seconds of demand asserted.
+        let end_on = now + Duration::from_millis(1500);
+        while now < end_on {
+            now += Duration::from_millis(50);
+            state = next_state(state, on, now);
+            assert!(
+                !matches!(state, State::Live),
+                "must not reach Live within activation debounce"
+            );
+        }
+        // Then demand off — must transition straight back to Idle.
+        for _ in 0..20 {
+            now += Duration::from_millis(50);
+            state = next_state(state, off, now);
+            assert!(!matches!(state, State::Live));
+        }
+        assert!(matches!(state, State::Idle));
+    }
+
+    #[test]
+    fn consumer_held_2s_reaches_live() {
+        // With demand asserted continuously, we should reach Live at
+        // exactly the activation-debounce boundary.
+        let on = demand(true, false, false);
+        let t0 = Instant::now();
+        let mut state = State::Idle;
+
+        // Just before the boundary: still Activating.
+        let before = t0 + ACTIVATION_DEBOUNCE - Duration::from_millis(50);
+        state = next_state(state, on, t0);
+        state = next_state(state, on, before);
+        assert!(matches!(state, State::Activating { .. }));
+
+        // At the boundary: Live.
+        let at = t0 + ACTIVATION_DEBOUNCE;
+        state = next_state(state, on, at);
+        assert!(matches!(state, State::Live));
+    }
+
+    #[test]
+    fn live_then_no_demand_for_3s_returns_idle() {
+        let on = demand(true, false, false);
+        let off = demand(false, false, false);
+        let t0 = Instant::now();
+
+        // 3 s off → Idle.
+        let mut s = State::Live;
+        s = next_state(s, off, t0);
+        assert!(matches!(s, State::Deactivating { .. }));
+        s = next_state(s, off, t0 + DEACTIVATION_DEBOUNCE);
+        assert!(matches!(s, State::Idle));
+
+        // 2.5 s off then on → must stay Live.
+        let t1 = Instant::now();
+        let mut s2 = State::Live;
+        s2 = next_state(s2, off, t1);
+        s2 = next_state(s2, off, t1 + Duration::from_millis(2500));
+        assert!(matches!(s2, State::Deactivating { .. }));
+        s2 = next_state(s2, on, t1 + Duration::from_millis(2600));
+        assert!(matches!(s2, State::Live));
+    }
+
+    #[test]
+    fn flicker_during_deactivation_stays_live() {
+        // Live, demand toggles off/on/off/on at 1 s each — never crosses
+        // the 3 s deactivation boundary, so must never leave Live.
+        let on = demand(true, false, false);
+        let off = demand(false, false, false);
+        let t0 = Instant::now();
+        let mut s = State::Live;
+        s = next_state(s, off, t0);
+        s = next_state(s, on, t0 + Duration::from_secs(1));
+        assert!(matches!(s, State::Live));
+        s = next_state(s, off, t0 + Duration::from_secs(2));
+        s = next_state(s, on, t0 + Duration::from_secs(3));
+        assert!(matches!(s, State::Live));
+    }
+
+    #[test]
+    fn force_on_alone_holds_live() {
+        // No real consumer, force_on=true → Live after activation.
+        let force = demand(false, true, false);
+        let t0 = Instant::now();
+        let mut s = State::Idle;
+        s = next_state(s, force, t0);
+        s = next_state(s, force, t0 + ACTIVATION_DEBOUNCE);
+        assert!(matches!(s, State::Live));
+    }
+
+    #[test]
+    fn gui_preview_alone_holds_live() {
+        // Validates the 0c wiring: preview pane visible counts as a
+        // synthetic consumer in the demand signal.
+        let preview = demand(false, false, true);
+        let t0 = Instant::now();
+        let mut s = State::Idle;
+        s = next_state(s, preview, t0);
+        s = next_state(s, preview, t0 + ACTIVATION_DEBOUNCE);
+        assert!(matches!(s, State::Live));
+    }
 }

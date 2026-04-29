@@ -24,3 +24,8 @@ fast_image_resize.workspace = true
 wide.workspace = true
 
 crossbeam-channel.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+serial_test = "3"
+tempfile = "3"

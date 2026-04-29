@@ -285,3 +285,169 @@ fn blur_vertical(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Mask;
+    use proptest::prelude::*;
+
+    fn solid_frame(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            buf.extend_from_slice(&rgba);
+        }
+        buf
+    }
+
+    fn mask_const(w: u32, h: u32, v: f32) -> Mask {
+        Mask {
+            data: vec![v; (w as usize) * (h as usize)],
+            width: w,
+            height: h,
+        }
+    }
+
+    fn red_image_bg(w: u32, h: u32) -> Background {
+        Background::Image {
+            rgba: solid_frame(w, h, [255, 0, 0, 255]),
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn none_is_byte_identical_passthrough() {
+        // Even with a non-trivial mask, Background::None must be a true
+        // bytewise short-circuit.
+        let (w, h) = (32, 32);
+        let mut frame = solid_frame(w, h, [10, 20, 30, 255]);
+        // Add a recognisable pattern so any modification is visible.
+        for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 251) as u8;
+            px[1] = ((i * 3) % 251) as u8;
+            px[2] = ((i * 7) % 251) as u8;
+        }
+        let original = frame.clone();
+        let mask = Mask {
+            data: (0..(w * h))
+                .map(|i| (i as f32) / ((w * h) as f32))
+                .collect(),
+            width: w,
+            height: h,
+        };
+        let mut c = Compositor::new();
+        c.composite(&mut frame, w, h, &mask, &Background::None)
+            .unwrap();
+        assert_eq!(
+            frame, original,
+            "Background::None must not modify the frame"
+        );
+    }
+
+    #[test]
+    fn mask_full_foreground_preserves_frame() {
+        // mask = 1.0 everywhere → output equals foreground (input frame).
+        let (w, h) = (16, 16);
+        let mut frame = solid_frame(w, h, [50, 100, 150, 255]);
+        let original = frame.clone();
+        let mask = mask_const(w, h, 1.0);
+        let mut c = Compositor::new();
+        c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h))
+            .unwrap();
+        assert_eq!(frame, original);
+    }
+
+    #[test]
+    fn mask_full_background_replaces_frame() {
+        // mask = 0.0 everywhere → output equals background.
+        let (w, h) = (16, 16);
+        let mut frame = solid_frame(w, h, [50, 100, 150, 255]);
+        let mask = mask_const(w, h, 0.0);
+        let mut c = Compositor::new();
+        c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h))
+            .unwrap();
+        for px in frame.chunks_exact(4) {
+            assert_eq!(px, &[255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn mask_half_blends_midpoint() {
+        // mask = 0.5, grey input + red bg → per-channel midpoint within ±2.
+        let (w, h) = (16, 16);
+        let mut frame = solid_frame(w, h, [100, 100, 100, 255]);
+        let mask = mask_const(w, h, 0.5);
+        let mut c = Compositor::new();
+        c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h))
+            .unwrap();
+        // out_R ≈ 100*0.5 + 255*0.5 = 177; out_G/B ≈ 100*0.5 + 0*0.5 = 50.
+        for px in frame.chunks_exact(4) {
+            assert!((px[0] as i32 - 177).abs() <= 2, "R={}", px[0]);
+            assert!((px[1] as i32 - 50).abs() <= 2, "G={}", px[1]);
+            assert!((px[2] as i32 - 50).abs() <= 2, "B={}", px[2]);
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    #[test]
+    fn mismatched_mask_size_upsamples() {
+        // 64×64 mask + 256×256 frame: must produce a 256×256 output and
+        // not panic. Use a half-mask so the upsample exercises the
+        // bilinear path.
+        let (fw, fh) = (256, 256);
+        let mut frame = solid_frame(fw, fh, [40, 40, 40, 255]);
+        let mask = mask_const(64, 64, 0.5);
+        let mut c = Compositor::new();
+        c.composite(&mut frame, fw, fh, &mask, &red_image_bg(fw, fh))
+            .unwrap();
+        assert_eq!(frame.len(), (fw * fh * 4) as usize);
+        // First pixel ≈ midpoint blend of (40,40,40) over (255,0,0) at α=0.5.
+        let px = &frame[..4];
+        assert!((px[0] as i32 - 147).abs() <= 3);
+        assert!((px[1] as i32 - 20).abs() <= 3);
+        assert!((px[2] as i32 - 20).abs() <= 3);
+    }
+
+    proptest! {
+        // For a fixed input frame and bg, increasing mask α must move
+        // each output channel monotonically from background toward
+        // foreground. Catches sign flips / mis-inverted alpha in `blend`.
+        #[test]
+        fn mask_monotonic_in_alpha(
+            fg in 0u8..=255,
+            bg in 0u8..=255,
+            // Three increasing α values in [0,1].
+            a0 in 0.0f32..=0.33,
+            a1 in 0.34f32..=0.66,
+            a2 in 0.67f32..=1.0,
+        ) {
+            let (w, h) = (8u32, 8u32);
+            let frame_init = solid_frame(w, h, [fg, fg, fg, 255]);
+            let bg_image = Background::Image {
+                rgba: solid_frame(w, h, [bg, bg, bg, 255]),
+                width: w,
+                height: h,
+            };
+            let mut out = [frame_init.clone(), frame_init.clone(), frame_init.clone()];
+            for (frame, &alpha) in out.iter_mut().zip(&[a0, a1, a2]) {
+                let mut c = Compositor::new();
+                let mask = mask_const(w, h, alpha);
+                c.composite(frame, w, h, &mask, &bg_image).unwrap();
+            }
+            // Pick channel 0 of pixel 0 from each output. Monotone toward
+            // fg as α grows. Allow ±1 for u8 rounding.
+            let v: Vec<i32> = out.iter().map(|f| f[0] as i32).collect();
+            let toward_fg = (fg as i32) - (bg as i32);
+            // sign of (v[i+1]-v[i]) should match sign of toward_fg (or be 0).
+            for w in v.windows(2) {
+                let delta = w[1] - w[0];
+                if toward_fg > 0 {
+                    prop_assert!(delta >= -1, "expected non-decreasing, got {:?}", v);
+                } else if toward_fg < 0 {
+                    prop_assert!(delta <= 1, "expected non-increasing, got {:?}", v);
+                }
+            }
+        }
+    }
+}

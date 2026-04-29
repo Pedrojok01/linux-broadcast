@@ -56,3 +56,98 @@ impl InstanceLock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    fn with_temp_runtime<F: FnOnce(&std::path::Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        let prior_rt = std::env::var_os("XDG_RUNTIME_DIR");
+        let prior_cfg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
+        // Also set XDG_CONFIG_HOME so the fallback path is sandboxed too.
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        f(tmp.path());
+        match prior_rt {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        match prior_cfg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn single_acquire_succeeds() {
+        with_temp_runtime(|_| {
+            let lock = InstanceLock::try_acquire().unwrap();
+            assert!(lock.is_some(), "fresh acquire should succeed");
+        });
+    }
+
+    /// flock(2) on Linux is per-OFD (open file description). Two
+    /// `try_acquire` calls in the same process produce two separate
+    /// OFDs, and their flock holds do NOT contend with each other —
+    /// that's a kernel-level guarantee, not something our code controls.
+    /// Real cross-process contention is what production cares about.
+    /// We exercise that here by spawning a child via `flock(1)` from
+    /// util-linux; if the binary is missing we skip the test rather
+    /// than fail.
+    #[test]
+    #[serial]
+    fn second_acquire_returns_none_while_held_by_other_process() {
+        with_temp_runtime(|_| {
+            let path = lock_path().unwrap();
+            // Make sure the file exists so `flock(1)` opens it cleanly.
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap();
+
+            let mut child = match std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&path)
+                .args(["-c", "sleep 5"])
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("skipping: `flock(1)` not on PATH");
+                    return;
+                }
+                Err(e) => panic!("spawn flock: {e}"),
+            };
+            // Give the child a moment to actually acquire the lock.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+
+            let attempt = InstanceLock::try_acquire().unwrap();
+            assert!(attempt.is_none(), "expected None while child holds flock");
+
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn dropped_lock_releases() {
+        with_temp_runtime(|_| {
+            let lock = InstanceLock::try_acquire().unwrap();
+            assert!(lock.is_some());
+            drop(lock);
+            // After drop, a fresh acquire still works (this is trivially
+            // true same-process, but the test doubles as a regression
+            // guard if the impl ever changes to retain locks globally).
+            let again = InstanceLock::try_acquire().unwrap();
+            assert!(again.is_some());
+        });
+    }
+}

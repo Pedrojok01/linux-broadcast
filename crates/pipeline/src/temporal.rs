@@ -41,3 +41,76 @@ impl MaskSmoother {
         self.prev = None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn first_call_passes_through() {
+        let mut s = MaskSmoother::new(0.5);
+        let mut m = vec![0.1, 0.4, 0.7, 1.0];
+        let original = m.clone();
+        s.smooth(&mut m);
+        assert_eq!(m, original);
+    }
+
+    #[test]
+    fn reset_drops_state() {
+        let mut s = MaskSmoother::new(0.5);
+        let mut a = vec![0.0; 4];
+        s.smooth(&mut a);
+        s.reset();
+        let mut b = vec![0.9_f32; 4];
+        let original = b.clone();
+        s.smooth(&mut b);
+        assert_eq!(b, original, "after reset, next smooth must pass through");
+    }
+
+    #[test]
+    fn ema_converges_to_constant() {
+        let mut s = MaskSmoother::new(0.7);
+        for _ in 0..100 {
+            let mut m = vec![0.42_f32; 8];
+            s.smooth(&mut m);
+        }
+        let mut probe = vec![0.42_f32; 8];
+        s.smooth(&mut probe);
+        for v in probe {
+            assert!((v - 0.42).abs() < 1e-5, "got {v}");
+        }
+    }
+
+    #[test]
+    fn alpha_zero_freezes_output() {
+        // α = 0 → output equals prev forever after the first call.
+        let mut s = MaskSmoother::new(0.0);
+        let mut first = vec![0.3_f32, 0.6, 0.9];
+        s.smooth(&mut first);
+        let prev = first.clone();
+        let mut next = vec![0.0_f32, 0.0, 0.0];
+        s.smooth(&mut next);
+        assert_eq!(next, prev, "α=0 should ignore the new frame entirely");
+    }
+
+    proptest! {
+        #[test]
+        fn output_bounded_for_bounded_input(
+            inputs in proptest::collection::vec(
+                proptest::collection::vec(0.0f32..=1.0, 4..=4),
+                1..=10,
+            ),
+            alpha in 0.0f32..=1.0,
+        ) {
+            let mut s = MaskSmoother::new(alpha);
+            for frame in inputs {
+                let mut m = frame;
+                s.smooth(&mut m);
+                for &v in &m {
+                    prop_assert!((0.0..=1.0).contains(&v), "out of range: {v}");
+                }
+            }
+        }
+    }
+}

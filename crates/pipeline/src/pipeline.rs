@@ -33,6 +33,20 @@ use crate::consumer_watch::{Consumer, Watcher};
 use crate::lazy::spawn_feeder;
 use crate::segmenter::ModelKind;
 
+/// Builder for the source GStreamer graph. Production code uses
+/// [`build_source_pipeline`] (the default); tests substitute a closure
+/// that wires a `videotestsrc` so the synthetic-graph integration suite
+/// can run without `/dev/video0`. See [`Pipeline::start_with_builders`].
+pub type SourceBuilder =
+    Arc<dyn Fn(&PipelineConfig) -> Result<(gst::Pipeline, gst_app::AppSink)> + Send + Sync>;
+
+/// Builder for the sink GStreamer graph. Production code uses
+/// [`build_sink_pipeline`] (the default); tests substitute a closure
+/// that terminates in an `appsink` instead of `v4l2sink` so the suite
+/// can run without `v4l2loopback`. See [`Pipeline::start_with_builders`].
+pub type SinkBuilder =
+    Arc<dyn Fn(&PipelineConfig) -> Result<(gst::Pipeline, gst_app::AppSrc)> + Send + Sync>;
+
 pub(crate) const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// How often the consumer watcher polls `/proc/*/fd`. Tuned against the
@@ -96,6 +110,13 @@ pub enum Command {
     /// preview channel, avoiding the per-frame RGBA clone. The
     /// downstream broadcast (`/dev/video10`) is unaffected.
     SetPreviewEnabled(bool),
+    /// Edge-triggered "GUI preview pane is currently visible" heartbeat.
+    /// Acts as a synthetic consumer in the lazy state machine: while
+    /// true, the camera stays lit even with no real consumer attached
+    /// to `/dev/video10`. The GUI sets it true when the window is
+    /// visible AND the user has the preview toggle on; false otherwise
+    /// (window hidden in tray, preview toggle off, app exiting).
+    SetGuiPreviewActive(bool),
     Stop,
 }
 
@@ -135,10 +156,35 @@ impl Pipeline {
         multiclass_onnx: &'static [u8],
         rvm_onnx: &'static [u8],
     ) -> Result<Self> {
+        Self::start_with_builders(
+            cfg,
+            binary_onnx,
+            multiclass_onnx,
+            rvm_onnx,
+            Arc::new(build_source_pipeline),
+            Arc::new(build_sink_pipeline),
+        )
+    }
+
+    /// Variant of [`Pipeline::start`] that accepts custom source / sink
+    /// graph builders. Production code calls [`Pipeline::start`], which
+    /// passes the real `v4l2src` and `v4l2sink` builders. Integration
+    /// tests substitute synthetic builders (`videotestsrc` source,
+    /// `appsink` sink) so the pipeline runs without `/dev/video0` or
+    /// `v4l2loopback`.
+    pub fn start_with_builders(
+        cfg: PipelineConfig,
+        binary_onnx: &'static [u8],
+        multiclass_onnx: &'static [u8],
+        rvm_onnx: &'static [u8],
+        source_builder: SourceBuilder,
+        sink_builder: SinkBuilder,
+    ) -> Result<Self> {
         gst::init().context("gst::init")?;
 
-        // 1. Sink graph (always-on owner of /dev/video10).
-        let (sink_pipeline, sink_appsrc) = build_sink_pipeline(&cfg)?;
+        // 1. Sink graph (always-on owner of /dev/video10 in production;
+        //    a plain appsink in tests).
+        let (sink_pipeline, sink_appsrc) = sink_builder(&cfg)?;
         install_bus_logger(&sink_pipeline, "sink");
         sink_pipeline.set_state(gst::State::Playing).map_err(|e| {
             let bus_errs = drain_bus_errors(&sink_pipeline);
@@ -176,6 +222,7 @@ impl Pipeline {
             watcher_rx,
             Arc::clone(&state),
             Arc::clone(&stop_flag),
+            source_builder,
         )?;
 
         Ok(Self {

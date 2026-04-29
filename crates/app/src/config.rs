@@ -91,7 +91,7 @@ impl Default for Config {
             source_device: "/dev/video0".to_string(),
             sink_device: "/dev/video10".to_string(),
             width: 1280,
-            height: 800,
+            height: 900,
             framerate: 30,
             mode: Mode::Blur,
             blur_strength: 0.62,
@@ -147,5 +147,126 @@ impl Config {
     /// True when the configured background image actually resolves.
     pub fn background_image_path(&self) -> Option<&Path> {
         self.background_path.as_deref().filter(|p| p.exists())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// Point ProjectDirs at a fresh tempdir for the duration of the test.
+    /// Must run #[serial] — env vars are process-global.
+    fn with_temp_xdg<F: FnOnce(&Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        // Save the prior value (if any) so we don't leak state into
+        // sibling tests that happen to also touch XDG_CONFIG_HOME.
+        let prior = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        f(tmp.path());
+        match prior {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn default_load_with_redirected_xdg() {
+        with_temp_xdg(|_| {
+            let cfg = Config::load();
+            let default = Config::default();
+            assert_eq!(cfg.source_device, default.source_device);
+            assert_eq!(cfg.sink_device, default.sink_device);
+            assert_eq!(cfg.width, default.width);
+            assert_eq!(cfg.height, default.height);
+            assert_eq!(cfg.framerate, default.framerate);
+            assert_eq!(cfg.mode, default.mode);
+            assert_eq!(cfg.model, default.model);
+            assert_eq!(cfg.show_preview, default.show_preview);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn roundtrip_save_then_load() {
+        with_temp_xdg(|_| {
+            let cfg = Config {
+                width: 1920,
+                height: 1080,
+                framerate: 60,
+                mode: Mode::Replace,
+                blur_strength: 0.123,
+                background_path: Some(PathBuf::from("/tmp/some_bg.png")),
+                model: Model::Rvm,
+                start_on_login: true,
+                force_on: true,
+                show_preview: false,
+                ..Config::default()
+            };
+            cfg.save().unwrap();
+
+            let loaded = Config::load();
+            assert_eq!(loaded.width, 1920);
+            assert_eq!(loaded.height, 1080);
+            assert_eq!(loaded.framerate, 60);
+            assert_eq!(loaded.mode, Mode::Replace);
+            assert!((loaded.blur_strength - 0.123).abs() < 1e-6);
+            assert_eq!(
+                loaded.background_path,
+                Some(PathBuf::from("/tmp/some_bg.png"))
+            );
+            assert_eq!(loaded.model, Model::Rvm);
+            assert!(loaded.start_on_login);
+            assert!(loaded.force_on);
+            assert!(!loaded.show_preview);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn forward_compat_missing_field() {
+        // A user upgrading from a pre-`force_on` build has a TOML without
+        // `force_on` / `start_on_login` / `show_preview`. Must load with
+        // defaults filled in.
+        with_temp_xdg(|root| {
+            let dir = root.join("linux-broadcast");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "source_device = \"/dev/video0\"\nwidth = 1280\nheight = 720\n",
+            )
+            .unwrap();
+
+            let cfg = Config::load();
+            assert_eq!(cfg.width, 1280);
+            assert_eq!(cfg.height, 720);
+            // Defaulted fields:
+            assert_eq!(cfg.framerate, Config::default().framerate);
+            assert_eq!(cfg.show_preview, Config::default().show_preview);
+            assert_eq!(cfg.force_on, Config::default().force_on);
+            assert_eq!(cfg.start_on_login, Config::default().start_on_login);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn unknown_field_does_not_panic() {
+        // Older or experimental builds may write extra keys. Loader must
+        // silently ignore them rather than failing the whole config.
+        with_temp_xdg(|root| {
+            let dir = root.join("linux-broadcast");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "width = 640\nheight = 480\nfuture_field = 42\nspeculative = \"hi\"\n",
+            )
+            .unwrap();
+
+            let cfg = Config::load();
+            assert_eq!(cfg.width, 640);
+            assert_eq!(cfg.height, 480);
+        });
     }
 }

@@ -179,6 +179,10 @@ struct App {
     /// sure the surface is actually off-screen. Mutually exclusive with
     /// `force_unhide_on_first_frame` (only one can be true).
     headless_minimize_pending: bool,
+    /// Last value sent to the pipeline via `Command::SetGuiPreviewActive`.
+    /// `None` before the first send. Used to edge-trigger so we don't
+    /// flood the command channel every frame.
+    last_gui_preview_active: Option<bool>,
 }
 
 impl App {
@@ -235,6 +239,7 @@ impl App {
             quit_requested: false,
             force_unhide_on_first_frame,
             headless_minimize_pending,
+            last_gui_preview_active: None,
         };
 
         // Always start the pipeline at launch — both GUI and headless.
@@ -326,6 +331,9 @@ impl App {
         self.preview_tex = None;
         self.last_preview_size = None;
         self.pipeline_state = PipelineState::default();
+        // The next pipeline starts at gui_preview_active = false; clear
+        // the cache so the next heartbeat re-sends.
+        self.last_gui_preview_active = None;
     }
 
     fn restart_pipeline(&mut self) {
@@ -441,6 +449,16 @@ impl eframe::App for App {
         //    anyway, so minimized is the only meaningful signal.
         let minimized = is_minimized(ctx) || starting_headless_hidden;
 
+        // GUI preview heartbeat: the pipeline treats this as a synthetic
+        // consumer in its lazy state machine (so opening the preview
+        // pane lights `/dev/video0` even with no real client attached,
+        // and hiding to tray releases it after the deactivation
+        // debounce). True only when the window is visible AND the user
+        // has the preview toggle on. Edge-triggered to avoid flooding
+        // the command channel every frame.
+        let preview_active = !minimized && self.cfg.show_preview;
+        self.send_gui_preview_active(preview_active);
+
         // 4. While minimized, skip layout entirely. eframe's repaint
         //    request keeps the loop ticking so tray events still land.
         if minimized {
@@ -525,6 +543,20 @@ impl App {
             //   "minimize to tray" Wayland app ships with today.
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
+    }
+
+    /// Edge-triggered heartbeat: only sends `Command::SetGuiPreviewActive`
+    /// when `active` differs from the last value we sent. Quietly drops
+    /// the send on a slow / disconnected channel — the pipeline will
+    /// observe demand via consumer detection or the next heartbeat.
+    fn send_gui_preview_active(&mut self, active: bool) {
+        if self.last_gui_preview_active == Some(active) {
+            return;
+        }
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(Command::SetGuiPreviewActive(active));
+            self.last_gui_preview_active = Some(active);
         }
     }
 }

@@ -99,3 +99,70 @@ pub fn reconcile(desired: bool, exec_path: &Path) -> Result<()> {
         (false, false) => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    fn with_temp_xdg<F: FnOnce(&Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        let prior = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        f(tmp.path());
+        match prior {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_true_creates_desktop_entry() {
+        with_temp_xdg(|root| {
+            let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
+            reconcile(true, &exec).unwrap();
+            let path = root.join("autostart").join(FILENAME);
+            assert!(path.exists(), "expected {} to exist", path.display());
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(body.contains("Exec="));
+            assert!(body.contains("--headless"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_false_removes_it() {
+        with_temp_xdg(|root| {
+            let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
+            reconcile(true, &exec).unwrap();
+            assert!(is_installed());
+
+            reconcile(false, &exec).unwrap();
+            let path = root.join("autostart").join(FILENAME);
+            assert!(!path.exists());
+            assert!(!is_installed());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_idempotent() {
+        with_temp_xdg(|root| {
+            let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
+            reconcile(true, &exec).unwrap();
+            let path = root.join("autostart").join(FILENAME);
+            let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            // Sleep just enough to see a different mtime if a write
+            // happened. 1.1s is generous; some FSes only have second
+            // resolution.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            reconcile(true, &exec).unwrap();
+            let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            assert_eq!(mtime1, mtime2, "second reconcile must be a no-op");
+        });
+    }
+}
