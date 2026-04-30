@@ -51,6 +51,11 @@ pub struct Compositor {
     bg_scaled: Vec<u8>,
     bg_w: u32,
     bg_h: u32,
+    /// Fingerprint of the source image last scaled into `bg_scaled`. The
+    /// cache is keyed on this in addition to the frame size so picking a
+    /// different library image (same frame size, different pixels) actually
+    /// invalidates the rescaled buffer.
+    bg_fingerprint: Option<u64>,
 }
 
 impl Compositor {
@@ -61,6 +66,7 @@ impl Compositor {
             bg_scaled: Vec::new(),
             bg_w: 0,
             bg_h: 0,
+            bg_fingerprint: None,
         }
     }
 
@@ -163,7 +169,12 @@ impl Compositor {
     }
 
     fn ensure_bg_scaled(&mut self, bg: &[u8], bw: u32, bh: u32, fw: u32, fh: u32) -> Result<()> {
-        if self.bg_w == fw && self.bg_h == fh && !self.bg_scaled.is_empty() {
+        let fp = bg_fingerprint(bg, bw, bh);
+        if self.bg_w == fw
+            && self.bg_h == fh
+            && self.bg_fingerprint == Some(fp)
+            && !self.bg_scaled.is_empty()
+        {
             return Ok(());
         }
         self.bg_scaled.resize((fw as usize) * (fh as usize) * 4, 0);
@@ -176,6 +187,7 @@ impl Compositor {
             .map_err(|e| anyhow!("bg resize: {e}"))?;
         self.bg_w = fw;
         self.bg_h = fh;
+        self.bg_fingerprint = Some(fp);
         Ok(())
     }
 }
@@ -184,6 +196,28 @@ impl Default for Compositor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Cheap content fingerprint for an RGBA buffer. We hash the source
+/// dimensions plus a sparse byte sample so two same-size library images
+/// with different pixels disambiguate without re-hashing the whole buffer.
+/// 1280×720 RGBA is ~3.7 MB — touching every byte each call would dwarf
+/// the actual rescale.
+fn bg_fingerprint(bg: &[u8], bw: u32, bh: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bw.hash(&mut h);
+    bh.hash(&mut h);
+    bg.len().hash(&mut h);
+    let n = bg.len();
+    if n >= 64 {
+        bg[..32].hash(&mut h);
+        bg[n - 32..].hash(&mut h);
+        bg[n / 2..(n / 2 + 32).min(n)].hash(&mut h);
+    } else {
+        bg.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Two passes of a separable box kernel approximate a Gaussian with σ ≈
