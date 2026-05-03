@@ -113,8 +113,6 @@ The footer shows what's happening: `● Idle` (no app reading), `● Standby (no
 
 When the LinuxBroadcast GUI is open and visible, the **preview pane counts as a consumer** so you can see your composited self while configuring backgrounds. Minimising the window drops that signal and the camera goes back to sleep (assuming nothing else is reading).
 
-For the streamer / rehearsal use case where you want the LED on regardless, flip **Force camera on** in the sidebar's *Settings* section. Default off.
-
 ## Using it
 
 1. Pick a physical camera in **Camera**.

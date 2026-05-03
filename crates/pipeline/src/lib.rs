@@ -8,12 +8,13 @@
 //!
 //! The pipeline runs in **lazy** mode by default: the physical camera is
 //! only opened while a real consumer is reading the virtual cam (or the
-//! GUI's preview pane / `force_on` toggle is asserting demand). See
+//! GUI's preview pane is asserting demand). See
 //! [`pipeline::PipelineState`] and [`consumer_watch`] for the moving
 //! parts.
 
 pub mod compositor;
 pub mod consumer_watch;
+pub mod framing;
 pub mod lazy;
 pub mod pipeline;
 pub mod segmenter;
@@ -21,6 +22,7 @@ pub mod temporal;
 
 pub use compositor::{Background, Compositor};
 pub use consumer_watch::Consumer;
+pub use framing::BBoxSmoother;
 pub use pipeline::{Command, Pipeline, PipelineConfig, PipelineState, PreviewFrame};
 pub use segmenter::{Mask, ModelKind, Segmenter};
 

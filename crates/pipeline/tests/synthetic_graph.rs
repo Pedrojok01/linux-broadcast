@@ -42,6 +42,7 @@ fn cfg() -> PipelineConfig {
         background: Background::None,
         model: lb_pipeline::ModelKind::SelfieBinary,
         preview_tx: None,
+        framing: false,
     }
 }
 
@@ -159,10 +160,13 @@ fn pipeline_emits_frames_with_videotestsrc() {
     c.background = Background::None;
     let (p, captured) = start_pipeline(c);
 
-    // force_on lights the synthetic camera. The activation debounce is
-    // 2 s; pull for slightly longer to ensure we land in Live and see
-    // real source frames flowing through, not just idle re-pushes.
-    p.cmd_sender().send(Command::SetForceOn(true)).unwrap();
+    // The GUI-preview heartbeat lights the synthetic camera. The
+    // activation debounce is 2 s; pull for slightly longer to ensure we
+    // land in Live and see real source frames flowing through, not just
+    // idle re-pushes.
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
     let sink = captured
         .lock()
         .unwrap()
@@ -195,7 +199,9 @@ fn lazy_state_walks_idle_to_live_to_idle() {
 
     // Assert demand → state should reach Live within activation
     // debounce + slack.
-    p.cmd_sender().send(Command::SetForceOn(true)).unwrap();
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
     let live_deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < live_deadline {
         if matches!(p.state(), PipelineState::Live { .. }) {
@@ -210,7 +216,9 @@ fn lazy_state_walks_idle_to_live_to_idle() {
 
     // Drop demand → must return to Idle within deactivation debounce +
     // slack.
-    p.cmd_sender().send(Command::SetForceOn(false)).unwrap();
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(false))
+        .unwrap();
     let idle_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < idle_deadline {
         if matches!(p.state(), PipelineState::Idle) {
@@ -223,6 +231,41 @@ fn lazy_state_walks_idle_to_live_to_idle() {
     p.stop();
 }
 
+/// Regression for the shutdown path the GUI's `App::shutdown_cleanup`
+/// drives on Quit: stop() then drop, with no panic and no hang. Used to
+/// trigger NVIDIA's EGL Wayland abort when followed by eframe's GL
+/// teardown — that's now bypassed via `std::process::exit(0)` in
+/// `App::on_exit`, but the underlying pipeline shutdown sequence must
+/// itself stay clean. Repeated stop() calls must be idempotent because
+/// `Pipeline::stop` runs once, then `drop` re-asserts the same state.
+#[test]
+fn shutdown_after_live_is_clean_and_idempotent() {
+    let c = cfg();
+    let (p, captured) = start_pipeline(c);
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let sink = captured.lock().unwrap().clone().unwrap();
+    // Drive into Live so feeder is actively running source + composite.
+    let _ = pull_frames_for(&sink, Duration::from_millis(2200));
+    assert!(matches!(p.state(), PipelineState::Live { .. }));
+
+    // Repeated stops mirror App::shutdown_cleanup → Drop, which calls
+    // stop() twice in effect. Must not panic, must not deadlock.
+    p.stop();
+    p.stop();
+
+    // Drop must complete promptly (Pipeline::Drop has a 2s join timeout
+    // on the feeder; we give the whole thing 5s headroom).
+    let start = Instant::now();
+    drop(p);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "Pipeline::drop took {:?} — feeder failed to join",
+        start.elapsed(),
+    );
+}
+
 #[test]
 fn set_background_no_frame_gap() {
     // While Live with a synthetic source, swap backgrounds and verify
@@ -232,7 +275,9 @@ fn set_background_no_frame_gap() {
     let mut c = cfg();
     c.background = Background::None;
     let (p, captured) = start_pipeline(c);
-    p.cmd_sender().send(Command::SetForceOn(true)).unwrap();
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
     let sink = captured.lock().unwrap().clone().unwrap();
 
     // Wait through activation debounce.

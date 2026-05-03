@@ -33,8 +33,9 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use crate::compositor::{Background, Compositor};
+use crate::compositor::{Background, Compositor, Framing};
 use crate::consumer_watch::Consumer;
+use crate::framing::{BBoxSmoother, FG_ZOOM, TOP_HEADROOM};
 use crate::pipeline::{
     log_negotiated_input, Command, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
     NS_PER_SEC,
@@ -76,7 +77,6 @@ pub(crate) enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Demand {
     pub consumers_present: bool,
-    pub force_on: bool,
     /// True while the GUI's preview pane is visible. Treated as a
     /// synthetic consumer so opening the preview lights the camera even
     /// when no real client is attached to `/dev/video10`.
@@ -84,7 +84,7 @@ pub(crate) struct Demand {
 }
 impl Demand {
     pub(crate) fn signal(&self) -> bool {
-        self.force_on || self.consumers_present || self.gui_preview_active
+        self.consumers_present || self.gui_preview_active
     }
 }
 
@@ -156,13 +156,14 @@ pub(crate) fn spawn_feeder(
                 segmenter,
                 compositor: Compositor::new(),
                 smoother: MaskSmoother::new(DEFAULT_ALPHA),
+                bbox_smoother: BBoxSmoother::new(),
+                framing_enabled: cfg.framing,
                 background: cfg.background.clone(),
                 preview_tx: cfg.preview_tx.clone(),
                 sink_appsrc,
                 source: None,
                 source_builder,
                 consumers: Vec::new(),
-                force_on: false,
                 preview_enabled: true,
                 gui_preview_active: false,
                 state: State::Idle,
@@ -186,6 +187,15 @@ struct Feeder {
     segmenter: Segmenter,
     compositor: Compositor,
     smoother: MaskSmoother,
+    /// Smoothed virtual-PTZ crop driver. Held even when `framing_enabled`
+    /// is false so toggling at runtime doesn't drop history more than the
+    /// explicit `reset()` we run on disable.
+    bbox_smoother: BBoxSmoother,
+    /// Toggle for the auto-frame stage. When true, segmentation runs on
+    /// every frame regardless of background mode (the smoother needs a
+    /// mask to compute the bbox), and the compositor's crop+rescale stage
+    /// runs after compositing.
+    framing_enabled: bool,
     background: Background,
     preview_tx: Option<Sender<PreviewFrame>>,
     sink_appsrc: gst_app::AppSrc,
@@ -196,7 +206,6 @@ struct Feeder {
     /// Source GST graph + its appsink; only `Some` while Live.
     source: Option<(gst::Pipeline, gst_app::AppSink)>,
     consumers: Vec<Consumer>,
-    force_on: bool,
     /// Mirrors the GUI's "Show preview" toggle. When false, frames are
     /// not forwarded to `preview_tx` (skips a 1280×720 RGBA clone per
     /// frame). Defaults to true so any standalone consumer of the
@@ -295,9 +304,16 @@ impl Feeder {
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::SetBackground(bg) => self.background = bg,
-            Command::SetForceOn(v) => self.force_on = v,
             Command::SetPreviewEnabled(v) => self.preview_enabled = v,
             Command::SetGuiPreviewActive(v) => self.gui_preview_active = v,
+            Command::SetFraming(v) => {
+                self.framing_enabled = v;
+                if !v {
+                    // Drop the smoother state so the next enable starts at
+                    // the live bbox instead of panning from a stale rect.
+                    self.bbox_smoother.reset();
+                }
+            }
             Command::Stop => unreachable!("handled in run()"),
         }
     }
@@ -322,7 +338,6 @@ impl Feeder {
 
         let demand = Demand {
             consumers_present: !self.consumers.is_empty(),
-            force_on: self.force_on,
             gui_preview_active: self.gui_preview_active,
         };
 
@@ -363,6 +378,7 @@ impl Feeder {
             // engagement starts clean instead of with stale gradients.
             self.segmenter.reset();
             self.smoother.reset();
+            self.bbox_smoother.reset();
         }
 
         let prev = self.state;
@@ -431,8 +447,7 @@ impl Feeder {
                 .collect::<Vec<_>>()
                 .join(",");
             log::info!(
-                "lazy state → {label} (consumers=[{consumer_summary}], force_on={}, gui_preview={})",
-                self.force_on,
+                "lazy state → {label} (consumers=[{consumer_summary}], gui_preview={})",
                 self.gui_preview_active,
             );
             self.last_state_log = Some(label);
@@ -479,6 +494,10 @@ impl Feeder {
         let frame_h = self.cfg.height;
         let bg = self.background.clone();
 
+        // Auto-frame is a no-op without a background plane to fill the
+        // strip vacated by the shifted silhouette, so we tie it to a
+        // non-None background and keep the original true-passthrough
+        // short-circuit otherwise.
         if !matches!(bg, Background::None) {
             match self
                 .segmenter
@@ -486,10 +505,38 @@ impl Feeder {
             {
                 Ok(mut mask) => {
                     self.smoother.smooth(&mut mask.data);
-                    if let Err(e) =
-                        self.compositor
-                            .composite(&mut frame_rgba, frame_w, frame_h, &mask, &bg)
-                    {
+                    let framing = if self.framing_enabled {
+                        self.bbox_smoother.update(&mask).map(|anchor| {
+                            let f = Framing {
+                                src_anchor_x: anchor.cx_norm * frame_w as f32,
+                                src_anchor_y: anchor.top_y_norm * frame_h as f32,
+                                dst_anchor_x: frame_w as f32 * 0.5,
+                                dst_anchor_y: frame_h as f32 * TOP_HEADROOM,
+                                zoom: FG_ZOOM,
+                            };
+                            if self.frame_idx == 1
+                                || self.frame_idx % (self.cfg.framerate as u64 * 2) == 0
+                            {
+                                log::debug!(
+                                    "auto-frame: cx={:.3} top_y={:.3} zoom={:.2}",
+                                    anchor.cx_norm,
+                                    anchor.top_y_norm,
+                                    f.zoom,
+                                );
+                            }
+                            f
+                        })
+                    } else {
+                        None
+                    };
+                    if let Err(e) = self.compositor.composite(
+                        &mut frame_rgba,
+                        frame_w,
+                        frame_h,
+                        &mask,
+                        &bg,
+                        framing,
+                    ) {
                         log::error!("composite: {e:#}");
                         return;
                     }
@@ -614,10 +661,9 @@ pub(crate) fn pids(consumers: &[Consumer]) -> HashSet<u32> {
 mod tests {
     use super::*;
 
-    fn demand(consumers: bool, force: bool, preview: bool) -> Demand {
+    fn demand(consumers: bool, preview: bool) -> Demand {
         Demand {
             consumers_present: consumers,
-            force_on: force,
             gui_preview_active: preview,
         }
     }
@@ -637,7 +683,7 @@ mod tests {
 
     #[test]
     fn idle_with_no_demand_stays_idle() {
-        let off = demand(false, false, false);
+        let off = demand(false, false);
         let final_state = run(State::Idle, &[(Duration::from_secs(1), off); 10]);
         assert!(matches!(final_state, State::Idle));
     }
@@ -645,8 +691,8 @@ mod tests {
     #[test]
     fn brief_consumer_under_2s_never_lights_camera() {
         // Demand on for 1.5 s, then off. Must never reach Live.
-        let on = demand(true, false, false);
-        let off = demand(false, false, false);
+        let on = demand(true, false);
+        let off = demand(false, false);
         let mut state = State::Idle;
         let mut now = Instant::now();
         // 1.5 seconds of demand asserted.
@@ -672,7 +718,7 @@ mod tests {
     fn consumer_held_2s_reaches_live() {
         // With demand asserted continuously, we should reach Live at
         // exactly the activation-debounce boundary.
-        let on = demand(true, false, false);
+        let on = demand(true, false);
         let t0 = Instant::now();
         let mut state = State::Idle;
 
@@ -690,8 +736,8 @@ mod tests {
 
     #[test]
     fn live_then_no_demand_for_3s_returns_idle() {
-        let on = demand(true, false, false);
-        let off = demand(false, false, false);
+        let on = demand(true, false);
+        let off = demand(false, false);
         let t0 = Instant::now();
 
         // 3 s off → Idle.
@@ -715,8 +761,8 @@ mod tests {
     fn flicker_during_deactivation_stays_live() {
         // Live, demand toggles off/on/off/on at 1 s each — never crosses
         // the 3 s deactivation boundary, so must never leave Live.
-        let on = demand(true, false, false);
-        let off = demand(false, false, false);
+        let on = demand(true, false);
+        let off = demand(false, false);
         let t0 = Instant::now();
         let mut s = State::Live;
         s = next_state(s, off, t0);
@@ -728,21 +774,10 @@ mod tests {
     }
 
     #[test]
-    fn force_on_alone_holds_live() {
-        // No real consumer, force_on=true → Live after activation.
-        let force = demand(false, true, false);
-        let t0 = Instant::now();
-        let mut s = State::Idle;
-        s = next_state(s, force, t0);
-        s = next_state(s, force, t0 + ACTIVATION_DEBOUNCE);
-        assert!(matches!(s, State::Live));
-    }
-
-    #[test]
     fn gui_preview_alone_holds_live() {
         // Validates the 0c wiring: preview pane visible counts as a
         // synthetic consumer in the demand signal.
-        let preview = demand(false, false, true);
+        let preview = demand(false, true);
         let t0 = Instant::now();
         let mut s = State::Idle;
         s = next_state(s, preview, t0);

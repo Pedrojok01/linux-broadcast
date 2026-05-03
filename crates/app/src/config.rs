@@ -72,17 +72,17 @@ pub struct Config {
     /// Off by default — flipping the toggle in the sidebar writes/removes
     /// the autostart file.
     pub start_on_login: bool,
-    /// When true, the camera is held on regardless of consumer count.
-    /// Default off; the pipeline's lazy mode opens the camera only while
-    /// a real consumer is reading `/dev/video10`. Useful for streamer /
-    /// rehearsal flows where the camera LED should stay lit.
-    pub force_on: bool,
     /// When true, the GUI's preview pane renders live composited frames.
     /// Off → preview pane shows a static placeholder; the pipeline stops
     /// forwarding frames to the GUI (saves a per-frame RGBA clone). The
     /// broadcast itself is unaffected — consumers of `/dev/video10` see
     /// the same picture either way.
     pub show_preview: bool,
+    /// When true, the pipeline runs the auto-frame stage: a smoothed
+    /// virtual-PTZ crop driven by the segmentation mask keeps the user
+    /// centered (Meet-style). Forces segmentation even in `Mode::None`
+    /// because the bbox needs a mask.
+    pub auto_frame: bool,
 }
 
 impl Default for Config {
@@ -98,8 +98,8 @@ impl Default for Config {
             background_path: None,
             model: Model::default(),
             start_on_login: false,
-            force_on: false,
             show_preview: true,
+            auto_frame: false,
         }
     }
 }
@@ -201,7 +201,6 @@ mod tests {
                 background_path: Some(PathBuf::from("/tmp/some_bg.png")),
                 model: Model::Rvm,
                 start_on_login: true,
-                force_on: true,
                 show_preview: false,
                 ..Config::default()
             };
@@ -219,7 +218,6 @@ mod tests {
             );
             assert_eq!(loaded.model, Model::Rvm);
             assert!(loaded.start_on_login);
-            assert!(loaded.force_on);
             assert!(!loaded.show_preview);
         });
     }
@@ -227,9 +225,9 @@ mod tests {
     #[test]
     #[serial]
     fn forward_compat_missing_field() {
-        // A user upgrading from a pre-`force_on` build has a TOML without
-        // `force_on` / `start_on_login` / `show_preview`. Must load with
-        // defaults filled in.
+        // A user upgrading from an older build has a TOML without
+        // `start_on_login` / `show_preview`. Must load with defaults
+        // filled in.
         with_temp_xdg(|root| {
             let dir = root.join("linux-broadcast");
             std::fs::create_dir_all(&dir).unwrap();
@@ -245,7 +243,6 @@ mod tests {
             // Defaulted fields:
             assert_eq!(cfg.framerate, Config::default().framerate);
             assert_eq!(cfg.show_preview, Config::default().show_preview);
-            assert_eq!(cfg.force_on, Config::default().force_on);
             assert_eq!(cfg.start_on_login, Config::default().start_on_login);
         });
     }

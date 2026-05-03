@@ -73,6 +73,14 @@ pub struct PipelineConfig {
     /// sender for the GUI's preview pane. Bounded; sends use `try_send`
     /// and silently drop when the GUI is slow.
     pub preview_tx: Option<Sender<PreviewFrame>>,
+    /// When true, the feeder runs the auto-frame stage: a smoothed
+    /// horizontal translation of the foreground so the silhouette's
+    /// midpoint lands at the frame's vertical centerline. The
+    /// background plane (blurred original frame, or replacement image)
+    /// is sampled at unshifted coordinates and fills the strip vacated
+    /// by the shifted silhouette. Has no effect when `background` is
+    /// `Background::None` (no background plane to fill the gap).
+    pub framing: bool,
 }
 
 impl Default for PipelineConfig {
@@ -88,6 +96,7 @@ impl Default for PipelineConfig {
             },
             model: ModelKind::SelfieBinary,
             preview_tx: None,
+            framing: false,
         }
     }
 }
@@ -104,8 +113,6 @@ pub struct PreviewFrame {
 #[derive(Debug, Clone)]
 pub enum Command {
     SetBackground(Background),
-    /// Pin the camera on regardless of consumer count. Sidebar toggle.
-    SetForceOn(bool),
     /// While false, the feeder skips forwarding frames to the GUI's
     /// preview channel, avoiding the per-frame RGBA clone. The
     /// downstream broadcast (`/dev/video10`) is unaffected.
@@ -117,6 +124,11 @@ pub enum Command {
     /// visible AND the user has the preview toggle on; false otherwise
     /// (window hidden in tray, preview toggle off, app exiting).
     SetGuiPreviewActive(bool),
+    /// Toggle the auto-frame (smoothed horizontal foreground recenter)
+    /// stage. When turned off, the feeder also resets the smoother so
+    /// the next re-engagement snaps to the new midpoint instead of
+    /// drifting from a stale one.
+    SetFraming(bool),
     Stop,
 }
 
@@ -127,8 +139,7 @@ pub enum PipelineState {
     #[default]
     Idle,
     /// Camera engaged; one or more consumers are reading
-    /// `/dev/video10` (or the `force_on` / GUI preview heartbeat is
-    /// asserting demand).
+    /// `/dev/video10` (or the GUI preview heartbeat is asserting demand).
     Live { consumers: Vec<Consumer> },
 }
 
@@ -149,7 +160,7 @@ impl Pipeline {
     /// Build the sink graph, start the consumer watcher and the feeder
     /// thread, and return. The physical camera is **not** opened until
     /// either a consumer attaches to `/dev/video10` or the caller asserts
-    /// demand via [`Command::SetForceOn`].
+    /// demand via [`Command::SetGuiPreviewActive`].
     pub fn start(
         cfg: PipelineConfig,
         binary_onnx: &'static [u8],

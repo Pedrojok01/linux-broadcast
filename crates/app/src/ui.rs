@@ -109,6 +109,7 @@ fn pipeline_config_from(cfg: &Config, preview_tx: Option<Sender<PreviewFrame>>) 
         background: build_background(cfg),
         model: cfg.model.into_kind(),
         preview_tx,
+        framing: cfg.auto_frame,
     }
 }
 
@@ -271,6 +272,15 @@ impl App {
         }
     }
 
+    /// Quit-time cleanup: release the camera + virtual cam, then persist
+    /// settings. Safe to call when the pipeline was never started — the
+    /// helpers below short-circuit on `None`. Order matters: stop first
+    /// so any final config changes triggered by stop are still saved.
+    fn shutdown_cleanup(&mut self) {
+        self.stop_pipeline();
+        self.save_settings();
+    }
+
     fn refresh_library(&mut self) {
         self.library = backgrounds::list();
         self.thumbnails
@@ -299,9 +309,6 @@ impl App {
                 // Push the saved toggle states to the freshly started
                 // pipeline so they survive Stop+Start cycles (model
                 // swaps, camera swaps).
-                if self.cfg.force_on {
-                    let _ = cmd_tx.send(Command::SetForceOn(true));
-                }
                 if !self.cfg.show_preview {
                     let _ = cmd_tx.send(Command::SetPreviewEnabled(false));
                 }
@@ -490,8 +497,20 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.stop_pipeline();
-        self.save_settings();
+        self.shutdown_cleanup();
+
+        // Bypass eframe's EGL/glutin teardown when the user explicitly
+        // asked to quit. NVIDIA's proprietary EGL Wayland driver
+        // (libnvidia-egl-wayland → libEGL_nvidia) aborts inside
+        // `wl_display_dispatch_queue` during context destruction,
+        // dumping core every time. Our resources are already released
+        // by `shutdown_cleanup` (GStreamer pipelines → Null, settings
+        // saved); the flock and tray thread go away with the process.
+        // Only short-circuit on intentional Quit so accidental exit
+        // paths still go through normal teardown.
+        if self.quit_requested {
+            std::process::exit(0);
+        }
     }
 }
 
@@ -641,7 +660,7 @@ impl App {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(space::LG);
                     let (dot_color, label, label_color) =
-                        footer_status(self.running(), &self.pipeline_state, self.cfg.force_on);
+                        footer_status(self.running(), &self.pipeline_state);
                     ui.label(egui::RichText::new("●").color(dot_color).small());
                     ui.add_space(space::XS);
                     ui.label(egui::RichText::new(label).small().color(label_color));
@@ -936,13 +955,6 @@ impl App {
                 }
             },
         );
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ghost_button(ui, "⟳ Refresh").clicked() {
-                self.cameras = enumerate(&self.cfg.sink_device);
-            }
-        });
 
         if camera_changed {
             self.save_settings();
@@ -1347,26 +1359,6 @@ impl App {
 
         ui.add_space(space::SM);
 
-        // Force-camera-on toggle. Default behaviour is lazy mode: the
-        // physical camera lights only when something is reading
-        // /dev/video10. Flipping this on pins the camera regardless —
-        // useful for streamer/rehearsal flows or for previewing in this
-        // window without opening Meet.
-        if toggle_row(
-            ui,
-            self.cfg.force_on,
-            "Force camera on",
-            "Keep camera lit even when no app is reading",
-        ) {
-            self.cfg.force_on = !self.cfg.force_on;
-            self.save_settings();
-            if let Some(tx) = &self.cmd_tx {
-                let _ = tx.send(Command::SetForceOn(self.cfg.force_on));
-            }
-        }
-
-        ui.add_space(space::SM);
-
         // Show-preview toggle. Off → the preview pane shows a static
         // placeholder and the pipeline stops forwarding frames to the
         // GUI (saves a per-frame RGBA clone). The broadcast itself is
@@ -1388,6 +1380,25 @@ impl App {
             if !self.cfg.show_preview {
                 self.preview_tex = None;
                 self.last_preview_size = None;
+            }
+        }
+
+        ui.add_space(space::SM);
+
+        // Auto-frame toggle. On → the pipeline runs a smoothed virtual-PTZ
+        // crop driven by the person mask, keeping the user centered (akin
+        // to Meet's framing). Forces segmentation even in passthrough
+        // mode, so it costs more CPU than today's bg-None short-circuit.
+        if toggle_row(
+            ui,
+            self.cfg.auto_frame,
+            "Auto-frame",
+            "Center on you (smooth virtual zoom)",
+        ) {
+            self.cfg.auto_frame = !self.cfg.auto_frame;
+            self.save_settings();
+            if let Some(tx) = &self.cmd_tx {
+                let _ = tx.send(Command::SetFraming(self.cfg.auto_frame));
             }
         }
     }
@@ -1622,16 +1633,13 @@ fn toggle_row(ui: &mut egui::Ui, active: bool, title: &str, subtitle: &str) -> b
 ///
 /// Three layers of nuance:
 /// - pipeline not running at all → grey "Idle".
-/// - running but lazy state is Idle (no consumer, no force-on) → blue
-///   "Standby" so the user sees the difference between "the app is on
-///   but the camera is off" and "the app is off".
+/// - running but lazy state is Idle (no consumer) → blue "Standby" so
+///   the user sees the difference between "the app is on but the camera
+///   is off" and "the app is off".
 /// - running and Live → green "LIVE → name(pid)" if there's a real
-///   consumer, otherwise green "LIVE (force-on)" / "LIVE (preview)".
-fn footer_status(
-    running: bool,
-    state: &PipelineState,
-    force_on: bool,
-) -> (Color32, String, Color32) {
+///   consumer, otherwise green "LIVE (preview)" (the GUI's preview
+///   heartbeat is the demand source).
+fn footer_status(running: bool, state: &PipelineState) -> (Color32, String, Color32) {
     if !running {
         return (color::TEXT_MUTED, "Idle".to_string(), color::TEXT_MUTED);
     }
@@ -1652,10 +1660,9 @@ fn footer_status(
             (color::SUCCESS, label, color::SUCCESS)
         }
         PipelineState::Live { .. } => {
-            // Live without external consumers: GUI preview heartbeat or
-            // force-on is the demand source.
-            let reason = if force_on { "force-on" } else { "preview" };
-            (color::SUCCESS, format!("LIVE ({reason})"), color::SUCCESS)
+            // Live without external consumers: the GUI preview heartbeat
+            // is the demand source.
+            (color::SUCCESS, "LIVE (preview)".to_string(), color::SUCCESS)
         }
         PipelineState::Idle => (
             color::ACCENT,
