@@ -261,10 +261,11 @@ fn segment_multiclass(
 // -----------------------------------------------------------------------
 
 /// Internal compute resolution = input × downsample_ratio. The official
-/// recommendation is 0.375–0.4 at 720p and 0.25 at 1080p; we stay at 0.4
-/// which gives ~480×270 internal compute on a 1280×720 frame — about
-/// 30–40 ms / frame on a single x86 core.
-const RVM_DOWNSAMPLE_RATIO: f32 = 0.4;
+/// recommendation is 0.375–0.4 at 720p for speed and 0.5 at 720p for
+/// "higher quality" (sharper hair / shoulder edges). 0.5 → 640×360
+/// internal compute on a 1280×720 frame; ~50 % more inference cost than
+/// 0.4 in exchange for visibly tighter mattes.
+const RVM_DOWNSAMPLE_RATIO: f32 = 0.5;
 
 pub struct RvmInner {
     session: Session,

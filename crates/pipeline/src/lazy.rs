@@ -41,7 +41,7 @@ use crate::pipeline::{
     NS_PER_SEC,
 };
 use crate::segmenter::{ModelKind, Segmenter};
-use crate::temporal::{MaskSmoother, DEFAULT_ALPHA};
+use crate::temporal::{MaskSmoother, DEFAULT_ALPHA, RVM_ALPHA};
 
 /// How long a consumer must remain present before we light the camera.
 /// Sized to reject browser capability-probes (typically <500 ms) without
@@ -155,7 +155,10 @@ pub(crate) fn spawn_feeder(
                 cfg: cfg_for_thread,
                 segmenter,
                 compositor: Compositor::new(),
-                smoother: MaskSmoother::new(DEFAULT_ALPHA),
+                smoother: MaskSmoother::new(match cfg.model {
+                    ModelKind::Rvm => RVM_ALPHA,
+                    _ => DEFAULT_ALPHA,
+                }),
                 bbox_smoother: BBoxSmoother::new(),
                 framing_enabled: cfg.framing,
                 background: cfg.background.clone(),

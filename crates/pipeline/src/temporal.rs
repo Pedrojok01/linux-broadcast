@@ -1,7 +1,14 @@
-/// Default EMA weight on the current frame. Values in `[0.6, 0.8]` look
-/// natural — present frame dominates so motion stays responsive while the
-/// remaining history weight damps shimmer at the silhouette.
+/// Default EMA weight on the current frame for the per-frame MediaPipe
+/// models. Values in `[0.6, 0.8]` look natural — present frame dominates
+/// so motion stays responsive while the remaining history weight damps
+/// shimmer at the silhouette.
 pub const DEFAULT_ALPHA: f32 = 0.7;
+
+/// EMA weight for RVM. RVM has its own recurrent temporal smoothing
+/// baked into the network (the 4 r*i / r*o state tensors), so stacking
+/// a heavy EMA on top mostly just blurs edges during motion. 0.95 keeps
+/// a tiny residual flicker damp without softening the matte.
+pub const RVM_ALPHA: f32 = 0.95;
 
 /// Exponential moving-average smoothing of the per-pixel mask across frames.
 ///
