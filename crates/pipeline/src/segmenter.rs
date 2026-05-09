@@ -23,13 +23,12 @@
 //! keep their input/output buffers in `self` so steady-state segmentation
 //! does no heap allocation.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use fast_image_resize::{
-    self as fr,
+    self as fr, FilterType, ResizeAlg, ResizeOptions,
     images::{Image, ImageRef},
-    FilterType, ResizeAlg, ResizeOptions,
 };
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Value;
 
 use crate::{MODEL_H, MODEL_W};

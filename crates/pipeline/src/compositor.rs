@@ -48,11 +48,10 @@
 //! them. Cold-start fills with a global background-mean colour for the
 //! ~1-2 seconds it takes the EMA to converge.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use fast_image_resize::{
-    self as fr,
+    self as fr, FilterType, ResizeAlg, ResizeOptions,
     images::{Image, ImageRef},
-    FilterType, ResizeAlg, ResizeOptions,
 };
 
 use crate::Mask;
@@ -429,9 +428,8 @@ impl Compositor {
         {
             let plate_rgba = &self.plate.rgba;
             let plate_conf = &self.plate.conf;
-            let plate_ready = self.plate.width == width
-                && self.plate.height == height
-                && !plate_rgba.is_empty();
+            let plate_ready =
+                self.plate.width == width && self.plate.height == height && !plate_rgba.is_empty();
             let out = &mut self.blur_out;
             for (i, &conf) in plate_conf.iter().take(w * h).enumerate() {
                 let pi = i * 4;
@@ -613,7 +611,8 @@ fn blend(
     let wf = w as f32;
     let hf = h as f32;
     for y in 0..h {
-        let src_yf = framing.src_anchor_y + (y as f32 + 0.5 - framing.dst_anchor_y) * inv_zoom - 0.5;
+        let src_yf =
+            framing.src_anchor_y + (y as f32 + 0.5 - framing.dst_anchor_y) * inv_zoom - 0.5;
         let row = y * w;
         for x in 0..w {
             let dst_pi = (row + x) * 4;

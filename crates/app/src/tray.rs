@@ -20,13 +20,13 @@
 //! "headless autostart, no GUI visible" path because `--headless` skips
 //! tray creation by design.
 
-use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::sync::OnceLock;
 
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
 use crate::icon;

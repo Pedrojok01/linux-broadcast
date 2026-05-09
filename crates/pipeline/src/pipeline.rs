@@ -16,15 +16,15 @@
 //! smoother and the lazy-mode state machine. Callers never see this
 //! split — the public [`Pipeline`] handle behaves like a single object.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 

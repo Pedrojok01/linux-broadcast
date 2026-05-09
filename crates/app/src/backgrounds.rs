@@ -15,7 +15,7 @@
 //! deps. The compositor receives a finished `Background::Image { rgba,
 //! width, height }`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

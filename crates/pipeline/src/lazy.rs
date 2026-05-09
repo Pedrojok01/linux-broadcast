@@ -22,13 +22,13 @@
 
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{select, tick, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, select, tick};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -37,11 +37,11 @@ use crate::compositor::{Background, Compositor, Framing};
 use crate::consumer_watch::Consumer;
 use crate::framing::{BBoxSmoother, FG_ZOOM, TOP_HEADROOM};
 use crate::pipeline::{
-    log_negotiated_input, Command, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
-    NS_PER_SEC,
+    Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
+    log_negotiated_input,
 };
 use crate::segmenter::{ModelKind, Segmenter};
-use crate::temporal::{MaskSmoother, DEFAULT_ALPHA, RVM_ALPHA};
+use crate::temporal::{DEFAULT_ALPHA, MaskSmoother, RVM_ALPHA};
 
 /// How long a consumer must remain present before we light the camera.
 /// Sized to reject browser capability-probes (typically <500 ms) without

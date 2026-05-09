@@ -32,7 +32,7 @@
 //! Footer surface mirrors `PipelineState`: `● Idle`, `● Standby (no
 //! consumer)`, or `● LIVE → name(pid)` while a real consumer is reading.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui::{self, Color32, Margin, Rounding, Stroke, ViewportCommand};
 use lb_pipeline::{Background, Command, Pipeline, PipelineConfig, PreviewFrame};
@@ -44,7 +44,7 @@ use lb_pipeline::PipelineState;
 
 use crate::autostart;
 use crate::backgrounds::{self, LibraryEntry};
-use crate::cameras::{enumerate, CameraEntry};
+use crate::cameras::{CameraEntry, enumerate};
 use crate::config::{Config, Mode, Model};
 use crate::theme::{self, color, control, radius, space};
 use crate::tray::{Tray, TrayEvent};

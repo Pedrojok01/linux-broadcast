@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
