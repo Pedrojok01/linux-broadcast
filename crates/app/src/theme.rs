@@ -1,4 +1,21 @@
 //! Design tokens (colors, spacing, radii, control sizes) applied to egui.
+//!
+//! Two layers:
+//! - **Token modules** (`color`, `space`, `radius`, `control`) hold raw
+//!   constants. Read from `ui.rs` whenever a widget needs to step outside
+//!   the default `Visuals`.
+//! - **`apply()`** writes those constants into `egui::Style`/`Visuals`
+//!   and registers Inter + JetBrains Mono via `FontDefinitions`. Called
+//!   once at app startup from `ui::run`.
+//!
+//! `DESIGN.md` is the prose companion (palette rationale, layout intent,
+//! type scale) but **this file is authoritative for values** — when they
+//! disagree, the code wins.
+//!
+//! Adding a new token: add the constant here, reference it from
+//! `ui.rs`, then mirror it in `DESIGN.md`'s tables so designers reading
+//! the doc see it. Don't fork tokens at the call site (`Color32::from_rgb`
+//! sprinkled through `ui.rs`); that's how palettes drift.
 
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Rounding, Stroke, Style,

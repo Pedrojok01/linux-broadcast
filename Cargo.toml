@@ -3,9 +3,9 @@ resolver = "2"
 members = ["crates/pipeline", "crates/app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/Pedrojok01/linux-broadcast"
 authors = ["Pedrojok01"]
 rust-version = "1.80"

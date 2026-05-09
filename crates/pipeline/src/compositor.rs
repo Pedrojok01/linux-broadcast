@@ -1,3 +1,53 @@
+//! Composite the segmented foreground over a chosen background plane.
+//!
+//! Steps, in order:
+//! 1. **Mask prep** — bilinear-upsample the model mask to frame resolution
+//!    when needed. RVM already returns frame-resolution masks, so the
+//!    upsample short-circuits.
+//! 2. **Background plate update** — for any non-`None` mode, fold the
+//!    current frame into a long-running per-pixel EMA that only
+//!    samples pixels we're confident are background (`mask < 0.5`).
+//!    Over a few seconds of natural movement the plate becomes a
+//!    person-free copy of the actual room. Used as the source for the
+//!    `Blur` mode bg plane, so the wall stays stationary while
+//!    auto-frame slides the silhouette across it. See `BgPlate`.
+//! 3. **Background plane** — produced once per frame from the active
+//!    [`Background`]:
+//!    - `Blur`: a two-pass separable box blur of the temporal plate
+//!      (`bg_mean`-filled where plate confidence is low, e.g. cold
+//!      start). The bg plane lives in source coordinates and is
+//!      sampled at unshifted output coordinates — auto-frame reframes
+//!      only the foreground, so the wall stays put.
+//!    - `Image`: a cached scaled-to-cover RGBA copy of the user's
+//!      library image. The image plane is sampled at unshifted output
+//!      coordinates regardless of framing — its contents are
+//!      independent of the camera, so there's no source/output
+//!      coordinate ambiguity to resolve.
+//!    - `None`: skips this entire module — the feeder pushes the
+//!      camera frame straight to `appsrc`.
+//! 4. **Blend** — `out = fg * mask + bg * (1 - mask)` per pixel, in RGBA8.
+//!    When [`Framing`] is non-identity (auto-frame is on and a silhouette
+//!    is detected), the foreground sample point is reparameterized as
+//!    `src = src_anchor + (out - dst_anchor) / zoom` and read with
+//!    bilinear interpolation; the background is sampled at unshifted
+//!    output coordinates so the bg plane stays put as the silhouette
+//!    slides over it.
+//!
+//! Buffers (resizers, working planes, blur scratch, plate) live on
+//! `Compositor` to avoid per-frame allocations. The blur kernel falls
+//! back to a single pass below `BLUR_TWO_PASS_THRESHOLD` and switches
+//! to two passes above it, pushing the box-kernel output closer to a
+//! Gaussian without paying for the second pass at low strengths.
+//!
+//! The temporal plate is what lets the bg stay stationary under
+//! auto-frame without leaving a "ghost me" anywhere the remapped
+//! silhouette doesn't cover the original-position body. A single-frame
+//! blur derived from the live frame would always carry the body in
+//! source coords; the plate, learned over time from frames where the
+//! user wasn't occluding each pixel, holds the actual wall behind
+//! them. Cold-start fills with a global background-mean colour for the
+//! ~1-2 seconds it takes the EMA to converge.
+
 use anyhow::{anyhow, Result};
 use fast_image_resize::{
     self as fr,
@@ -59,9 +109,14 @@ pub enum Background {
     /// for diagnostics. The compositor short-circuits both the segmentation
     /// upsample and the per-pixel blend.
     None,
-    /// Gaussian-blur the original frame and use that as the background.
-    /// `strength` is in `[0.0, 1.0]` and maps to a kernel radius from
-    /// `BLUR_MIN_RADIUS` (barely-visible) to `BLUR_MAX_RADIUS` (strong).
+    /// Gaussian-blur the temporal background plate and use it as the
+    /// background. `strength` is in `[0.0, 1.0]` and maps to a kernel
+    /// radius from `BLUR_MIN_RADIUS` (barely-visible) to
+    /// `BLUR_MAX_RADIUS` (strong). The plate is a per-pixel EMA of
+    /// the source frame restricted to confidently-bg samples (see
+    /// `BgPlate`), so the bg plane is the actual room behind the
+    /// user — never the user themselves — and stays stationary while
+    /// auto-frame reframes the foreground.
     Blur { strength: f32 },
     /// Composite over a static RGBA image, scaled to cover the frame.
     Image {
@@ -74,6 +129,102 @@ pub enum Background {
 impl Background {
     /// Default blur intensity (mid-strength).
     pub const DEFAULT_BLUR_STRENGTH: f32 = 0.62;
+}
+
+/// Per-pixel EMA learning rate when a sample is confidently background.
+/// At 30 fps this gives an effective half-life of roughly one second —
+/// fast enough to track gentle lighting drift, slow enough that a brief
+/// segmenter false-negative on the body doesn't bake the user into the
+/// plate.
+const PLATE_LEARN_RATE: f32 = 0.05;
+
+/// Mask threshold below which a pixel is treated as confidently
+/// background and folded into the plate. Pixels above this are skipped
+/// entirely so the body never contributes, even at boundary smoothing.
+const PLATE_BG_THRESHOLD: f32 = 0.5;
+
+/// Cumulative-weight threshold above which the plate is trusted at a
+/// pixel. Below this, the bg materializer falls back to the global
+/// `bg_mean` colour. ~6-12 confident updates' worth, so cold start
+/// transitions to "real plate" within roughly half a second per pixel
+/// once exposed.
+const PLATE_CONF_THRESHOLD: f32 = 0.3;
+
+/// Long-running per-pixel estimate of the room behind the user.
+///
+/// On each non-`None` composite the plate folds in the current frame
+/// at pixels where the segmentation mask reports confidently-bg, using
+/// a small EMA. After a few seconds of natural movement the plate is a
+/// person-free copy of the actual scene — that's what lets the
+/// `Background::Blur` mode keep the wall stationary under auto-frame
+/// without leaving a "ghost me" wherever the remapped silhouette
+/// doesn't cover the original-position body.
+///
+/// Per-pixel `conf` accumulates the weights ever applied at that
+/// pixel, capped at 1.0. `conf < PLATE_CONF_THRESHOLD` marks
+/// "haven't seen real bg here yet" and the materializer fills with
+/// `bg_mean` instead. `reset()` zeros both buffers — the feeder calls
+/// it on Live exit so the next engagement starts learning fresh in
+/// case the camera or lighting changed during the idle window.
+struct BgPlate {
+    rgba: Vec<u8>,
+    conf: Vec<f32>,
+    width: u32,
+    height: u32,
+}
+
+impl BgPlate {
+    fn new() -> Self {
+        Self {
+            rgba: Vec::new(),
+            conf: Vec::new(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// Drop all accumulated state. Next call to [`Self::update`] starts
+    /// from a cold plate; the `bg_mean` cold-start fallback in
+    /// [`Compositor::run_blur`] covers the visual gap until the EMA
+    /// re-converges.
+    fn reset(&mut self) {
+        self.rgba.clear();
+        self.conf.clear();
+        self.width = 0;
+        self.height = 0;
+    }
+
+    /// Fold one frame into the plate. `mask` is the upsampled
+    /// foreground probability at frame resolution. Pixels with
+    /// `mask >= PLATE_BG_THRESHOLD` are skipped entirely; the rest are
+    /// EMA'd at a rate proportional to their bg-certainty.
+    fn update(&mut self, frame: &[u8], mask: &[f32], width: u32, height: u32) {
+        let n_px = (width as usize) * (height as usize);
+        if self.width != width || self.height != height {
+            self.rgba.clear();
+            self.rgba.resize(n_px * 4, 0);
+            self.conf.clear();
+            self.conf.resize(n_px, 0.0);
+            self.width = width;
+            self.height = height;
+        }
+        for (i, &m) in mask.iter().take(n_px).enumerate() {
+            let bg_certainty = 1.0 - m.clamp(0.0, 1.0);
+            if bg_certainty <= PLATE_BG_THRESHOLD {
+                continue;
+            }
+            let alpha = PLATE_LEARN_RATE * bg_certainty;
+            let inv = 1.0 - alpha;
+            let pi = i * 4;
+            self.rgba[pi] = (self.rgba[pi] as f32 * inv + frame[pi] as f32 * alpha) as u8;
+            self.rgba[pi + 1] =
+                (self.rgba[pi + 1] as f32 * inv + frame[pi + 1] as f32 * alpha) as u8;
+            self.rgba[pi + 2] =
+                (self.rgba[pi + 2] as f32 * inv + frame[pi + 2] as f32 * alpha) as u8;
+            self.rgba[pi + 3] = 255;
+            self.conf[i] = (self.conf[i] + alpha).min(1.0);
+        }
+    }
 }
 
 pub struct Compositor {
@@ -96,6 +247,18 @@ pub struct Compositor {
     /// source position while writing to the in-place output. Allocated
     /// lazily; only used when a non-identity `Framing` is supplied.
     fg_scratch: Vec<u8>,
+    /// Background plane for `Background::Blur`. Holds the materialized
+    /// plate (with `bg_mean` fill where confidence is low) after the
+    /// box-blur passes. Reused across frames to dodge a
+    /// 1280×720×4 = 3.6 MB allocation per tick.
+    blur_out: Vec<u8>,
+    /// Scratch buffer used as the intermediate for the separable box
+    /// blur (horizontal pass writes here, vertical pass reads from it).
+    blur_tmp: Vec<u8>,
+    /// Long-running estimate of the room behind the user. Updated
+    /// every non-`None` composite, consumed only in `Blur` mode. See
+    /// `BgPlate`.
+    plate: BgPlate,
 }
 
 impl Compositor {
@@ -108,7 +271,18 @@ impl Compositor {
             bg_h: 0,
             bg_fingerprint: None,
             fg_scratch: Vec::new(),
+            blur_out: Vec::new(),
+            blur_tmp: Vec::new(),
+            plate: BgPlate::new(),
         }
+    }
+
+    /// Discard the temporal background plate. Called by the feeder on
+    /// Live exit so the next engagement starts learning from scratch
+    /// (lighting and camera position may have changed during the idle
+    /// window). Cheap — just clears two `Vec`s.
+    pub fn reset_bg_plate(&mut self) {
+        self.plate.reset();
     }
 
     fn resize_opts() -> ResizeOptions {
@@ -167,6 +341,14 @@ impl Compositor {
 
         self.prepare_mask(mask, width, height)?;
 
+        // Fold this frame into the temporal background plate. We do
+        // this for every non-`None` mode (not just `Blur`) so that
+        // switching from `Image` to `Blur` finds a primed plate
+        // instead of a cold start. Cost is one O(N) pass; trivial
+        // next to segmentation.
+        self.plate
+            .update(frame, &self.upsampled_mask, width, height);
+
         // Background prep first — these methods take `&mut self`, so we
         // can't be holding the `fg_scratch` borrow yet.
         if let Background::Image {
@@ -190,22 +372,24 @@ impl Compositor {
             }
             self.fg_scratch.copy_from_slice(frame);
         }
-        let fg_src: Option<&[u8]> = framing.map(|_| self.fg_scratch.as_slice());
 
         match background {
             Background::None => unreachable!(),
             Background::Blur { strength } => {
-                composite_blur(
+                self.run_blur(frame, width, height, *strength);
+                let fg_src: Option<&[u8]> = framing.map(|_| self.fg_scratch.as_slice());
+                blend(
                     frame,
-                    width,
-                    height,
+                    &self.blur_out,
                     &self.upsampled_mask,
-                    *strength,
+                    width as usize,
+                    height as usize,
                     framing,
                     fg_src,
                 );
             }
             Background::Image { .. } => {
+                let fg_src: Option<&[u8]> = framing.map(|_| self.fg_scratch.as_slice());
                 composite_image(
                     frame,
                     width,
@@ -218,6 +402,64 @@ impl Compositor {
             }
         }
         Ok(())
+    }
+
+    /// Build the bg plane for `Background::Blur` into `self.blur_out`.
+    ///
+    /// Materializes the temporal background plate (with a global
+    /// `bg_mean` fill where plate confidence is still low) and runs
+    /// a one- or two-pass separable box blur over it. The bg is in
+    /// source coordinates and is sampled at unshifted output
+    /// coordinates by the blend, so the wall stays stationary while
+    /// auto-frame slides the silhouette across it.
+    fn run_blur(&mut self, frame: &[u8], width: u32, height: u32, strength: f32) {
+        let w = width as usize;
+        let h = height as usize;
+        let n = (w * h) * 4;
+
+        self.blur_out.resize(n, 0);
+        self.blur_tmp.resize(n, 0);
+
+        let bg_mean = compute_bg_mean(frame, &self.upsampled_mask, w * h);
+
+        // Materialize: plate where confidence is high, `bg_mean`
+        // where it isn't yet. The blur kernel hides the boundary
+        // between the two regions, so this transition is invisible
+        // outside the first ~second of cold-start.
+        {
+            let plate_rgba = &self.plate.rgba;
+            let plate_conf = &self.plate.conf;
+            let plate_ready = self.plate.width == width
+                && self.plate.height == height
+                && !plate_rgba.is_empty();
+            let out = &mut self.blur_out;
+            for (i, &conf) in plate_conf.iter().take(w * h).enumerate() {
+                let pi = i * 4;
+                let use_plate = plate_ready && conf > PLATE_CONF_THRESHOLD;
+                if use_plate {
+                    out[pi] = plate_rgba[pi];
+                    out[pi + 1] = plate_rgba[pi + 1];
+                    out[pi + 2] = plate_rgba[pi + 2];
+                } else {
+                    out[pi] = bg_mean[0];
+                    out[pi + 1] = bg_mean[1];
+                    out[pi + 2] = bg_mean[2];
+                }
+                out[pi + 3] = 255;
+            }
+        }
+
+        let s = strength.clamp(0.0, 1.0);
+        let span = (BLUR_MAX_RADIUS - BLUR_MIN_RADIUS) as f32;
+        let radius = (BLUR_MIN_RADIUS as f32 + s * span).round() as usize;
+        if radius == 0 {
+            return;
+        }
+
+        box_blur_rgba(&mut self.blur_out, &mut self.blur_tmp, w, h, radius);
+        if radius >= BLUR_TWO_PASS_THRESHOLD {
+            box_blur_rgba(&mut self.blur_out, &mut self.blur_tmp, w, h, radius);
+        }
     }
 
     /// Make sure `self.upsampled_mask` holds the mask at frame resolution.
@@ -313,39 +555,6 @@ fn bg_fingerprint(bg: &[u8], bw: u32, bh: u32) -> u64 {
         bg.hash(&mut h);
     }
     h.finish()
-}
-
-/// Two passes of a separable box kernel approximate a Gaussian with σ ≈
-/// 1.5×radius. `strength` ∈ [0,1] maps to a radius from
-/// `BLUR_MIN_RADIUS` to `BLUR_MAX_RADIUS` px.
-///
-/// `fg_src` must be `Some` when `framing.is_some()` (a clean copy of
-/// the unframed input), `None` otherwise. The blur is computed from
-/// `frame` in either case so the background plane keeps its original
-/// content — that's what makes the silhouette appear to slide and grow
-/// *over* a stationary background.
-fn composite_blur(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
-    mask: &[f32],
-    strength: f32,
-    framing: Option<Framing>,
-    fg_src: Option<&[u8]>,
-) {
-    let w = width as usize;
-    let h = height as usize;
-    let s = strength.clamp(0.0, 1.0);
-    let span = (BLUR_MAX_RADIUS - BLUR_MIN_RADIUS) as f32;
-    let radius = (BLUR_MIN_RADIUS as f32 + s * span).round() as usize;
-    // Two passes → quasi-Gaussian. Skip second pass for very small radii.
-    let mut blurred = frame.to_vec();
-    box_blur_rgba(&mut blurred, w, h, radius);
-    if radius >= BLUR_TWO_PASS_THRESHOLD {
-        box_blur_rgba(&mut blurred, w, h, radius);
-    }
-
-    blend(frame, &blurred, mask, w, h, framing, fg_src);
 }
 
 fn composite_image(
@@ -484,14 +693,40 @@ fn sample_fg_bilinear(
     (m, rgb)
 }
 
-/// Two-pass separable box blur on RGBA8. Radius is in pixels.
-fn box_blur_rgba(buf: &mut [u8], w: usize, h: usize, r: usize) {
-    if r == 0 {
-        return;
+/// Mask-weighted mean RGB of the input frame: pixels with low mask
+/// (confidently background) dominate; foreground pixels contribute
+/// little. Used as the cold-start fallback colour wherever the
+/// temporal plate hasn't accumulated enough confidence yet. f64
+/// accumulators keep the 1280×720 sum precise.
+fn compute_bg_mean(frame: &[u8], mask: &[f32], n_px: usize) -> [u8; 3] {
+    let mut bg_sum = [0.0_f64; 3];
+    let mut bg_w = 0.0_f64;
+    for i in 0..n_px {
+        let w = (1.0 - mask[i].clamp(0.0, 1.0)) as f64;
+        bg_w += w;
+        bg_sum[0] += frame[i * 4] as f64 * w;
+        bg_sum[1] += frame[i * 4 + 1] as f64 * w;
+        bg_sum[2] += frame[i * 4 + 2] as f64 * w;
     }
-    let mut tmp = vec![0_u8; buf.len()];
-    blur_horizontal(buf, &mut tmp, w, h, r);
-    blur_vertical(&tmp, buf, w, h, r);
+    if bg_w > 1.0 {
+        [
+            (bg_sum[0] / bg_w) as u8,
+            (bg_sum[1] / bg_w) as u8,
+            (bg_sum[2] / bg_w) as u8,
+        ]
+    } else {
+        // Frame is essentially all foreground — there's no bg
+        // signal to estimate from. Mid-grey is the least-bad
+        // default and only applies to a degenerate input.
+        [128, 128, 128]
+    }
+}
+
+/// Two-pass separable box blur on RGBA8 in `buf`, using `tmp` as the
+/// horizontal-pass intermediate. Alpha is forced to 255.
+fn box_blur_rgba(buf: &mut [u8], tmp: &mut [u8], w: usize, h: usize, r: usize) {
+    blur_horizontal(buf, tmp, w, h, r);
+    blur_vertical(tmp, buf, w, h, r);
 }
 
 fn blur_horizontal(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
@@ -500,7 +735,6 @@ fn blur_horizontal(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
         let row = y * w * 4;
         for c in 0..3 {
             let mut sum = 0.0_f32;
-            // Prime the window with edge replication.
             for k in 0..(2 * r + 1) {
                 let xi = (k as isize - r as isize).clamp(0, w as isize - 1) as usize;
                 sum += src[row + xi * 4 + c] as f32;
@@ -512,7 +746,6 @@ fn blur_horizontal(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
                 sum += src[row + x_in * 4 + c] as f32 - src[row + x_out * 4 + c] as f32;
             }
         }
-        // Alpha → 255.
         for x in 0..w {
             dst[row + x * 4 + 3] = 255;
         }

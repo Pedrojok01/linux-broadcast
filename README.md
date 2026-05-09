@@ -20,6 +20,9 @@ A small virtual webcam for Linux that segments the foreground with MediaPipe / R
   - **RVM** (Robust Video Matting) — recurrent video matting, best edges, no flicker (~15 MB).
 - **Three background modes** — passthrough, blur (intensity slider, 4–32 px radius), replace with a saved image.
 - **Saved background library** — imports are copied to `~/.local/share/linux-broadcast/backgrounds/` so they survive across launches.
+- **Auto-frame** — a smoothed horizontal recenter plus a light foreground zoom that keeps the silhouette centered as you move. Off by default; toggle in the sidebar's *Settings*. Skipped when the background mode is *None* (no plane to paint over).
+- **Lazy producer mode** — the physical webcam LED only lights when an app is actually reading the virtual cam, like NVIDIA Broadcast. See [Lazy mode](#lazy-mode-camera-on-demand).
+- **System tray** — the close button hides to the tray; `Quit` from the tray menu actually exits.
 - **Live preview pane** in the GUI; settings persist to `~/.config/linux-broadcast/config.toml`.
 - **No CUDA, no PyTorch, no Python** — single Rust binary, ~25 MB plus the bundled ONNX/font assets.
 
@@ -57,9 +60,12 @@ sudo apt install -y \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libxkbcommon-dev libwayland-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
   v4l2loopback-dkms \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
+
+The `libgtk-3-dev` / `libxdo-dev` / `libayatana-appindicator3-dev` trio is pulled in by the `tray-icon` crate at build time; at runtime only `libayatana-appindicator3-1` is required (already declared in the `.deb`'s `Depends`).
 
 #### 2. Create the virtual camera device (development only)
 
@@ -115,11 +121,14 @@ When the LinuxBroadcast GUI is open and visible, the **preview pane counts as a 
 
 ## Using it
 
+The pipeline is **always running** while LinuxBroadcast is open — there's no Start/Stop button. Conferencing apps see `LinuxBroadcast` in their camera list the moment LB starts, and the physical webcam only powers on when something actually reads the virtual cam (see [Lazy mode](#lazy-mode-camera-on-demand)).
+
 1. Pick a physical camera in **Camera**.
 2. Pick a model in **Model** — binary is fastest, multiclass sharper, RVM cleanest. Switching restarts the pipeline automatically.
 3. **Set the scene** with the segmented control — `None` (passthrough), `Blur` (slider for intensity), or `Replace` (uses the active library tile).
 4. Click **+ Import** to add background images; click any thumbnail to switch to it live; right-click → Remove deletes it.
-5. Click **Start broadcasting**. Any conferencing app that picks `LinuxBroadcast` as its camera now sees the composited stream.
+5. Toggle **Auto-frame**, **Show preview**, or **Start on login** in the sidebar's *Settings* section as needed. All three persist to `config.toml`.
+6. Open Zoom / Meet / Signal / Firefox / OBS and pick `LinuxBroadcast` as the camera — that's it. Closing LB's window keeps it running in the tray; `Quit` from the tray menu actually shuts it down.
 
 ## Performance
 
@@ -180,4 +189,6 @@ For substantive changes:
 
 ## License
 
-MIT.
+GPL-3.0-or-later. See [`LICENSE`](LICENSE) for the full text.
+
+This project bundles [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) (`models/rvm.onnx`), released under GPL-3.0, which is what makes the entire binary GPL-3.0. The two MediaPipe ONNX files in `models/` are Apache-2.0; the bundled fonts in `assets/fonts/` are SIL Open Font License 1.1. See [`models/README.md`](models/README.md) and [`assets/fonts/`](assets/fonts/) for per-asset attribution.

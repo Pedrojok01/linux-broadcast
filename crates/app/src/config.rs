@@ -1,3 +1,20 @@
+//! Persisted user configuration.
+//!
+//! TOML at `~/.config/linux-broadcast/config.toml` (path resolved via
+//! `directories::ProjectDirs` so it follows XDG on Linux). Loaded once
+//! at startup and rewritten each time a user-facing toggle flips.
+//!
+//! Every field is annotated with `#[serde(default)]` at the struct
+//! level so older configs missing newly-added keys still load — that's
+//! how we add settings (`auto_frame`, `show_preview`, …) without
+//! migrations or breaking existing installs.
+//!
+//! `Model` and `Mode` here mirror their pipeline-side counterparts
+//! (`lb_pipeline::ModelKind`, `lb_pipeline::Background` discriminant)
+//! but with `serde` impls. Keeping them separate is deliberate: the
+//! pipeline crate stays free of `serde` and `toml` dependencies, so
+//! it's still usable as a plain library by downstream code.
+
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use lb_pipeline::ModelKind;

@@ -119,7 +119,7 @@ Key non-obvious settings:
 - **`v4l2src do-timestamp=true`** — without it the output stream's PTS is wrong and v4l2sink's pacing slips.
 - **Caps strategy:** the source-side capsfilter pins **only RGBA + width/height** (no framerate). Forcing 30/1 caused negotiation failures with the C920 (camera reports `30000/1001`). The appsrc-side caps **do** declare framerate, otherwise the sink-side videoconvert asserts `fps_n == out_fps_n`.
 
-Live setting changes (background mode swap, blur strength, picking a new image, GUI preview toggle) flow over the existing `crossbeam-channel` of `Command`s and are applied by the feeder on the next tick — no graph rebuild. Camera, resolution, and **model** changes still require a Stop+Start cycle from the GUI.
+Live setting changes (background mode swap, blur strength, picking a new image, GUI preview toggle, **auto-frame on/off**) flow over the existing `crossbeam-channel` of `Command`s and are applied by the feeder on the next tick — no graph rebuild. Camera, resolution, and **model** changes still require a Stop+Start cycle from the GUI.
 
 #### Lazy mode constants and consumer detection
 
@@ -174,7 +174,8 @@ Pipeline (`crates/pipeline/src/`):
 - `compositor.rs` — bilinear mask upsample, two-pass separable box blur (radius 4–32 px from `Background::Blur { strength }`), plain alpha composite via `blend()`.
 - `temporal.rs` — `MaskSmoother` (EMA across frames). Note: experimental `sharpen_mask` / `feather_mask` / `light_wrap` were tried and reverted — the raw mask composites cleaner perceptually.
 - `pipeline.rs` — public `Pipeline` facade + `PipelineConfig`, `Command`, `PipelineState`. Builds the always-on sink graph at `start()`, spawns the consumer watcher and the feeder, returns. `build_source_pipeline` / `build_sink_pipeline` are factored helpers used by the feeder on every Live engagement.
-- `lazy.rs` — feeder thread + state machine + debounce timers. Owns `Segmenter` / `Compositor` / `MaskSmoother` and the source pipeline handle (only `Some` while Live). Drives the Idle ↔ Activating ↔ Live ↔ Deactivating transitions and the per-frame segment + composite + push.
+- `lazy.rs` — feeder thread + state machine + debounce timers. Owns `Segmenter` / `Compositor` / `MaskSmoother` / `BBoxSmoother` and the source pipeline handle (only `Some` while Live). Drives the Idle ↔ Activating ↔ Live ↔ Deactivating transitions and the per-frame segment + (optional auto-frame) + composite + push.
+- `framing.rs` — auto-framing math. Computes a `Framing` (foreground source-anchor + zoom) from the silhouette mask: mass-weighted horizontal centroid for `cx`, *top-edge row* for `cy` (centering on the vertical centroid would crop heads when zoomed). EMA-smoothed across frames via `BBoxSmoother`; returns `None` when no foreground is detected (feeder skips framing that frame). Foreground zoom is a static `FG_ZOOM` (no UI control). The compositor consumes the `Framing` to remap foreground sample points only — background plane stays fixed, and the `mask = 0` strip vacated on the trailing edge is filled by the existing blend.
 - `consumer_watch.rs` — background `/proc/*/fd` poller. Public `Consumer { pid, name }` (re-exported as `lb_pipeline::Consumer`). Emits a fresh `Vec<Consumer>` on each set change; the feeder folds these into its demand signal.
 - `lib.rs` — `MODEL_W`/`MODEL_H` constants and the public re-exports (`Pipeline`, `PipelineConfig`, `PipelineState`, `Consumer`, `Command`, `Background`, …).
 
@@ -232,9 +233,20 @@ The release artefact lives at `target/debian/linux-broadcast_<ver>_amd64.deb`. C
 4. Add a config-side `Model` variant (with serde) in `app/src/config.rs` and surface it in the GUI's `sidebar_model` dropdown.
 5. The GUI auto-restarts the pipeline on model change, so no graph plumbing is required.
 
+### Tests
+
+`cargo test -p lb_pipeline` covers the headless math and graph plumbing:
+
+- `tests/models_smoke.rs` — loads each bundled ONNX through `Segmenter::from_bytes`, runs a single inference on a synthetic frame, and asserts the mask shape matches the per-model contract (256×256 for the MediaPipe variants, frame-size for RVM). Catches model/pre-post regressions without needing a real camera.
+- `tests/synthetic_graph.rs` — drives a fake `videotestsrc → … → appsink` source through the `Compositor` and back into the sink graph, verifying caps negotiation and the appsrc PTS pacing without touching `/dev/video0` or `/dev/video10`. Useful when refactoring `pipeline.rs` / `lazy.rs`.
+
+The GUI crate has no tests — its surface is mostly egui layout, exercised by hand. Don't add UI snapshot tests without a strong reason; egui rendering is too version-sensitive to be worth the maintenance.
+
 ## Roadmap
 
 - CPU/GPU usage in footer.
 - ~~`.deb` packaging~~ ✅ — `cargo-deb` metadata in `crates/app/Cargo.toml`, conffiles in `packaging/`, postinst handles `modprobe` + cache refresh, opt-in autostart toggle in the GUI. Flatpak is **not pursued** — sandbox can't `modprobe` and the wizard pattern (`flatpak-spawn --host pkexec modprobe …`) is too fragile to recommend; users who can't install the `.deb` should build from source.
-- GitHub Actions release-on-tag workflow + benchmarks.
+- ~~Auto-framing~~ ✅ — `framing.rs` + `BBoxSmoother`, opt-in via the *Auto-frame* setting. Currently a static zoom + horizontal recenter; could grow into a fuller PTZ if there's demand.
+- GitHub Actions release-on-tag workflow that uploads the `.deb` to the release page (`cargo deb` already produces a reproducible artefact locally).
+- Throughput benchmarks per model on a stable reference machine, published in the repo so contributors can spot regressions on a model swap.
 

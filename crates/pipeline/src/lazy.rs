@@ -379,9 +379,13 @@ impl Feeder {
             self.stop_source();
             // RVM / smoother carry inter-frame state; reset so the next
             // engagement starts clean instead of with stale gradients.
+            // The bg plate is dropped too — lighting and camera
+            // position may have changed during the idle window, and
+            // the EMA reconverges within ~1 s of being live again.
             self.segmenter.reset();
             self.smoother.reset();
             self.bbox_smoother.reset();
+            self.compositor.reset_bg_plate();
         }
 
         let prev = self.state;
@@ -510,11 +514,21 @@ impl Feeder {
                     self.smoother.smooth(&mut mask.data);
                     let framing = if self.framing_enabled {
                         self.bbox_smoother.update(&mask).map(|anchor| {
+                            // Place head at TOP_HEADROOM, but never higher
+                            // than what's needed to keep the source bottom
+                            // mapped to (at least) the output bottom — at
+                            // low zoom the silhouette doesn't fully cover
+                            // the frame, and a fixed top anchor would leave
+                            // a band of the background plane at the bottom.
+                            let src_y = anchor.top_y_norm * frame_h as f32;
+                            let h = frame_h as f32;
+                            let min_dst_y = h - (h - src_y) * FG_ZOOM;
+                            let dst_y = (h * TOP_HEADROOM).max(min_dst_y);
                             let f = Framing {
                                 src_anchor_x: anchor.cx_norm * frame_w as f32,
-                                src_anchor_y: anchor.top_y_norm * frame_h as f32,
+                                src_anchor_y: src_y,
                                 dst_anchor_x: frame_w as f32 * 0.5,
-                                dst_anchor_y: frame_h as f32 * TOP_HEADROOM,
+                                dst_anchor_y: dst_y,
                                 zoom: FG_ZOOM,
                             };
                             if self.frame_idx == 1

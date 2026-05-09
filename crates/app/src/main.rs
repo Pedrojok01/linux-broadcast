@@ -1,3 +1,37 @@
+// LinuxBroadcast — virtual webcam with background replacement for Linux.
+// Copyright (C) 2025-2026 Pedrojok01
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//! `linux-broadcast` binary entry point.
+//!
+//! Responsibilities:
+//! - Embed the three ONNX models at compile time (`include_bytes!`) so the
+//!   shipped binary is self-contained — no separate model files, no first-run
+//!   download.
+//! - Acquire the per-user single-instance lock before doing anything else
+//!   that could race a sibling instance (consumer poller, sink graph,
+//!   autostart reconciliation). The lock is held for the lifetime of the
+//!   process.
+//! - Decide whether to run the icon-dump tool (`LB_DUMP_ICON=1`, used by
+//!   `cargo deb` to regenerate the menu icon at packaging time) or hand off
+//!   to the egui app loop.
+//! - Detect headless mode (`--headless` from the autostart .desktop, or the
+//!   legacy `LB_HEADLESS=1` env var) and forward it to `ui::run`. There is
+//!   no separate headless code path — the same eframe loop just starts with
+//!   the window hidden in the tray.
+
 mod autostart;
 mod backgrounds;
 mod cameras;

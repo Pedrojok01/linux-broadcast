@@ -1,3 +1,25 @@
+//! System tray icon + menu bridge.
+//!
+//! The `tray-icon` crate's Linux backend (libayatana-appindicator) needs
+//! a running GTK main loop on *some* thread, but eframe/winit don't host
+//! one and aren't going to. We solve that by spawning a dedicated
+//! `lb-tray-gtk` thread that calls `gtk::init()` + `gtk::main()` and
+//! constructs the tray icon there (GTK objects are thread-affine — they
+//! panic if poked from anywhere else). Menu events fire on that thread
+//! and are forwarded to the egui app loop through a crossbeam channel
+//! that `App::update()` drains every frame.
+//!
+//! Keep the public surface coarse: this module exposes `TrayEvent`
+//! (`Show` / `Hide` / `Quit`) — never raw menu-item ids — so the rest of
+//! the app reasons about user intent, not GTK plumbing.
+//!
+//! Install can fail on minimal sessions without an appindicator host
+//! (some headless WMs, container-only desktops). When it does the error
+//! is logged and the GUI keeps working without a tray entry — the close
+//! button intercept in `ui.rs` still keeps the process alive on the
+//! "headless autostart, no GUI visible" path because `--headless` skips
+//! tray creation by design.
+
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::sync::OnceLock;

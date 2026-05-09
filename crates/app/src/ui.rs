@@ -1,3 +1,37 @@
+//! `eframe`/`egui` GUI for the app.
+//!
+//! Layout: a 320 px sidebar (camera picker, model picker, scene mode +
+//! blur slider, library grid, settings, footer) next to a preview pane
+//! that renders the latest `PreviewFrame` produced by the pipeline. The
+//! preview channel is a 2-deep `crossbeam` queue with drop-old semantics
+//! so the segmenter never blocks on a slow GUI.
+//!
+//! The egui app loop is also where high-level lifecycle decisions land:
+//!
+//! - **Synthetic-consumer heartbeat.** While the window is visible AND
+//!   the *Show preview* toggle is on, every `update()` tick pushes a
+//!   `Command::SetGuiPreviewActive(true)` (edge-triggered) so the lazy
+//!   feeder treats the GUI as a consumer and keeps the camera lit. The
+//!   signal is explicitly cleared the moment the window goes to the
+//!   tray, so a tray-only instance lets the camera drop to Idle.
+//! - **Close-button intercept.** `ViewportCommand::CancelClose` +
+//!   `Visible(false)` turns the window's X into "hide to tray". Only the
+//!   tray's `Quit` menu sets `quit_requested` and lets the close go
+//!   through. This is the single source of "the user actually wants to
+//!   exit".
+//! - **Headless boot guard.** `App::new` polls for the sink device
+//!   (default `/dev/video10`) for up to `HEADLESS_DEVICE_WAIT` before
+//!   starting the pipeline, so an XDG autostart entry that fires before
+//!   `systemd-modules-load.service` finishes still recovers cleanly.
+//! - **Live config writeback.** Every persisted setting (mode, blur
+//!   strength, model, image, source/sink, `start_on_login`,
+//!   `show_preview`, `auto_frame`) is debounced through `Config::save`
+//!   so `~/.config/linux-broadcast/config.toml` stays in sync with the
+//!   GUI without per-keystroke writes.
+//!
+//! Footer surface mirrors `PipelineState`: `● Idle`, `● Standby (no
+//! consumer)`, or `● LIVE → name(pid)` while a real consumer is reading.
+
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui::{self, Color32, Margin, Rounding, Stroke, ViewportCommand};

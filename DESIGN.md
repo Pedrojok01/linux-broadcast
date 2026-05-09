@@ -76,4 +76,27 @@ The accent dot is the only colour element — drop it and the mark works in pure
 
 ## Where the tokens land in egui
 
-`Color32` constants live in `theme::color`; spacing in `theme::space`; radii in `theme::radius`. `theme::apply()` registers Inter + JetBrains Mono via `FontDefinitions` and writes the full `egui::Style`/`Visuals` from those constants. Re-read `crates/app/src/theme.rs` if any value here looks out of date — code is authoritative.
+`Color32` constants live in `theme::color`; spacing in `theme::space`; radii in `theme::radius`; control sizes in `theme::control`. `theme::apply()` registers Inter + JetBrains Mono via `FontDefinitions` and writes the full `egui::Style`/`Visuals` from those constants. Re-read `crates/app/src/theme.rs` if any value here looks out of date — code is authoritative.
+
+A few spots in `theme.rs` carry derived values that aren't tokens here, intentionally:
+
+- `selection.bg_fill = #1F464099` — the accent at high opacity *over the background colour*. Don't pull it into the tokens table; it's a render-time mix, not a designer choice.
+- `accent_soft` and `danger_soft` are stored in *premultiplied* form in code (`#122A26@22`, `#2A141222`) so egui composes them correctly over `panel_inset`. The DESIGN.md table lists them in the more readable straight-alpha form (`#5BD4C022`, `#E5685A22`); both describe the same colour, just in different colour spaces.
+- The "section caption" type is rendered via `egui::RichText::new(t).small().strong().extra_letter_spacing(1.2)` rather than a custom `TextStyle`. That means the *weight* tracks egui's default bold for the active font, not literally "Inter SemiBold" — close enough at 11 px that the distinction isn't perceptible, and avoids shipping a third font weight.
+
+## Adding or changing tokens
+
+1. Add the constant to the right `theme::*` module (`color`, `space`, `radius`, `control`).
+2. Reference it from `ui.rs` — never inline `Color32::from_rgb(...)` at the call site, that's how palettes drift.
+3. Mirror the addition in the relevant table here so designers reading this doc see it.
+4. If the change affects the dark-only palette (e.g. preparing for a light theme), keep the role names role-based (`text`, `panel`) rather than appearance-based (`white`, `dark-grey`). The colour values change per-theme; the roles don't.
+
+## Agent context (why this doc exists alongside `theme.rs`)
+
+This file is intentionally redundant with `theme.rs`. It exists so that:
+
+- An agent or contributor unfamiliar with the codebase can answer *design* questions ("what's the accent colour for?", "why no drop shadows?") without reading egui-specific Rust.
+- Designers reviewing PRs can sanity-check token changes against intent (single accent, hairline strokes, type contrast) without learning egui's `Visuals` struct.
+- Reviewers can spot drift: if a PR changes `theme.rs` without touching this file's tables, the stated intent and the rendered UI have started disagreeing — that's a smell, not a typo.
+
+When in doubt, the rule is: `theme.rs` defines what the app *looks like*; `DESIGN.md` defines what we *meant* it to look like. Keep both honest.

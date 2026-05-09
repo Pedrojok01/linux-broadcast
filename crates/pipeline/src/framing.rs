@@ -14,9 +14,13 @@
 //! - **Horizontal:** silhouette centroid → frame center. Mass-weighted
 //!   so a hand on a desk doesn't dominate (see `horizontal_midpoint`).
 //! - **Vertical:** silhouette *top edge* → [`TOP_HEADROOM`] of the way
-//!   down the frame. Centering on the vertical centroid would crop the
-//!   head when zoomed; pinning the top edge keeps the head in frame
-//!   regardless of how much body is visible.
+//!   down the frame, but capped so the source bottom always maps to
+//!   (at least) the output bottom. Centering on the vertical centroid
+//!   would crop the head when zoomed; pinning the top edge keeps the
+//!   head in frame regardless of how much body is visible. The cap
+//!   matters at low [`FG_ZOOM`]: without it, the silhouette wouldn't
+//!   reach the output bottom and a band of the (unshifted) background
+//!   plane would peek through under the body.
 //!
 //! When no foreground is detected, [`BBoxSmoother::update`] returns
 //! `None` and the feeder skips framing for that frame. When auto-framing
@@ -55,7 +59,7 @@ pub const DEFAULT_DEADZONE_Y: f32 = 0.005;
 /// Static foreground zoom factor applied whenever auto-frame is on.
 /// A subtle "lean-in" effect; deliberately not user-adjustable. Past
 /// ~1.2× the segmentation edges and any pixelation become visible.
-pub const FG_ZOOM: f32 = 1.15;
+pub const FG_ZOOM: f32 = 1.05;
 /// Where the silhouette's top edge should land in the output frame, as
 /// a fraction of frame height. Small enough to feel like a tight
 /// portrait crop, large enough that mask noise above the head doesn't

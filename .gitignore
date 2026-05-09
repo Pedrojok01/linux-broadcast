@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock.bak
 
 # Editor / IDE
 .idea/
@@ -22,3 +21,9 @@ Cargo.lock.bak
 # Legacy Python cruft (kept while assets/ may still hold pyc temp files)
 __pycache__/
 *.pyc
+
+# LLM
+.claude/
+.cursor/
+.agents/
+.codex/

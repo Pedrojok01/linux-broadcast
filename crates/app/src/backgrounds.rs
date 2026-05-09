@@ -1,3 +1,20 @@
+//! User-managed library of replacement-background images.
+//!
+//! Imported files are *copied* into
+//! `~/.local/share/linux-broadcast/backgrounds/` (XDG data dir, resolved
+//! via `directories::ProjectDirs`) so the library survives across
+//! launches even when the user's source files move or get deleted.
+//! `import` collision-renames with a numeric suffix to avoid clobbering.
+//!
+//! The library is the source of truth for which images appear in the
+//! sidebar grid; the active selection is persisted as a path in
+//! `Config::background_path` and re-read on next launch.
+//!
+//! Pixel decoding lives here (the `image` crate) rather than in the
+//! pipeline crate so that `lb_pipeline` stays free of image-format
+//! deps. The compositor receives a finished `Background::Image { rgba,
+//! width, height }`.
+
 use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};

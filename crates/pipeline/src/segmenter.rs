@@ -1,3 +1,28 @@
+//! Foreground segmentation. Wraps three interchangeable ONNX models
+//! behind the [`Segmenter`] enum, each with its own pre/post:
+//!
+//! - **MediaPipe Selfie binary** — NCHW input, single-channel sigmoid
+//!   probability output. Cheapest (~5 ms / 256² frame on one CPU core).
+//! - **MediaPipe Selfie multiclass** — NHWC input, 6-class raw logits
+//!   output. Foreground probability is `1 - softmax(logits)[bg]`. Better
+//!   on tricky scenes (similar-luminance bg, hair detail).
+//! - **Robust Video Matting (RVM)** — recurrent. Six inputs (`src` + four
+//!   recurrent state tensors `r1i..r4i` + `downsample_ratio` scalar) and
+//!   six outputs (`fgr`, `pha`, `r1o..r4o`). We discard `fgr` and use
+//!   `pha`. The recurrent state lives on `RvmInner` across calls and is
+//!   cleared by `reset()` whenever the user toggles passthrough or the
+//!   source frame size changes.
+//!
+//! Inference always runs at the model's native resolution
+//! (`MODEL_W × MODEL_H` = 256×256 for the MediaPipe variants, an internal
+//! `RVM_DOWNSAMPLE_RATIO`-scaled tensor for RVM). Only the upsample +
+//! composite step in `compositor.rs` touches frame-resolution pixels.
+//! That's what keeps CPU usage low at 720p/1080p.
+//!
+//! All resizes use `fast_image_resize`; both `MpInner` and `RvmInner`
+//! keep their input/output buffers in `self` so steady-state segmentation
+//! does no heap allocation.
+
 use anyhow::{anyhow, Result};
 use fast_image_resize::{
     self as fr,

@@ -53,7 +53,7 @@ tempfile = "3"
 [package.metadata.deb]
 name = "linux-broadcast"
 maintainer = "Pedrojok01 <pedrojok@pm.me>"
-copyright = "2026, Pedrojok01"
+copyright = "2025-2026, Pedrojok01"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 LinuxBroadcast is a small virtual webcam that captures your real camera,
@@ -71,6 +71,11 @@ assets = [
     ["../../packaging/linux-broadcast.modprobe.conf", "etc/modprobe.d/linux-broadcast.conf", "644"],
     ["../../packaging/linux-broadcast.modules-load.conf", "etc/modules-load.d/linux-broadcast.conf", "644"],
     ["../../README.md", "usr/share/doc/linux-broadcast/README.md", "644"],
+    ["../../models/README.md", "usr/share/doc/linux-broadcast/models/README.md", "644"],
+    ["../../models/Apache-2.0-LICENSE.txt", "usr/share/doc/linux-broadcast/models/Apache-2.0-LICENSE.txt", "644"],
+    ["../../models/RVM-LICENSE.txt", "usr/share/doc/linux-broadcast/models/RVM-LICENSE.txt", "644"],
+    ["../../assets/fonts/Inter-LICENSE.txt", "usr/share/doc/linux-broadcast/fonts/Inter-LICENSE.txt", "644"],
+    ["../../assets/fonts/JetBrainsMono-LICENSE.txt", "usr/share/doc/linux-broadcast/fonts/JetBrainsMono-LICENSE.txt", "644"],
 ]
 maintainer-scripts = "../../packaging/scripts"
 conf-files = [
