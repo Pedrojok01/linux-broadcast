@@ -1,32 +1,35 @@
-//! Auto-framing: smoothed horizontal recenter + light foreground zoom.
+//! Auto-framing: snap-on-first horizontal recenter + light foreground zoom.
 //!
-//! The compositor blends `fg * mask + bg * (1 - mask)`. Auto-framing
-//! reparameterizes the per-output-pixel *foreground sample point* so the
-//! silhouette is recentered horizontally and slightly enlarged. The
-//! background plane (blurred original frame, or replacement image) is
-//! sampled at unshifted output coordinates, so it stays put while the
-//! person slides over it. The strip vacated on the trailing edge gets
-//! filled by the background — that's just the `mask = 0` case of the
-//! existing blend.
+//! On the first detection after construction (or after [`BBoxSmoother::reset`])
+//! we capture the silhouette anchor and hold it forever. Subsequent calls
+//! return that locked anchor unchanged — small natural movements of a seated
+//! user don't produce visible recentering. To pick a new anchor, the caller
+//! resets the smoother (the feeder does this when auto-frame is toggled off
+//! and on again, and also on Live exit).
+//!
+//! This is the GMeet auto-frame UX: snap once at engagement, stay put. An
+//! earlier EMA-based design panned every frame to track the centroid; users
+//! reported it as a "I'm always moving" loop where the recentering and the
+//! user's natural compensation kept feeding each other.
 //!
 //! The zoom is a static [`FG_ZOOM`] (no UI control). Anchors are picked
-//! so a 1.15× zoom doesn't crop heads:
-//! - **Horizontal:** silhouette centroid → frame center. Mass-weighted
+//! so the zoom doesn't crop heads:
+//! - **Horizontal:** silhouette centroid → frame centre. Mass-weighted
 //!   so a hand on a desk doesn't dominate (see `horizontal_midpoint`).
 //! - **Vertical:** silhouette *top edge* → [`TOP_HEADROOM`] of the way
 //!   down the frame, but capped so the source bottom always maps to
-//!   (at least) the output bottom. Centering on the vertical centroid
+//!   (at least) the output bottom. Centring on the vertical centroid
 //!   would crop the head when zoomed; pinning the top edge keeps the
 //!   head in frame regardless of how much body is visible. The cap
-//!   matters at low [`FG_ZOOM`]: without it, the silhouette wouldn't
-//!   reach the output bottom and a band of the (unshifted) background
-//!   plane would peek through under the body.
+//!   matters at low [`FG_ZOOM`]: without it the crop window would
+//!   extend below the source frame and edge-clamped sampling would
+//!   smear the bottom row across a visible band.
 //!
-//! When no foreground is detected, [`BBoxSmoother::update`] returns
-//! `None` and the feeder skips framing for that frame. When auto-framing
-//! is on but the user picks `Background::None`, the feeder skips framing
-//! entirely — there's no background plane, so a translated/zoomed
-//! foreground would leave a hole.
+//! When no foreground is detected on the very first update, the lock
+//! never engages and [`BBoxSmoother::update`] returns `None` — the feeder
+//! passes `framing = None` to the compositor and the frame is composited
+//! without any zoom that tick. Once locked, the lock holds even through
+//! later frames where the segmenter loses the silhouette.
 
 use crate::Mask;
 
@@ -41,32 +44,23 @@ const FG_THRESHOLD: f32 = 0.5;
 /// pull the top anchor up but the actual top of the head registers.
 const HEAD_TOP_ROW_FRACTION: f32 = 0.02;
 
-/// EMA factor applied to the smoothed normalized `cx`. 0.10 at 30 fps
-/// lags real motion by ~0.3 s — fast enough to feel like centering,
-/// slow enough to ignore single-frame mask noise.
-pub const DEFAULT_ALPHA: f32 = 0.10;
-/// Horizontal deadzone in normalized coords. Below this, hold the
-/// previous `cx`. Sized so a stationary user with a slightly noisy
-/// mask never produces visible micro-shift, but tight enough that the
-/// EMA tail settles to within ~3 px of true center on a 1280-wide
-/// frame.
-pub const DEFAULT_DEADZONE_X: f32 = 0.002;
-/// Vertical deadzone in normalized coords. The head-top edge is noisier
-/// than the centroid (single mask row), so this is intentionally larger
-/// than [`DEFAULT_DEADZONE_X`] to avoid head-bobble.
-pub const DEFAULT_DEADZONE_Y: f32 = 0.005;
-
-/// Static foreground zoom factor applied whenever auto-frame is on.
-/// A subtle "lean-in" effect; deliberately not user-adjustable. Past
-/// ~1.2× the segmentation edges and any pixelation become visible.
-pub const FG_ZOOM: f32 = 1.05;
+/// Minimum zoom factor when auto-frame is on. Applied when the user is
+/// already perfectly centred — a barely-perceptible "lean-in" that
+/// keeps the framing from feeling completely flat.
+pub const FG_ZOOM: f32 = 1.03;
+/// Maximum zoom factor allowed when adaptive zoom kicks in to recentre
+/// an off-centre user. Past ~1.2× the wall starts visibly zooming and
+/// segmentation edges / pixelation become noticeable. Users
+/// significantly past this offset get clamped (appear off-centre but
+/// still in frame) rather than zoom even further.
+pub const FG_ZOOM_MAX: f32 = 1.20;
 /// Where the silhouette's top edge should land in the output frame, as
 /// a fraction of frame height. Small enough to feel like a tight
 /// portrait crop, large enough that mask noise above the head doesn't
 /// poke past the top edge.
 pub const TOP_HEADROOM: f32 = 0.08;
 
-/// Smoothed framing anchor in normalized source coords. Output of
+/// Framing anchor in normalised source coords. Output of
 /// [`BBoxSmoother::update`].
 #[derive(Debug, Clone, Copy)]
 pub struct Anchor {
@@ -76,18 +70,15 @@ pub struct Anchor {
     pub top_y_norm: f32,
 }
 
-/// Smoothed silhouette tracker. One instance per running pipeline.
+/// Snap-on-first silhouette tracker. One instance per running pipeline.
+///
+/// Captures the first detection's anchor and returns it unchanged on
+/// every subsequent `update()`. `reset()` clears the lock so the next
+/// detection seeds a new anchor.
 pub struct BBoxSmoother {
-    /// Last published `cx` in normalized `[0, 1]`. `None` until the
-    /// first detection — and reset back to `None` on engagement
-    /// boundaries (toggle off, exited Live) so the next engagement
-    /// snaps to the new position instead of panning from a stale one.
-    current_cx: Option<f32>,
-    /// Last published top-edge `y` in normalized `[0, 1]`.
-    current_top_y: Option<f32>,
-    alpha: f32,
-    deadzone_x: f32,
-    deadzone_y: f32,
+    /// Anchor captured on the first detection after construction or
+    /// `reset()`. `None` until that first detection succeeds.
+    locked: Option<Anchor>,
 }
 
 impl Default for BBoxSmoother {
@@ -98,51 +89,35 @@ impl Default for BBoxSmoother {
 
 impl BBoxSmoother {
     pub fn new() -> Self {
-        Self {
-            current_cx: None,
-            current_top_y: None,
-            alpha: DEFAULT_ALPHA,
-            deadzone_x: DEFAULT_DEADZONE_X,
-            deadzone_y: DEFAULT_DEADZONE_Y,
-        }
+        Self { locked: None }
     }
 
-    /// Compute the smoothed framing anchor for this mask. Returns
-    /// `None` when no foreground pixel exceeds [`FG_THRESHOLD`] — feeder
-    /// skips framing in that case so the output is the unshifted
-    /// composited frame.
+    /// Compute the framing anchor for this mask.
+    ///
+    /// Once locked, returns the cached anchor on every call. If not yet
+    /// locked, computes the centroid + top edge from this mask, locks
+    /// to that, and returns it. Returns `None` only when the lock is
+    /// not yet engaged AND no foreground exceeds [`FG_THRESHOLD`].
     pub fn update(&mut self, mask: &Mask) -> Option<Anchor> {
-        let target_cx = horizontal_midpoint(mask)?;
-        let target_top = top_edge(mask).unwrap_or(target_cx); // fall back if all rows below threshold
-        let cx = ema_step(self.current_cx, target_cx, self.alpha, self.deadzone_x);
-        let top_y = ema_step(self.current_top_y, target_top, self.alpha, self.deadzone_y);
-        self.current_cx = Some(cx);
-        self.current_top_y = Some(top_y);
-        Some(Anchor {
-            cx_norm: cx,
-            top_y_norm: top_y,
-        })
-    }
-
-    /// Drop smoother state. Call on engagement boundaries (toggling
-    /// auto-frame off, dropping out of Live) so the next engagement
-    /// snaps to the new position instead of drifting from a stale one.
-    pub fn reset(&mut self) {
-        self.current_cx = None;
-        self.current_top_y = None;
-    }
-}
-
-fn ema_step(prev: Option<f32>, target: f32, alpha: f32, deadzone: f32) -> f32 {
-    match prev {
-        None => target,
-        Some(p) => {
-            if (target - p).abs() < deadzone {
-                p
-            } else {
-                p + (target - p) * alpha
-            }
+        if let Some(a) = self.locked {
+            return Some(a);
         }
+        let cx = horizontal_midpoint(mask)?;
+        let top = top_edge(mask).unwrap_or(cx); // fall back if all rows below threshold
+        let a = Anchor {
+            cx_norm: cx,
+            top_y_norm: top,
+        };
+        self.locked = Some(a);
+        Some(a)
+    }
+
+    /// Drop the lock. The next [`update`](Self::update) call will seed a
+    /// new anchor from the next mask that has any detectable foreground.
+    /// Called by the feeder on engagement boundaries (auto-frame
+    /// toggled off, pipeline exited Live).
+    pub fn reset(&mut self) {
+        self.locked = None;
     }
 }
 
@@ -250,43 +225,40 @@ mod tests {
     }
 
     #[test]
-    fn deadzone_holds_against_micro_shift() {
+    fn lock_holds_against_subsequent_movement() {
+        // Snap to silhouette at centroid 0.4, then move it to centroid 0.7.
+        // The lock must keep returning the original anchor.
         let mut s = BBoxSmoother::new();
-        // First call seeds — silhouette midpoint at 0.5.
-        let m1 = mask_with_rect(1000, 100, 400, 10, 600, 90);
-        let first = s.update(&m1).unwrap();
-        // Shift midpoint by 1/1000 = 0.001, well below the 0.002 deadzone.
-        let m2 = mask_with_rect(1000, 100, 401, 10, 601, 90);
-        let second = s.update(&m2).unwrap();
-        assert_eq!(
-            first.cx_norm, second.cx_norm,
-            "tiny x shift should be deadzoned",
-        );
+        let first = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90)).unwrap();
+        // First anchor: centroid at 0.40.
+        assert!((first.cx_norm - 0.40).abs() < 1e-3, "cx={}", first.cx_norm);
+        // Now feed a very different silhouette (centroid 0.70).
+        let second = s.update(&mask_with_rect(100, 100, 50, 10, 90, 90)).unwrap();
+        assert_eq!(first.cx_norm, second.cx_norm);
+        assert_eq!(first.top_y_norm, second.top_y_norm);
     }
 
     #[test]
-    fn ema_blends_partial_pan_toward_target() {
+    fn lock_holds_through_lost_detection() {
+        // Once locked, the lock survives a frame with no foreground
+        // (segmenter blink, user briefly leaving frame). Returns the
+        // cached anchor instead of None.
         let mut s = BBoxSmoother::new();
-        let _ = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90));
-        let after_seed = s.current_cx.unwrap();
-        let _ = s.update(&mask_with_rect(100, 100, 40, 10, 80, 90));
-        let after_step = s.current_cx.unwrap();
-        assert!(
-            after_step > after_seed && after_step < 0.6,
-            "after_step={after_step} (seed={after_seed}, target=0.6)",
-        );
+        let first = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90)).unwrap();
+        let after_blank = s.update(&empty_mask(100, 100)).unwrap();
+        assert_eq!(first.cx_norm, after_blank.cx_norm);
+        assert_eq!(first.top_y_norm, after_blank.top_y_norm);
     }
 
     #[test]
-    fn reset_clears_state() {
+    fn reset_clears_lock_and_re_snaps() {
         let mut s = BBoxSmoother::new();
         let _ = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90));
-        assert!(s.current_cx.is_some());
-        assert!(s.current_top_y.is_some());
+        assert!(s.locked.is_some());
         s.reset();
-        assert!(s.current_cx.is_none());
-        assert!(s.current_top_y.is_none());
-        // After reset, the next detection should snap (no EMA blend).
+        assert!(s.locked.is_none());
+        // After reset, the next detection seeds a new lock — at the
+        // *new* silhouette position, not the old one.
         let a = s.update(&mask_with_rect(100, 100, 70, 10, 90, 90)).unwrap();
         assert!((a.cx_norm - 0.80).abs() < 1e-3, "cx={}", a.cx_norm);
     }

@@ -95,10 +95,8 @@ fn main() -> Result<()> {
     let headless =
         argv.iter().any(|a| a == "--headless") || std::env::var_os("LB_HEADLESS").is_some();
 
-    if !headless {
-        if let Err(e) = desktop_install::ensure_desktop_entry() {
-            log::warn!("desktop entry install: {e:#}");
-        }
+    if !headless && let Err(e) = desktop_install::ensure_desktop_entry() {
+        log::warn!("desktop entry install: {e:#}");
     }
 
     ui::run(headless)

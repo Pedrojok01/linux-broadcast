@@ -27,5 +27,7 @@ crossbeam-channel.workspace = true
 
 [dev-dependencies]
 proptest = "1"
-serial_test = "3"
 tempfile = "3"
+
+[lints]
+workspace = true

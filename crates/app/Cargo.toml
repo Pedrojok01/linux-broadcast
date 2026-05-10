@@ -39,8 +39,10 @@ tray-icon = "0.22"
 gtk = "0.18"
 
 [dev-dependencies]
-serial_test = "3"
 tempfile = "3"
+
+[lints]
+workspace = true
 
 # ---------------------------------------------------------------------------
 # Debian packaging — `cargo deb -p linux-broadcast` reads this block.
@@ -76,6 +78,7 @@ assets = [
     ["../../models/RVM-LICENSE.txt", "usr/share/doc/linux-broadcast/models/RVM-LICENSE.txt", "644"],
     ["../../assets/fonts/Inter-LICENSE.txt", "usr/share/doc/linux-broadcast/fonts/Inter-LICENSE.txt", "644"],
     ["../../assets/fonts/JetBrainsMono-LICENSE.txt", "usr/share/doc/linux-broadcast/fonts/JetBrainsMono-LICENSE.txt", "644"],
+    ["../../THIRD_PARTY_LICENSES.md", "usr/share/doc/linux-broadcast/THIRD_PARTY_LICENSES.md", "644"],
 ]
 maintainer-scripts = "../../packaging/scripts"
 conf-files = [

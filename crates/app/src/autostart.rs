@@ -27,7 +27,11 @@ const FILENAME: &str = "LinuxBroadcast-autostart.desktop";
 
 fn autostart_path() -> Result<PathBuf> {
     let base = BaseDirs::new().context("no XDG base dirs")?;
-    Ok(base.config_dir().join("autostart").join(FILENAME))
+    Ok(autostart_path_in(base.config_dir()))
+}
+
+fn autostart_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("autostart").join(FILENAME)
 }
 
 /// Render the .desktop body. `exec_path` is the absolute path to the
@@ -55,26 +59,32 @@ fn desktop_body(exec_path: &Path) -> String {
 /// Write `~/.config/autostart/LinuxBroadcast-autostart.desktop` if absent
 /// or stale. Idempotent — re-run is cheap.
 pub fn install(exec_path: &Path) -> Result<()> {
-    let path = autostart_path()?;
+    install_at(&autostart_path()?, exec_path)
+}
+
+fn install_at(path: &Path, exec_path: &Path) -> Result<()> {
     let body = desktop_body(exec_path);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == body {
-            return Ok(());
-        }
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == body
+    {
+        return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
-    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
     log::info!("autostart enabled → {}", path.display());
     Ok(())
 }
 
 /// Remove the autostart entry if present. Missing-file is success.
 pub fn uninstall() -> Result<()> {
-    let path = autostart_path()?;
-    match std::fs::remove_file(&path) {
+    uninstall_at(&autostart_path()?)
+}
+
+fn uninstall_at(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Ok(_) => {
             log::info!("autostart disabled (removed {})", path.display());
             Ok(())
@@ -101,68 +111,59 @@ pub fn reconcile(desired: bool, exec_path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+fn reconcile_at(path: &Path, desired: bool, exec_path: &Path) -> Result<()> {
+    let on_disk = path.exists();
+    match (desired, on_disk) {
+        (true, false) | (true, true) => install_at(path, exec_path),
+        (false, true) => uninstall_at(path),
+        (false, false) => Ok(()),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use tempfile::TempDir;
 
-    fn with_temp_xdg<F: FnOnce(&Path)>(f: F) {
-        let tmp = TempDir::new().unwrap();
-        let prior = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        f(tmp.path());
-        match prior {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-    }
-
     #[test]
-    #[serial]
     fn reconcile_true_creates_desktop_entry() {
-        with_temp_xdg(|root| {
-            let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
-            reconcile(true, &exec).unwrap();
-            let path = root.join("autostart").join(FILENAME);
-            assert!(path.exists(), "expected {} to exist", path.display());
-            let body = std::fs::read_to_string(&path).unwrap();
-            assert!(body.contains("Exec="));
-            assert!(body.contains("--headless"));
-        });
+        let tmp = TempDir::new().unwrap();
+        let path = autostart_path_in(tmp.path());
+        let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
+        reconcile_at(&path, true, &exec).unwrap();
+        assert!(path.exists(), "expected {} to exist", path.display());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("Exec="));
+        assert!(body.contains("--headless"));
     }
 
     #[test]
-    #[serial]
     fn reconcile_false_removes_it() {
-        with_temp_xdg(|root| {
-            let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
-            reconcile(true, &exec).unwrap();
-            assert!(is_installed());
+        let tmp = TempDir::new().unwrap();
+        let path = autostart_path_in(tmp.path());
+        let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
+        reconcile_at(&path, true, &exec).unwrap();
+        assert!(path.exists());
 
-            reconcile(false, &exec).unwrap();
-            let path = root.join("autostart").join(FILENAME);
-            assert!(!path.exists());
-            assert!(!is_installed());
-        });
+        reconcile_at(&path, false, &exec).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
-    #[serial]
     fn reconcile_idempotent() {
-        with_temp_xdg(|root| {
-            let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
-            reconcile(true, &exec).unwrap();
-            let path = root.join("autostart").join(FILENAME);
-            let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let path = autostart_path_in(tmp.path());
+        let exec = PathBuf::from("/usr/local/bin/linux-broadcast");
+        reconcile_at(&path, true, &exec).unwrap();
+        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-            // Sleep just enough to see a different mtime if a write
-            // happened. 1.1s is generous; some FSes only have second
-            // resolution.
-            std::thread::sleep(std::time::Duration::from_millis(1100));
-            reconcile(true, &exec).unwrap();
-            let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Sleep just enough to see a different mtime if a write
+        // happened. 1.1s is generous; some FSes only have second
+        // resolution.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        reconcile_at(&path, true, &exec).unwrap();
+        let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-            assert_eq!(mtime1, mtime2, "second reconcile must be a no-op");
-        });
+        assert_eq!(mtime1, mtime2, "second reconcile must be a no-op");
     }
 }

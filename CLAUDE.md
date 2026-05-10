@@ -237,7 +237,7 @@ The release artefact lives at `target/debian/linux-broadcast_<ver>_amd64.deb`. C
 
 `cargo test -p lb_pipeline` covers the headless math and graph plumbing:
 
-- `tests/models_smoke.rs` — loads each bundled ONNX through `Segmenter::from_bytes`, runs a single inference on a synthetic frame, and asserts the mask shape matches the per-model contract (256×256 for the MediaPipe variants, frame-size for RVM). Catches model/pre-post regressions without needing a real camera.
+- `tests/models_smoke.rs` — loads each bundled ONNX through `Segmenter::from_bytes`, runs 1–2 inferences on a synthetic frame, and asserts the mask shape + value range match the per-model contract (256×256 for the MediaPipe variants, frame-size for RVM; RVM also covers `reset()` clearing recurrent state). Catches model/pre-post regressions without needing a real camera; runs by default on every `cargo test`.
 - `tests/synthetic_graph.rs` — drives a fake `videotestsrc → … → appsink` source through the `Compositor` and back into the sink graph, verifying caps negotiation and the appsrc PTS pacing without touching `/dev/video0` or `/dev/video10`. Useful when refactoring `pipeline.rs` / `lazy.rs`.
 
 The GUI crate has no tests — its surface is mostly egui layout, exercised by hand. Don't add UI snapshot tests without a strong reason; egui rendering is too version-sensitive to be worth the maintenance.

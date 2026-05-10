@@ -98,10 +98,10 @@ fn install_desktop_file(data: &Path) -> Result<()> {
     );
 
     // Skip rewrite when the file already matches — avoids touching mtime.
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == want {
-            return Ok(());
-        }
+    if let Ok(existing) = std::fs::read_to_string(&path)
+        && existing == want
+    {
+        return Ok(());
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
     std::fs::write(&path, want).with_context(|| format!("write {}", path.display()))?;

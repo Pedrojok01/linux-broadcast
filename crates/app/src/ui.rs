@@ -225,10 +225,10 @@ impl App {
         let cfg = Config::load();
         // Bring the on-disk autostart entry in line with the saved
         // preference. Cheap to call, no-op when in sync.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Err(e) = autostart::reconcile(cfg.start_on_login, &exe) {
-                log::warn!("autostart reconcile: {e:#}");
-            }
+        if let Ok(exe) = std::env::current_exe()
+            && let Err(e) = autostart::reconcile(cfg.start_on_login, &exe)
+        {
+            log::warn!("autostart reconcile: {e:#}");
         }
         let cameras = enumerate(&cfg.sink_device);
         let library = backgrounds::list();
@@ -1419,15 +1419,17 @@ impl App {
 
         ui.add_space(space::SM);
 
-        // Auto-frame toggle. On → the pipeline runs a smoothed virtual-PTZ
-        // crop driven by the person mask, keeping the user centered (akin
-        // to Meet's framing). Forces segmentation even in passthrough
-        // mode, so it costs more CPU than today's bg-None short-circuit.
+        // Auto-frame toggle. On → the pipeline locks onto the silhouette
+        // on the first detection and keeps it centred (snap-once, à la
+        // Meet). Works in all three bg modes: Blur and None do a
+        // post-composite crop on the whole frame (wall zooms slightly
+        // with you), Image keeps the bg image static and slides the
+        // foreground over it.
         if toggle_row(
             ui,
             self.cfg.auto_frame,
             "Auto-frame",
-            "Center on you (smooth virtual zoom)",
+            "Lock and centre on you (toggle off+on to re-frame)",
         ) {
             self.cfg.auto_frame = !self.cfg.auto_frame;
             self.save_settings();

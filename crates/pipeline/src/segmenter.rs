@@ -29,7 +29,7 @@ use fast_image_resize::{
     images::{Image, ImageRef},
 };
 use ort::session::{Session, builder::GraphOptimizationLevel};
-use ort::value::Value;
+use ort::value::TensorRef;
 
 use crate::{MODEL_H, MODEL_W};
 
@@ -177,7 +177,7 @@ fn segment_binary(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize)
     }
 
     let shape: [i64; 4] = [1, 3, MODEL_H as i64, MODEL_W as i64];
-    let input_value = Value::from_array((shape, inner.input_buf.clone()))
+    let input_value = TensorRef::from_array_view((shape, &inner.input_buf[..]))
         .map_err(|e| anyhow!("ort Value: {e}"))?;
     let outputs = inner
         .session
@@ -235,7 +235,7 @@ fn segment_multiclass(
     }
 
     let shape: [i64; 4] = [1, MODEL_H as i64, MODEL_W as i64, 3];
-    let input_value = Value::from_array((shape, inner.input_buf.clone()))
+    let input_value = TensorRef::from_array_view((shape, &inner.input_buf[..]))
         .map_err(|e| anyhow!("ort Value: {e}"))?;
     let outputs = inner
         .session
@@ -289,7 +289,7 @@ fn segment_multiclass(
 /// "higher quality" (sharper hair / shoulder edges). 0.5 → 640×360
 /// internal compute on a 1280×720 frame; ~50 % more inference cost than
 /// 0.4 in exchange for visibly tighter mattes.
-const RVM_DOWNSAMPLE_RATIO: f32 = 0.5;
+const RVM_DOWNSAMPLE_RATIO: f32 = 0.50;
 
 pub struct RvmInner {
     session: Session,
@@ -345,8 +345,11 @@ impl RvmInner {
         }
 
         // 2. Build inputs: src + 4 recurrent states + downsample_ratio scalar.
+        // All input tensors borrow from buffers we own (`self.input_buf`,
+        // `self.prev_states` / `initial_states`, `ratio`) — no per-frame
+        // copies into the ORT runtime.
         let src_shape: [i64; 4] = [1, 3, height as i64, width as i64];
-        let src_value = Value::from_array((src_shape, self.input_buf.clone()))
+        let src_value = TensorRef::from_array_view((src_shape, &self.input_buf[..]))
             .map_err(|e| anyhow!("ort Value src: {e}"))?;
 
         // First-frame initial states: shape [1, C, 1, 1] of zeros for each
@@ -363,9 +366,7 @@ impl RvmInner {
 
         let mut state_values = Vec::with_capacity(4);
         for (shape, data) in states {
-            // Convert Vec<i64> shape into a fixed-size array for ort.
-            let shape_vec = shape.clone();
-            let v = Value::from_array((shape_vec, data.clone()))
+            let v = TensorRef::from_array_view((&shape[..], &data[..]))
                 .map_err(|e| anyhow!("ort Value state: {e}"))?;
             state_values.push(v);
         }
@@ -373,8 +374,8 @@ impl RvmInner {
             .try_into()
             .map_err(|_| anyhow!("expected 4 state values"))?;
 
-        let ratio = vec![RVM_DOWNSAMPLE_RATIO];
-        let ratio_value = Value::from_array(([1_i64], ratio))
+        let ratio = [RVM_DOWNSAMPLE_RATIO];
+        let ratio_value = TensorRef::from_array_view(([1_i64], &ratio[..]))
             .map_err(|e| anyhow!("ort Value downsample_ratio: {e}"))?;
 
         let outputs = self

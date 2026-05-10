@@ -45,6 +45,11 @@ fn ensure_dir() -> Result<PathBuf> {
 /// appended.
 pub fn import(src: &Path) -> Result<PathBuf> {
     let dir = ensure_dir()?;
+    import_into(&dir, src)
+}
+
+fn import_into(dir: &Path, src: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
     let ext = src
         .extension()
         .and_then(|s| s.to_str())
@@ -71,7 +76,11 @@ pub fn list() -> Vec<LibraryEntry> {
     let Some(dir) = storage_dir() else {
         return Vec::new();
     };
-    let read = match std::fs::read_dir(&dir) {
+    list_in(&dir)
+}
+
+fn list_in(dir: &Path) -> Vec<LibraryEntry> {
+    let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -97,7 +106,11 @@ pub fn list() -> Vec<LibraryEntry> {
 
 pub fn remove(path: &Path) -> Result<()> {
     let dir = storage_dir().context("no data dir on this platform")?;
-    if !path.starts_with(&dir) {
+    remove_from(&dir, path)
+}
+
+fn remove_from(dir: &Path, path: &Path) -> Result<()> {
+    if !path.starts_with(dir) {
         return Err(anyhow!(
             "refusing to delete path outside library: {}",
             path.display()
@@ -120,19 +133,7 @@ fn is_image(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use tempfile::TempDir;
-
-    fn with_temp_xdg<F: FnOnce(&Path)>(f: F) {
-        let tmp = TempDir::new().unwrap();
-        let prior = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("XDG_DATA_HOME", tmp.path());
-        f(tmp.path());
-        match prior {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
-    }
 
     /// Build a 1×1 PNG so `import` has a real image to copy. `is_image`
     /// only checks the extension, so the bytes don't have to be valid.
@@ -143,33 +144,29 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn import_then_list_returns_entry() {
-        with_temp_xdg(|_| {
-            let src_dir = TempDir::new().unwrap();
-            let src = write_fake_png(src_dir.path(), "wave.png");
-            let dest = import(&src).unwrap();
-            assert!(dest.exists());
+        let lib = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src = write_fake_png(src_dir.path(), "wave.png");
+        let dest = import_into(lib.path(), &src).unwrap();
+        assert!(dest.exists());
 
-            let entries = list();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].path, dest);
-            assert_eq!(entries[0].label, "wave");
-        });
+        let entries = list_in(lib.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, dest);
+        assert_eq!(entries[0].label, "wave");
     }
 
     #[test]
-    #[serial]
     fn remove_clears_entry() {
-        with_temp_xdg(|_| {
-            let src_dir = TempDir::new().unwrap();
-            let src = write_fake_png(src_dir.path(), "studio.png");
-            let dest = import(&src).unwrap();
-            assert_eq!(list().len(), 1);
+        let lib = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src = write_fake_png(src_dir.path(), "studio.png");
+        let dest = import_into(lib.path(), &src).unwrap();
+        assert_eq!(list_in(lib.path()).len(), 1);
 
-            remove(&dest).unwrap();
-            assert!(!dest.exists());
-            assert!(list().is_empty());
-        });
+        remove_from(lib.path(), &dest).unwrap();
+        assert!(!dest.exists());
+        assert!(list_in(lib.path()).is_empty());
     }
 }

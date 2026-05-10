@@ -1,16 +1,59 @@
-# LinuxBroadcast
+<div align="center">
+
+<img src="./packaging/LinuxBroadcast.png" width="96" height="96" alt="LinuxBroadcast logo" />
+
+<br><br>
+
+<h1><strong>LinuxBroadcast</strong></h1>
+
+<p>
+  <em>Background replacement for your webcam, on Linux, in a single Rust binary.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Pedrojok01/linux-broadcast/actions/workflows/ci.yml"><img src="https://github.com/Pedrojok01/linux-broadcast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0-or-later"></a>
+  <img src="https://img.shields.io/badge/MSRV-1.80-orange.svg" alt="MSRV 1.80">
+  <img src="https://img.shields.io/badge/platform-linux--x86__64-lightgrey" alt="Platform: Linux x86_64">
+</p>
+
+</div>
 
 A small virtual webcam for Linux that segments the foreground with MediaPipe / RVM, blurs or replaces the background, and exposes the result on a `v4l2loopback` device that Zoom, Meet, Teams, OBS, Firefox, and Chrome treat as a regular webcam.
 
-```
-  v4l2src           appsink                appsrc           v4l2sink
- ┌────────┐  RGBA  ┌────────┐  segment +  ┌────────┐  YUY2  ┌─────────────┐
- │/dev/v0 ├───────►│ Rust   ├────────────►│ Rust   ├───────►│ /dev/video10│
- └────────┘        │  ML    │  composite  │ push   │        └─────────────┘
-                   └────────┘             └────────┘
+```mermaid
+flowchart LR
+    cam(["📷 Physical cam<br/><sub>/dev/video0</sub>"])
+    seg["🧠 <b>Segment</b><br/><sub>MediaPipe · RVM<br/>ONNX Runtime</sub>"]
+    comp["🎨 <b>Composite</b><br/><sub>blur · replace<br/>auto-frame</sub>"]
+    vcam(["📺 Virtual cam<br/><sub>/dev/video10</sub>"])
+
+    cam == RGBA ==> seg
+    seg == mask ==> comp
+    comp == YUY2 ==> vcam
+
+    classDef device fill:#0f172a,stroke:#60a5fa,stroke-width:2px,color:#f8fafc;
+    classDef rust fill:#7c2d12,stroke:#fb923c,stroke-width:2px,color:#fff7ed;
+    class cam,vcam device;
+    class seg,comp rust;
 ```
 
 **Why it exists.** Existing options on Linux are either heavy (Python + CUDA + OpenCV stacks) or shallow (basic chroma key with hard cuts). This is a single Rust binary that runs MediaPipe / RVM on CPU via ONNX Runtime, with a native `egui` UI, no Python, no CUDA, and edge quality on par with the leading proprietary alternatives.
+
+## Contents
+
+- [Features](#features)
+- [Install & run](#install--run)
+  - [Option A — `.deb` (recommended)](#option-a--deb-recommended)
+  - [Option B — Build from source](#option-b--build-from-source)
+  - [Start on login](#start-on-login)
+  - [Lazy mode (camera on demand)](#lazy-mode-camera-on-demand)
+- [Using it](#using-it)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Repo layout](#repo-layout)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 

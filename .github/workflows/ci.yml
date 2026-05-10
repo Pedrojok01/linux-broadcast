@@ -70,9 +70,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Default test set: Phase 1 unit tests + Phase 2 synthetic-graph
-      # integration tests. Phase 3 model-smoke tests are #[ignore]d so
-      # they only run when explicitly requested with `--ignored`.
       - name: cargo test
         run: cargo test --workspace
 

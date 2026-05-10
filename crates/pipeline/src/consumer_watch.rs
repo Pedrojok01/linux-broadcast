@@ -81,11 +81,11 @@ pub fn current_consumers(target_device: &str, exclude_pid: u32) -> Vec<Consumer>
         let mut matched = false;
         for fd in fds.flatten() {
             // readlink — non-existent / racy entries are silently skipped.
-            if let Ok(link) = fs::read_link(fd.path()) {
-                if link == target {
-                    matched = true;
-                    break;
-                }
+            if let Ok(link) = fs::read_link(fd.path())
+                && link == target
+            {
+                matched = true;
+                break;
             }
         }
         if matched {

@@ -1,13 +1,10 @@
-//! Phase 3 — model smoke tests.
+//! Model smoke tests.
 //!
 //! Validates that each ONNX model loads and produces a sensible mask on
-//! a synthetic input. Gated behind `#[ignore]` because each test loads
-//! a real ONNX model and runs inference (~2-5 s each).
-//!
-//! Run with:
-//!   cargo test --workspace -- --ignored
-//! or:
-//!   cargo nextest run --workspace --run-ignored only
+//! a synthetic input. Catches layout / pre-post regressions on the
+//! `Segmenter` (NCHW vs NHWC, sigmoid vs softmax, recurrent-state
+//! plumbing) without needing a real camera. Each test loads its model
+//! once and runs 1–2 inferences; the suite finishes in a few seconds.
 
 use lb_pipeline::{ModelKind, Segmenter};
 
@@ -30,7 +27,6 @@ fn gradient_frame(w: u32, h: u32) -> Vec<u8> {
 }
 
 #[test]
-#[ignore]
 fn binary_segmenter_produces_valid_mask() {
     let mut s = Segmenter::from_bytes(ModelKind::SelfieBinary, MODEL_BINARY_ONNX).unwrap();
     let frame = gradient_frame(256, 256);
@@ -45,7 +41,6 @@ fn binary_segmenter_produces_valid_mask() {
 }
 
 #[test]
-#[ignore]
 fn multiclass_segmenter_produces_valid_mask() {
     let mut s = Segmenter::from_bytes(ModelKind::SelfieMulticlass, MODEL_MULTICLASS_ONNX).unwrap();
     let frame = gradient_frame(256, 256);
@@ -60,7 +55,6 @@ fn multiclass_segmenter_produces_valid_mask() {
 }
 
 #[test]
-#[ignore]
 fn rvm_segmenter_recurrent_state_resets() {
     // Two segments, then reset(), then two more on the same input.
     // Recurrent state must come back to zero, so the post-reset

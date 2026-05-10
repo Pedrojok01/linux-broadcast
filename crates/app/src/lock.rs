@@ -17,7 +17,7 @@ use directories::BaseDirs;
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn lock_path() -> Result<PathBuf> {
     let base = BaseDirs::new().context("no XDG base dirs")?;
@@ -41,13 +41,16 @@ impl InstanceLock {
     /// `Ok(Some(lock))` on success, `Ok(None)` if another instance already
     /// holds the lock, `Err` only on unrelated I/O errors.
     pub fn try_acquire() -> Result<Option<Self>> {
-        let path = lock_path()?;
+        Self::try_acquire_at(&lock_path()?)
+    }
+
+    fn try_acquire_at(path: &Path) -> Result<Option<Self>> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("open {}", path.display()))?;
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(Self { _file: file })),
@@ -60,34 +63,17 @@ impl InstanceLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use tempfile::TempDir;
 
-    fn with_temp_runtime<F: FnOnce(&std::path::Path)>(f: F) {
-        let tmp = TempDir::new().unwrap();
-        let prior_rt = std::env::var_os("XDG_RUNTIME_DIR");
-        let prior_cfg = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_RUNTIME_DIR", tmp.path());
-        // Also set XDG_CONFIG_HOME so the fallback path is sandboxed too.
-        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        f(tmp.path());
-        match prior_rt {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
-        match prior_cfg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
+    fn lock_file(dir: &Path) -> PathBuf {
+        dir.join("linux-broadcast.lock")
     }
 
     #[test]
-    #[serial]
     fn single_acquire_succeeds() {
-        with_temp_runtime(|_| {
-            let lock = InstanceLock::try_acquire().unwrap();
-            assert!(lock.is_some(), "fresh acquire should succeed");
-        });
+        let tmp = TempDir::new().unwrap();
+        let lock = InstanceLock::try_acquire_at(&lock_file(tmp.path())).unwrap();
+        assert!(lock.is_some(), "fresh acquire should succeed");
     }
 
     /// flock(2) on Linux is per-OFD (open file description). Two
@@ -99,55 +85,55 @@ mod tests {
     /// util-linux; if the binary is missing we skip the test rather
     /// than fail.
     #[test]
-    #[serial]
     fn second_acquire_returns_none_while_held_by_other_process() {
-        with_temp_runtime(|_| {
-            let path = lock_path().unwrap();
-            // Make sure the file exists so `flock(1)` opens it cleanly.
-            std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .unwrap();
+        let tmp = TempDir::new().unwrap();
+        let path = lock_file(tmp.path());
+        // Make sure the file exists so `flock(1)` opens it cleanly.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
 
-            let mut child = match std::process::Command::new("flock")
-                .args(["-n", "-x"])
-                .arg(&path)
-                .args(["-c", "sleep 5"])
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("skipping: `flock(1)` not on PATH");
-                    return;
-                }
-                Err(e) => panic!("spawn flock: {e}"),
-            };
-            // Give the child a moment to actually acquire the lock.
-            std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut child = match std::process::Command::new("flock")
+            .args(["-n", "-x"])
+            .arg(&path)
+            .args(["-c", "sleep 5"])
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: `flock(1)` not on PATH");
+                return;
+            }
+            Err(e) => {
+                eprintln!("skipping: spawn flock failed: {e}");
+                return;
+            }
+        };
+        // Give the child a moment to actually acquire the lock.
+        std::thread::sleep(std::time::Duration::from_millis(150));
 
-            let attempt = InstanceLock::try_acquire().unwrap();
-            assert!(attempt.is_none(), "expected None while child holds flock");
+        let attempt = InstanceLock::try_acquire_at(&path).unwrap();
+        assert!(attempt.is_none(), "expected None while child holds flock");
 
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
-    #[serial]
     fn dropped_lock_releases() {
-        with_temp_runtime(|_| {
-            let lock = InstanceLock::try_acquire().unwrap();
-            assert!(lock.is_some());
-            drop(lock);
-            // After drop, a fresh acquire still works (this is trivially
-            // true same-process, but the test doubles as a regression
-            // guard if the impl ever changes to retain locks globally).
-            let again = InstanceLock::try_acquire().unwrap();
-            assert!(again.is_some());
-        });
+        let tmp = TempDir::new().unwrap();
+        let path = lock_file(tmp.path());
+        let lock = InstanceLock::try_acquire_at(&path).unwrap();
+        assert!(lock.is_some());
+        drop(lock);
+        // After drop, a fresh acquire still works (this is trivially
+        // true same-process, but the test doubles as a regression
+        // guard if the impl ever changes to retain locks globally).
+        let again = InstanceLock::try_acquire_at(&path).unwrap();
+        assert!(again.is_some());
     }
 }

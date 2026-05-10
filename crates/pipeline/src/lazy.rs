@@ -35,7 +35,7 @@ use gstreamer_app as gst_app;
 
 use crate::compositor::{Background, Compositor, Framing};
 use crate::consumer_watch::Consumer;
-use crate::framing::{BBoxSmoother, FG_ZOOM, TOP_HEADROOM};
+use crate::framing::{BBoxSmoother, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
 use crate::pipeline::{
     Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
     log_negotiated_input,
@@ -501,11 +501,12 @@ impl Feeder {
         let frame_h = self.cfg.height;
         let bg = self.background.clone();
 
-        // Auto-frame is a no-op without a background plane to fill the
-        // strip vacated by the shifted silhouette, so we tie it to a
-        // non-None background and keep the original true-passthrough
-        // short-circuit otherwise.
-        if !matches!(bg, Background::None) {
+        // Segmentation runs whenever there's bg work to do (any non-None
+        // bg) OR auto-frame needs the silhouette anchor (any mode). In
+        // `Background::None + framing` the compositor crops the raw
+        // camera frame around the locked centroid — the mask is only
+        // there so `BBoxSmoother` has something to lock onto.
+        if !matches!(bg, Background::None) || self.framing_enabled {
             match self
                 .segmenter
                 .segment(&frame_rgba, frame_w as usize, frame_h as usize)
@@ -514,25 +515,51 @@ impl Feeder {
                     self.smoother.smooth(&mut mask.data);
                     let framing = if self.framing_enabled {
                         self.bbox_smoother.update(&mask).map(|anchor| {
-                            // Place head at TOP_HEADROOM, but never higher
-                            // than what's needed to keep the source bottom
-                            // mapped to (at least) the output bottom — at
-                            // low zoom the silhouette doesn't fully cover
-                            // the frame, and a fixed top anchor would leave
-                            // a band of the background plane at the bottom.
-                            let src_y = anchor.top_y_norm * frame_h as f32;
-                            let h = frame_h as f32;
-                            let min_dst_y = h - (h - src_y) * FG_ZOOM;
-                            let dst_y = (h * TOP_HEADROOM).max(min_dst_y);
+                            let frame_w_f = frame_w as f32;
+                            let frame_h_f = frame_h as f32;
+                            let center_x = frame_w_f * 0.5;
+                            let raw_src_x = anchor.cx_norm * frame_w_f;
+
+                            // Adaptive zoom: pick the smallest zoom that
+                            // both meets the FG_ZOOM minimum and keeps
+                            // the recentred crop window strictly inside
+                            // [0, frame_w]. Centred user → 1.05×;
+                            // off-centre user → bumps just enough to
+                            // recentre cleanly. Capped at FG_ZOOM_MAX so
+                            // the wall doesn't visibly zoom for users
+                            // sitting near the edge — at the cap, src_x
+                            // gets clamped instead and the user appears
+                            // slightly off-centre but in frame.
+                            let dist_to_nearer_edge =
+                                raw_src_x.min(frame_w_f - raw_src_x).max(0.0);
+                            let required_zoom = if dist_to_nearer_edge > 0.5 {
+                                center_x / dist_to_nearer_edge
+                            } else {
+                                FG_ZOOM_MAX
+                            };
+                            let zoom = required_zoom.clamp(FG_ZOOM, FG_ZOOM_MAX);
+                            let half_crop_w = center_x / zoom;
+                            let src_x = raw_src_x.clamp(half_crop_w, frame_w_f - half_crop_w);
+
+                            // Vertical: place head at TOP_HEADROOM, but
+                            // never higher than what's needed to keep the
+                            // source bottom mapped to (at least) the
+                            // output bottom. Uses the dynamic zoom so the
+                            // headroom math agrees with the horizontal
+                            // crop sizing.
+                            let src_y = anchor.top_y_norm * frame_h_f;
+                            let min_dst_y = frame_h_f - (frame_h_f - src_y) * zoom;
+                            let dst_y = (frame_h_f * TOP_HEADROOM).max(min_dst_y);
+
                             let f = Framing {
-                                src_anchor_x: anchor.cx_norm * frame_w as f32,
+                                src_anchor_x: src_x,
                                 src_anchor_y: src_y,
-                                dst_anchor_x: frame_w as f32 * 0.5,
+                                dst_anchor_x: center_x,
                                 dst_anchor_y: dst_y,
-                                zoom: FG_ZOOM,
+                                zoom,
                             };
                             if self.frame_idx == 1
-                                || self.frame_idx % (self.cfg.framerate as u64 * 2) == 0
+                                || self.frame_idx.is_multiple_of(self.cfg.framerate as u64 * 2)
                             {
                                 log::debug!(
                                     "auto-frame: cx={:.3} top_y={:.3} zoom={:.2}",
@@ -564,25 +591,27 @@ impl Feeder {
                 }
             }
         } else {
-            // Passthrough: keep recurrent state clean for the next
-            // non-None engagement.
+            // Pure passthrough: keep recurrent state clean for the next
+            // non-trivial engagement.
             self.smoother.reset();
             self.segmenter.reset();
         }
 
-        if self.preview_enabled {
-            if let Some(tx) = &self.preview_tx {
-                // try_send so we silently drop when the GUI lags.
-                let _ = tx.try_send(PreviewFrame {
-                    width: frame_w,
-                    height: frame_h,
-                    rgba: frame_rgba.clone(),
-                });
-            }
+        if self.preview_enabled
+            && let Some(tx) = &self.preview_tx
+        {
+            // try_send so we silently drop when the GUI lags.
+            let _ = tx.try_send(PreviewFrame {
+                width: frame_w,
+                height: frame_h,
+                rgba: frame_rgba.clone(),
+            });
         }
 
         let pushed = self.push_to_sink(&frame_rgba);
-        if pushed && (self.frame_idx == 1 || self.frame_idx % (self.cfg.framerate as u64) == 0) {
+        if pushed
+            && (self.frame_idx == 1 || self.frame_idx.is_multiple_of(self.cfg.framerate as u64))
+        {
             log::debug!(
                 "live frame #{} ({}x{} RGBA) → /dev/video sink",
                 self.frame_idx,
@@ -610,10 +639,10 @@ impl Feeder {
     /// (cached in `self.idle_frame` so subsequent ticks reuse it).
     fn pump_idle_frame(&mut self) {
         let now = Instant::now();
-        if let Some(last) = self.last_idle_push {
-            if now.duration_since(last) < IDLE_PUSH_INTERVAL {
-                return;
-            }
+        if let Some(last) = self.last_idle_push
+            && now.duration_since(last) < IDLE_PUSH_INTERVAL
+        {
+            return;
         }
 
         if self.idle_frame.is_none() {

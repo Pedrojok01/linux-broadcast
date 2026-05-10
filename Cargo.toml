@@ -4,11 +4,11 @@ members = ["crates/pipeline", "crates/app"]
 
 [workspace.package]
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Pedrojok01/linux-broadcast"
 authors = ["Pedrojok01"]
-rust-version = "1.80"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -42,3 +42,16 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Workspace-wide lint bar. Mirrors what CI enforces (`-D warnings`) so that
+# `cargo clippy` locally fails on the same things the pipeline does.
+#
+# `priority = -1` on the group lints lets individual lints below override
+# without clippy erroring on the conflict — keep it if you ever need to
+# `allow` a single lint on top of `clippy::all`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
