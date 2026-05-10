@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/Pedrojok01/linux-broadcast/actions/workflows/ci.yml"><img src="https://github.com/Pedrojok01/linux-broadcast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0-or-later"></a>
-  <img src="https://img.shields.io/badge/MSRV-1.80-orange.svg" alt="MSRV 1.80">
+  <img src="https://img.shields.io/badge/MSRV-1.88-orange.svg" alt="MSRV 1.88">
   <img src="https://img.shields.io/badge/platform-linux--x86__64-lightgrey" alt="Platform: Linux x86_64">
 </p>
 
@@ -57,10 +57,9 @@ flowchart LR
 
 ## Features
 
-- **Three switchable models** (chosen live in the GUI):
-  - **Selfie binary** — fast (~5 ms inference, 450 KB).
-  - **Selfie multiclass** — six-class output, sharper edges (~16 MB).
-  - **RVM** (Robust Video Matting) — recurrent video matting, best edges, no flicker (~15 MB).
+- **Two switchable models** (chosen live in the GUI):
+  - **RVM** (Robust Video Matting) — recurrent video matting, best edges, no flicker (~15 MB). Default.
+  - **Selfie multiclass** — per-frame, fixed 256×256 (~16 MB). Low-CPU fallback.
 - **Three background modes** — passthrough, blur (intensity slider, 4–32 px radius), replace with a saved image.
 - **Saved background library** — imports are copied to `~/.local/share/linux-broadcast/backgrounds/` so they survive across launches.
 - **Auto-frame** — a smoothed horizontal recenter plus a light foreground zoom that keeps the silhouette centered as you move. Off by default; toggle in the sidebar's *Settings*. Skipped when the background mode is *None* (no plane to paint over).
@@ -167,7 +166,7 @@ When the LinuxBroadcast GUI is open and visible, the **preview pane counts as a 
 The pipeline is **always running** while LinuxBroadcast is open — there's no Start/Stop button. Conferencing apps see `LinuxBroadcast` in their camera list the moment LB starts, and the physical webcam only powers on when something actually reads the virtual cam (see [Lazy mode](#lazy-mode-camera-on-demand)).
 
 1. Pick a physical camera in **Camera**.
-2. Pick a model in **Model** — binary is fastest, multiclass sharper, RVM cleanest. Switching restarts the pipeline automatically.
+2. Pick a model in **Model** — RVM is the default (best edges); multiclass is the low-CPU fallback. Switching restarts the pipeline automatically.
 3. **Set the scene** with the segmented control — `None` (passthrough), `Blur` (slider for intensity), or `Replace` (uses the active library tile).
 4. Click **+ Import** to add background images; click any thumbnail to switch to it live; right-click → Remove deletes it.
 5. Toggle **Auto-frame**, **Show preview**, or **Start on login** in the sidebar's *Settings* section as needed. All three persist to `config.toml`.
@@ -179,11 +178,10 @@ Reference numbers on a **Logitech C920 + single x86 core, 1280×720**:
 
 | Model | Inference / frame | Throughput |
 |---|---|---|
-| Selfie binary | ~5 ms | 30 fps (camera-bound) |
 | Selfie multiclass | ~10 ms | 30 fps (camera-bound) |
-| RVM (`downsample_ratio=0.4`) | ~30–40 ms | ~15 fps |
+| RVM (`downsample_ratio=0.5`) | ~40–60 ms | ~15 fps |
 
-The MediaPipe variants leave plenty of headroom for 1080p; RVM at 1080p needs `downsample_ratio=0.25` (set in `crates/pipeline/src/segmenter.rs`).
+Multiclass leaves plenty of headroom for 1080p; RVM at 1080p needs `downsample_ratio=0.25` (set in `crates/pipeline/src/segmenter.rs`).
 
 ## Troubleshooting
 
@@ -198,7 +196,7 @@ The MediaPipe variants leave plenty of headroom for 1080p; RVM at 1080p needs `d
 crates/
   pipeline/      # GStreamer graph + ort segmenter + compositor (no GUI deps)
   app/           # eframe/egui GUI, theme, config, background library
-models/          # bundled ONNX (binary / multiclass / RVM)
+models/          # bundled ONNX (multiclass / RVM)
 assets/fonts/    # Inter + JetBrains Mono
 DESIGN.md        # design tokens (colour, spacing, type) + rationale
 CLAUDE.md        # in-depth dev notes (pipeline, gotchas, model details)
@@ -234,4 +232,4 @@ For substantive changes:
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE) for the full text.
 
-This project bundles [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) (`models/rvm.onnx`), released under GPL-3.0, which is what makes the entire binary GPL-3.0. The two MediaPipe ONNX files in `models/` are Apache-2.0; the bundled fonts in `assets/fonts/` are SIL Open Font License 1.1. See [`models/README.md`](models/README.md) and [`assets/fonts/`](assets/fonts/) for per-asset attribution.
+This project bundles [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) (`models/rvm.onnx`), released under GPL-3.0, which is what makes the entire binary GPL-3.0. The MediaPipe ONNX file in `models/` is Apache-2.0; the bundled fonts in `assets/fonts/` are SIL Open Font License 1.1. See [`models/README.md`](models/README.md) and [`assets/fonts/`](assets/fonts/) for per-asset attribution.

@@ -94,7 +94,7 @@ impl Default for PipelineConfig {
             background: Background::Blur {
                 strength: Background::DEFAULT_BLUR_STRENGTH,
             },
-            model: ModelKind::SelfieBinary,
+            model: ModelKind::Rvm,
             preview_tx: None,
             framing: false,
         }
@@ -163,13 +163,11 @@ impl Pipeline {
     /// demand via [`Command::SetGuiPreviewActive`].
     pub fn start(
         cfg: PipelineConfig,
-        binary_onnx: &'static [u8],
         multiclass_onnx: &'static [u8],
         rvm_onnx: &'static [u8],
     ) -> Result<Self> {
         Self::start_with_builders(
             cfg,
-            binary_onnx,
             multiclass_onnx,
             rvm_onnx,
             Arc::new(build_source_pipeline),
@@ -185,7 +183,6 @@ impl Pipeline {
     /// `v4l2loopback`.
     pub fn start_with_builders(
         cfg: PipelineConfig,
-        binary_onnx: &'static [u8],
         multiclass_onnx: &'static [u8],
         rvm_onnx: &'static [u8],
         source_builder: SourceBuilder,
@@ -225,7 +222,6 @@ impl Pipeline {
         // 4. Feeder thread.
         let feeder = spawn_feeder(
             cfg,
-            binary_onnx,
             multiclass_onnx,
             rvm_onnx,
             sink_appsrc,
@@ -405,7 +401,6 @@ pub(crate) fn build_source_pipeline(
         .sync(false)
         .enable_last_sample(false)
         .build();
-    appsink.set_sync(false);
 
     pipeline.add_many([
         &src,

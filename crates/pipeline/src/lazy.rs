@@ -35,7 +35,7 @@ use gstreamer_app as gst_app;
 
 use crate::compositor::{Background, Compositor, Framing};
 use crate::consumer_watch::Consumer;
-use crate::framing::{BBoxSmoother, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
+use crate::framing::{AnchorLock, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
 use crate::pipeline::{
     Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
     log_negotiated_input,
@@ -127,7 +127,6 @@ pub(crate) fn next_state(state: State, demand: Demand, now: Instant) -> State {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_feeder(
     cfg: PipelineConfig,
-    binary_onnx: &'static [u8],
     multiclass_onnx: &'static [u8],
     rvm_onnx: &'static [u8],
     sink_appsrc: gst_app::AppSrc,
@@ -140,7 +139,6 @@ pub(crate) fn spawn_feeder(
     let segmenter = Segmenter::from_bytes(
         cfg.model,
         match cfg.model {
-            ModelKind::SelfieBinary => binary_onnx,
             ModelKind::SelfieMulticlass => multiclass_onnx,
             ModelKind::Rvm => rvm_onnx,
         },
@@ -159,7 +157,7 @@ pub(crate) fn spawn_feeder(
                     ModelKind::Rvm => RVM_ALPHA,
                     _ => DEFAULT_ALPHA,
                 }),
-                bbox_smoother: BBoxSmoother::new(),
+                anchor_lock: AnchorLock::new(),
                 framing_enabled: cfg.framing,
                 background: cfg.background.clone(),
                 preview_tx: cfg.preview_tx.clone(),
@@ -193,7 +191,7 @@ struct Feeder {
     /// Smoothed virtual-PTZ crop driver. Held even when `framing_enabled`
     /// is false so toggling at runtime doesn't drop history more than the
     /// explicit `reset()` we run on disable.
-    bbox_smoother: BBoxSmoother,
+    anchor_lock: AnchorLock,
     /// Toggle for the auto-frame stage. When true, segmentation runs on
     /// every frame regardless of background mode (the smoother needs a
     /// mask to compute the bbox), and the compositor's crop+rescale stage
@@ -314,7 +312,7 @@ impl Feeder {
                 if !v {
                     // Drop the smoother state so the next enable starts at
                     // the live bbox instead of panning from a stale rect.
-                    self.bbox_smoother.reset();
+                    self.anchor_lock.reset();
                 }
             }
             Command::Stop => unreachable!("handled in run()"),
@@ -384,7 +382,7 @@ impl Feeder {
             // the EMA reconverges within ~1 s of being live again.
             self.segmenter.reset();
             self.smoother.reset();
-            self.bbox_smoother.reset();
+            self.anchor_lock.reset();
             self.compositor.reset_bg_plate();
         }
 
@@ -505,7 +503,7 @@ impl Feeder {
         // bg) OR auto-frame needs the silhouette anchor (any mode). In
         // `Background::None + framing` the compositor crops the raw
         // camera frame around the locked centroid — the mask is only
-        // there so `BBoxSmoother` has something to lock onto.
+        // there so `AnchorLock` has something to lock onto.
         if !matches!(bg, Background::None) || self.framing_enabled {
             match self
                 .segmenter
@@ -514,7 +512,7 @@ impl Feeder {
                 Ok(mut mask) => {
                     self.smoother.smooth(&mut mask.data);
                     let framing = if self.framing_enabled {
-                        self.bbox_smoother.update(&mask).map(|anchor| {
+                        self.anchor_lock.update(&mask).map(|anchor| {
                             let frame_w_f = frame_w as f32;
                             let frame_h_f = frame_h as f32;
                             let center_x = frame_w_f * 0.5;
@@ -696,13 +694,6 @@ impl Feeder {
     }
 }
 
-/// Helper used by tests + the orchestrator to dedupe consumer-set
-/// updates when polling produces an identical PID set.
-#[allow(dead_code)]
-pub(crate) fn pids(consumers: &[Consumer]) -> HashSet<u32> {
-    consumers.iter().map(|c| c.pid).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,8 +812,8 @@ mod tests {
 
     #[test]
     fn gui_preview_alone_holds_live() {
-        // Validates the 0c wiring: preview pane visible counts as a
-        // synthetic consumer in the demand signal.
+        // Preview pane visible counts as a synthetic consumer in the
+        // demand signal, so it should drive Idle → Live on its own.
         let preview = demand(false, true);
         let t0 = Instant::now();
         let mut s = State::Idle;

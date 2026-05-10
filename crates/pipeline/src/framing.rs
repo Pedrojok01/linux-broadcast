@@ -1,11 +1,11 @@
 //! Auto-framing: snap-on-first horizontal recenter + light foreground zoom.
 //!
-//! On the first detection after construction (or after [`BBoxSmoother::reset`])
+//! On the first detection after construction (or after [`AnchorLock::reset`])
 //! we capture the silhouette anchor and hold it forever. Subsequent calls
 //! return that locked anchor unchanged — small natural movements of a seated
 //! user don't produce visible recentering. To pick a new anchor, the caller
-//! resets the smoother (the feeder does this when auto-frame is toggled off
-//! and on again, and also on Live exit).
+//! resets the lock (the feeder does this when auto-frame is toggled off and
+//! on again, and also on Live exit).
 //!
 //! This is the GMeet auto-frame UX: snap once at engagement, stay put. An
 //! earlier EMA-based design panned every frame to track the centroid; users
@@ -26,7 +26,7 @@
 //!   smear the bottom row across a visible band.
 //!
 //! When no foreground is detected on the very first update, the lock
-//! never engages and [`BBoxSmoother::update`] returns `None` — the feeder
+//! never engages and [`AnchorLock::update`] returns `None` — the feeder
 //! passes `framing = None` to the compositor and the frame is composited
 //! without any zoom that tick. Once locked, the lock holds even through
 //! later frames where the segmenter loses the silhouette.
@@ -61,7 +61,7 @@ pub const FG_ZOOM_MAX: f32 = 1.20;
 pub const TOP_HEADROOM: f32 = 0.08;
 
 /// Framing anchor in normalised source coords. Output of
-/// [`BBoxSmoother::update`].
+/// [`AnchorLock::update`].
 #[derive(Debug, Clone, Copy)]
 pub struct Anchor {
     /// Mass-weighted horizontal centroid in `[0, 1]`.
@@ -75,19 +75,19 @@ pub struct Anchor {
 /// Captures the first detection's anchor and returns it unchanged on
 /// every subsequent `update()`. `reset()` clears the lock so the next
 /// detection seeds a new anchor.
-pub struct BBoxSmoother {
+pub struct AnchorLock {
     /// Anchor captured on the first detection after construction or
     /// `reset()`. `None` until that first detection succeeds.
     locked: Option<Anchor>,
 }
 
-impl Default for BBoxSmoother {
+impl Default for AnchorLock {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BBoxSmoother {
+impl AnchorLock {
     pub fn new() -> Self {
         Self { locked: None }
     }
@@ -204,13 +204,13 @@ mod tests {
 
     #[test]
     fn empty_mask_returns_none() {
-        let mut s = BBoxSmoother::new();
+        let mut s = AnchorLock::new();
         assert!(s.update(&empty_mask(50, 50)).is_none());
     }
 
     #[test]
     fn first_detection_snaps_to_anchor() {
-        let mut s = BBoxSmoother::new();
+        let mut s = AnchorLock::new();
         // Silhouette occupying x ∈ [20, 60), y ∈ [10, 90) of a 100×100 mask.
         // Centroid x = (20 + 59 + 1) / 2 / 100 = 0.40.
         // Top row = 10, normalized = 10.5/100 = 0.105.
@@ -228,7 +228,7 @@ mod tests {
     fn lock_holds_against_subsequent_movement() {
         // Snap to silhouette at centroid 0.4, then move it to centroid 0.7.
         // The lock must keep returning the original anchor.
-        let mut s = BBoxSmoother::new();
+        let mut s = AnchorLock::new();
         let first = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90)).unwrap();
         // First anchor: centroid at 0.40.
         assert!((first.cx_norm - 0.40).abs() < 1e-3, "cx={}", first.cx_norm);
@@ -243,7 +243,7 @@ mod tests {
         // Once locked, the lock survives a frame with no foreground
         // (segmenter blink, user briefly leaving frame). Returns the
         // cached anchor instead of None.
-        let mut s = BBoxSmoother::new();
+        let mut s = AnchorLock::new();
         let first = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90)).unwrap();
         let after_blank = s.update(&empty_mask(100, 100)).unwrap();
         assert_eq!(first.cx_norm, after_blank.cx_norm);
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn reset_clears_lock_and_re_snaps() {
-        let mut s = BBoxSmoother::new();
+        let mut s = AnchorLock::new();
         let _ = s.update(&mask_with_rect(100, 100, 20, 10, 60, 90));
         assert!(s.locked.is_some());
         s.reset();
@@ -280,7 +280,7 @@ mod tests {
             width: 100,
             height: 100,
         };
-        let mut s = BBoxSmoother::new();
+        let mut s = AnchorLock::new();
         let a = s.update(&mask).unwrap();
         assert!(
             (a.top_y_norm - 0.105).abs() < 1e-3,

@@ -2,13 +2,12 @@
 //!
 //! Validates that each ONNX model loads and produces a sensible mask on
 //! a synthetic input. Catches layout / pre-post regressions on the
-//! `Segmenter` (NCHW vs NHWC, sigmoid vs softmax, recurrent-state
-//! plumbing) without needing a real camera. Each test loads its model
+//! `Segmenter` (NHWC softmax for multiclass, recurrent-state plumbing
+//! for RVM) without needing a real camera. Each test loads its model
 //! once and runs 1–2 inferences; the suite finishes in a few seconds.
 
 use lb_pipeline::{ModelKind, Segmenter};
 
-const MODEL_BINARY_ONNX: &[u8] = include_bytes!("../../../models/selfie_segmenter.onnx");
 const MODEL_MULTICLASS_ONNX: &[u8] = include_bytes!("../../../models/selfie_multiclass.onnx");
 const MODEL_RVM_ONNX: &[u8] = include_bytes!("../../../models/rvm.onnx");
 
@@ -24,20 +23,6 @@ fn gradient_frame(w: u32, h: u32) -> Vec<u8> {
         }
     }
     v
-}
-
-#[test]
-fn binary_segmenter_produces_valid_mask() {
-    let mut s = Segmenter::from_bytes(ModelKind::SelfieBinary, MODEL_BINARY_ONNX).unwrap();
-    let frame = gradient_frame(256, 256);
-    let mask = s.segment(&frame, 256, 256).unwrap();
-    assert_eq!(mask.width, 256);
-    assert_eq!(mask.height, 256);
-    assert_eq!(mask.data.len(), 256 * 256);
-    for &v in &mask.data {
-        assert!(v.is_finite(), "non-finite mask value: {v}");
-        assert!((0.0..=1.0).contains(&v), "out of range: {v}");
-    }
 }
 
 #[test]

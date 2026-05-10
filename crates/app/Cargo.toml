@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Background-replacement virtual webcam for Linux"
+publish = false
 
 default-run = "linux-broadcast"
 

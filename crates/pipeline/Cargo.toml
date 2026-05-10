@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Webcam → segmentation → composite → v4l2loopback pipeline for linux-broadcast"
+publish = false
 
 [lib]
 name = "lb_pipeline"
@@ -21,7 +22,6 @@ gstreamer-video.workspace = true
 
 ort.workspace = true
 fast_image_resize.workspace = true
-wide.workspace = true
 
 crossbeam-channel.workspace = true
 

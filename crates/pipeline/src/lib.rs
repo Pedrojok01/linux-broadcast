@@ -17,8 +17,8 @@
 //! linux-broadcast video pipeline.
 //!
 //! Pulls frames from a v4l2 capture device, segments the foreground via
-//! ONNX Runtime (MediaPipe Selfie Segmentation, MediaPipe multiclass, or
-//! Robust Video Matting), composites against a blurred or replaced
+//! ONNX Runtime (Robust Video Matting by default, MediaPipe multiclass as
+//! a low-CPU fallback), composites against a blurred or replaced
 //! background, and writes the result to a `v4l2loopback` device that
 //! conferencing apps consume.
 //!
@@ -38,12 +38,11 @@ pub mod temporal;
 
 pub use compositor::{Background, Compositor};
 pub use consumer_watch::Consumer;
-pub use framing::BBoxSmoother;
 pub use pipeline::{Command, Pipeline, PipelineConfig, PipelineState, PreviewFrame};
 pub use segmenter::{Mask, ModelKind, Segmenter};
 
-/// Native input resolution of the MediaPipe Selfie Segmentation (general) model.
-/// The "landscape" variant is 256×144 but isn't on the `onnx-community` HF repo;
-/// the general model is 256×256 and otherwise identical in op set / output.
+/// Native input resolution of the MediaPipe Selfie Multiclass model
+/// (256×256). RVM does not use these constants — its mask is emitted at
+/// frame resolution.
 pub const MODEL_W: usize = 256;
 pub const MODEL_H: usize = 256;

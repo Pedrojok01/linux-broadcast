@@ -21,38 +21,33 @@ use lb_pipeline::ModelKind;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Mirrors `lb_pipeline::ModelKind` but with `serde` impls for the config
+/// Mirrors `lb_pipeline::ModelKind` with `serde` impls for the config
 /// file. Kept separate so the pipeline crate doesn't need a serde dep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Model {
-    /// MediaPipe Selfie Segmentation (binary, ~450 KB).
-    #[default]
-    SelfieBinary,
-    /// MediaPipe Selfie Multiclass (~16 MB) — segments hair / face / body /
-    /// clothes / others separately, gives sharper edges.
+    /// MediaPipe Selfie Multiclass — 256×256, per-frame. Low-CPU fallback.
     SelfieMulticlass,
-    /// Robust Video Matting (MobileNetV3, ~15 MB) — recurrent, frame-rate
-    /// alpha matte. Best edges; slowest.
+    /// Robust Video Matting (MobileNetV3) — recurrent, frame-res alpha.
+    #[default]
+    #[serde(alias = "selfie_binary")]
     Rvm,
 }
 
 impl Model {
     pub fn label(self) -> &'static str {
         match self {
-            Model::SelfieBinary => "Selfie (binary, fast)",
-            Model::SelfieMulticlass => "Selfie multiclass (sharper)",
-            Model::Rvm => "RVM (best edges, slower)",
+            Model::SelfieMulticlass => "Selfie multiclass (low CPU)",
+            Model::Rvm => "RVM (best edges)",
         }
     }
     pub fn into_kind(self) -> ModelKind {
         match self {
-            Model::SelfieBinary => ModelKind::SelfieBinary,
             Model::SelfieMulticlass => ModelKind::SelfieMulticlass,
             Model::Rvm => ModelKind::Rvm,
         }
     }
-    pub const ALL: &'static [Model] = &[Model::SelfieBinary, Model::SelfieMulticlass, Model::Rvm];
+    pub const ALL: &'static [Model] = &[Model::Rvm, Model::SelfieMulticlass];
 }
 
 const QUALIFIER: &str = "io";

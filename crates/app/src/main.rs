@@ -17,7 +17,7 @@
 //! `linux-broadcast` binary entry point.
 //!
 //! Responsibilities:
-//! - Embed the three ONNX models at compile time (`include_bytes!`) so the
+//! - Embed the two ONNX models at compile time (`include_bytes!`) so the
 //!   shipped binary is self-contained — no separate model files, no first-run
 //!   download.
 //! - Acquire the per-user single-instance lock before doing anything else
@@ -46,10 +46,6 @@ mod ui;
 use anyhow::Result;
 
 use crate::lock::InstanceLock;
-
-/// Bundled MediaPipe Selfie Segmentation ONNX (binary, ~450 KB).
-/// Sourced from `onnx-community/mediapipe_selfie_segmentation` on Hugging Face.
-pub(crate) const MODEL_BINARY_ONNX: &[u8] = include_bytes!("../../../models/selfie_segmenter.onnx");
 
 /// Bundled MediaPipe Selfie Multiclass ONNX (6 classes: bg/hair/body/face/clothes/other,
 /// ~16 MB). Converted via tf2onnx from the official MediaPipe TFLite.

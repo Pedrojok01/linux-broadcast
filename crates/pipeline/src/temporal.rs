@@ -41,7 +41,14 @@ impl MaskSmoother {
             }
             _ => {}
         }
-        self.prev = Some(mask.to_vec());
+        // Reuse the previous-frame Vec when its size matches; only
+        // allocate (or grow) when the mask resolution changes. At RVM
+        // frame resolution this saves a multi-MB allocation per tick.
+        let prev = self.prev.get_or_insert_with(|| Vec::with_capacity(mask.len()));
+        if prev.len() != mask.len() {
+            prev.resize(mask.len(), 0.0);
+        }
+        prev.copy_from_slice(mask);
     }
 
     pub fn reset(&mut self) {

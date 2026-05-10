@@ -82,10 +82,10 @@ impl Tray {
         Ok(Self { rx: event_rx })
     }
 
-    /// Drains pending tray events. Returns the most recent meaningful
-    /// event, collapsing repeated Show/Hide clicks. Called every frame.
+    /// Drains all pending tray events without blocking. Called every
+    /// frame from the egui update loop.
     pub fn drain(&self) -> impl Iterator<Item = TrayEvent> + '_ {
-        std::iter::from_fn(move || self.rx.try_recv().ok())
+        self.rx.try_iter()
     }
 }
 

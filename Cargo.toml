@@ -21,9 +21,7 @@ gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
-ndarray = "0.16"
 fast_image_resize = "5"
-wide = "0.7"
 
 # App / GUI
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

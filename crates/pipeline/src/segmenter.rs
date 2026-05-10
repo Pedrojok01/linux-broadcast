@@ -1,20 +1,16 @@
-//! Foreground segmentation. Wraps three interchangeable ONNX models
+//! Foreground segmentation. Wraps two interchangeable ONNX models
 //! behind the [`Segmenter`] enum, each with its own pre/post:
 //!
-//! - **MediaPipe Selfie binary** — NCHW input, single-channel sigmoid
-//!   probability output. Cheapest (~5 ms / 256² frame on one CPU core).
 //! - **MediaPipe Selfie multiclass** — NHWC input, 6-class raw logits
-//!   output. Foreground probability is `1 - softmax(logits)[bg]`. Better
-//!   on tricky scenes (similar-luminance bg, hair detail).
+//!   output. Foreground = `1 - softmax(logits)[bg]`. Fixed 256×256.
 //! - **Robust Video Matting (RVM)** — recurrent. Six inputs (`src` + four
 //!   recurrent state tensors `r1i..r4i` + `downsample_ratio` scalar) and
 //!   six outputs (`fgr`, `pha`, `r1o..r4o`). We discard `fgr` and use
-//!   `pha`. The recurrent state lives on `RvmInner` across calls and is
-//!   cleared by `reset()` whenever the user toggles passthrough or the
-//!   source frame size changes.
+//!   `pha`. State lives on `RvmInner` across calls and is cleared by
+//!   `reset()` on passthrough toggle or source-size change.
 //!
 //! Inference always runs at the model's native resolution
-//! (`MODEL_W × MODEL_H` = 256×256 for the MediaPipe variants, an internal
+//! (`MODEL_W × MODEL_H` = 256×256 for multiclass, an internal
 //! `RVM_DOWNSAMPLE_RATIO`-scaled tensor for RVM). Only the upsample +
 //! composite step in `compositor.rs` touches frame-resolution pixels.
 //! That's what keeps CPU usage low at 720p/1080p.
@@ -36,22 +32,17 @@ use crate::{MODEL_H, MODEL_W};
 /// Which segmentation model the pipeline should run with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelKind {
-    /// MediaPipe Selfie Segmentation, single-channel output.
-    /// 256×256, NCHW, output is already a probability.
-    #[default]
-    SelfieBinary,
     /// MediaPipe Selfie Multiclass — 6 classes, 256×256 NHWC, raw logits.
-    /// Foreground = `1 - softmax(logits)[bg]` per pixel.
     SelfieMulticlass,
-    /// Robust Video Matting (MobileNetV3) — recurrent video matting.
-    /// Frame-resolution alpha output, internal compute scaled by
-    /// `downsample_ratio`. Best edge fidelity.
+    /// Robust Video Matting (MobileNetV3) — recurrent, frame-resolution
+    /// alpha output, internal compute scaled by `downsample_ratio`.
+    #[default]
     Rvm,
 }
 
 /// A segmentation mask with its native resolution. Variants of `Segmenter`
-/// may return masks at different sizes — RVM at frame size, MediaPipe at
-/// the model's native 256×256 — so callers must respect `width`/`height`.
+/// may return masks at different sizes — RVM at frame size, multiclass at
+/// 256×256 — so callers must respect `width`/`height`.
 pub struct Mask {
     pub data: Vec<f32>,
     pub width: u32,
@@ -60,13 +51,14 @@ pub struct Mask {
 
 /// Public segmenter — internal implementation switches on `ModelKind`.
 pub enum Segmenter {
-    Binary(MpInner),
     Multiclass(MpInner),
-    Rvm(RvmInner),
+    // Boxed because `RvmInner` carries the four recurrent-state buffers
+    // and is significantly larger than `MpInner`. Heap allocation cost
+    // is paid once at construction; per-frame dispatch is unchanged.
+    Rvm(Box<RvmInner>),
 }
 
-/// Shared session + reusable buffers for the two MediaPipe models. Layout
-/// (NCHW vs NHWC) is handled per variant in `segment_*`.
+/// Session + reusable buffers for the multiclass MediaPipe model.
 pub struct MpInner {
     session: Session,
     input_name: String,
@@ -79,15 +71,13 @@ pub struct MpInner {
 impl Segmenter {
     pub fn from_bytes(kind: ModelKind, onnx: &[u8]) -> Result<Self> {
         match kind {
-            ModelKind::SelfieBinary => Ok(Segmenter::Binary(MpInner::new(onnx)?)),
             ModelKind::SelfieMulticlass => Ok(Segmenter::Multiclass(MpInner::new(onnx)?)),
-            ModelKind::Rvm => Ok(Segmenter::Rvm(RvmInner::new(onnx)?)),
+            ModelKind::Rvm => Ok(Segmenter::Rvm(Box::new(RvmInner::new(onnx)?))),
         }
     }
 
     pub fn segment(&mut self, rgba: &[u8], width: usize, height: usize) -> Result<Mask> {
         match self {
-            Segmenter::Binary(inner) => segment_binary(inner, rgba, width, height),
             Segmenter::Multiclass(inner) => segment_multiclass(inner, rgba, width, height),
             Segmenter::Rvm(inner) => inner.segment(rgba, width, height),
         }
@@ -137,7 +127,7 @@ fn resize_opts() -> ResizeOptions {
 }
 
 /// Resize source RGBA into the model's native 256×256, in-place into
-/// `inner.rgba_resized`. Used by the two MediaPipe variants.
+/// `inner.rgba_resized`.
 fn resize_to_model(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize) -> Result<()> {
     if rgba.len() != width * height * 4 {
         return Err(anyhow!(
@@ -160,56 +150,6 @@ fn resize_to_model(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize
         .resizer
         .resize(&src, &mut dst, &resize_opts())
         .map_err(|e| anyhow!("resize: {e}"))
-}
-
-// -----------------------------------------------------------------------
-//  Binary (MediaPipe Selfie Segmentation, single channel, NCHW 256×256)
-// -----------------------------------------------------------------------
-
-fn segment_binary(inner: &mut MpInner, rgba: &[u8], width: usize, height: usize) -> Result<Mask> {
-    resize_to_model(inner, rgba, width, height)?;
-
-    let plane = MODEL_H * MODEL_W;
-    for i in 0..plane {
-        inner.input_buf[i] = inner.rgba_resized[i * 4] as f32 / 255.0;
-        inner.input_buf[plane + i] = inner.rgba_resized[i * 4 + 1] as f32 / 255.0;
-        inner.input_buf[2 * plane + i] = inner.rgba_resized[i * 4 + 2] as f32 / 255.0;
-    }
-
-    let shape: [i64; 4] = [1, 3, MODEL_H as i64, MODEL_W as i64];
-    let input_value = TensorRef::from_array_view((shape, &inner.input_buf[..]))
-        .map_err(|e| anyhow!("ort Value: {e}"))?;
-    let outputs = inner
-        .session
-        .run(ort::inputs![&inner.input_name => input_value])
-        .map_err(|e| anyhow!("ort run: {e}"))?;
-    let (_name, value) = outputs.iter().next().ok_or_else(|| anyhow!("no outputs"))?;
-    let (out_shape, data) = value
-        .try_extract_tensor::<f32>()
-        .map_err(|e| anyhow!("extract: {e}"))?;
-
-    let n = MODEL_H * MODEL_W;
-    let mut mask = vec![0.0_f32; n];
-    match &out_shape[..] {
-        [1, 1, h, w] if *h as usize == MODEL_H && *w as usize == MODEL_W => {
-            for (i, &v) in data.iter().enumerate() {
-                mask[i] = v.clamp(0.0, 1.0);
-            }
-        }
-        other => {
-            return Err(anyhow!(
-                "unexpected binary output shape {:?}, want [1,1,{},{}]",
-                other,
-                MODEL_H,
-                MODEL_W
-            ));
-        }
-    }
-    Ok(Mask {
-        data: mask,
-        width: MODEL_W as u32,
-        height: MODEL_H as u32,
-    })
 }
 
 // -----------------------------------------------------------------------
@@ -293,9 +233,17 @@ const RVM_DOWNSAMPLE_RATIO: f32 = 0.50;
 
 pub struct RvmInner {
     session: Session,
-    /// Recurrent states from the previous frame — fed back as r1i…r4i on
-    /// the next call. Stored as `(shape, data)` per state, in order
-    /// `[r1, r2, r3, r4]`.
+    /// Initial-frame recurrent state: zeros at shape `[1, C, 1, 1]` per
+    /// state. Built once at construction, fed in on the first call after
+    /// `reset()`. RVM's graph accepts any spatial size for `r*i` and
+    /// broadcasts/upsamples internally.
+    initial_states: [(Vec<i64>, Vec<f32>); 4],
+    /// Recurrent state from the previous frame — reused across calls.
+    /// Set to `None` until the first frame runs (or after `reset()`),
+    /// in which case `initial_states` is fed instead. After the first
+    /// call, the four `(Vec<i64>, Vec<f32>)` buffers are kept across
+    /// frames and overwritten in place from each new output, so steady
+    /// state allocates nothing.
     prev_states: Option<[(Vec<i64>, Vec<f32>); 4]>,
     /// Reusable f32 input buffer in NCHW layout.
     input_buf: Vec<f32>,
@@ -306,6 +254,12 @@ impl RvmInner {
     fn new(onnx: &[u8]) -> Result<Self> {
         Ok(RvmInner {
             session: build_session(onnx)?,
+            initial_states: [
+                (vec![1, 16, 1, 1], vec![0.0; 16]),
+                (vec![1, 20, 1, 1], vec![0.0; 20]),
+                (vec![1, 40, 1, 1], vec![0.0; 40]),
+                (vec![1, 64, 1, 1], vec![0.0; 64]),
+            ],
             prev_states: None,
             input_buf: Vec::new(),
             last_dims: (0, 0),
@@ -346,23 +300,13 @@ impl RvmInner {
 
         // 2. Build inputs: src + 4 recurrent states + downsample_ratio scalar.
         // All input tensors borrow from buffers we own (`self.input_buf`,
-        // `self.prev_states` / `initial_states`, `ratio`) — no per-frame
-        // copies into the ORT runtime.
+        // `self.prev_states` / `self.initial_states`, `ratio`) — no
+        // per-frame copies into the ORT runtime.
         let src_shape: [i64; 4] = [1, 3, height as i64, width as i64];
         let src_value = TensorRef::from_array_view((src_shape, &self.input_buf[..]))
             .map_err(|e| anyhow!("ort Value src: {e}"))?;
 
-        // First-frame initial states: shape [1, C, 1, 1] of zeros for each
-        // recurrent input. RVM's graph accepts any spatial size for r*i —
-        // it broadcasts/upsamples internally as needed. After the first
-        // call we feed the previous outputs back at their native shapes.
-        let initial_states: [(Vec<i64>, Vec<f32>); 4] = [
-            (vec![1, 16, 1, 1], vec![0.0; 16]),
-            (vec![1, 20, 1, 1], vec![0.0; 20]),
-            (vec![1, 40, 1, 1], vec![0.0; 40]),
-            (vec![1, 64, 1, 1], vec![0.0; 64]),
-        ];
-        let states = self.prev_states.as_ref().unwrap_or(&initial_states);
+        let states = self.prev_states.as_ref().unwrap_or(&self.initial_states);
 
         let mut state_values = Vec::with_capacity(4);
         for (shape, data) in states {
@@ -412,17 +356,29 @@ impl RvmInner {
             }
         };
 
-        // 4. Capture next-frame recurrent states.
-        let mut next_states: [(Vec<i64>, Vec<f32>); 4] = Default::default();
+        // 4. Capture next-frame recurrent states. Reuses the existing
+        // `prev_states` buffers in place so steady-state inference does
+        // no per-frame allocation; on the very first frame (when
+        // `prev_states` is None) we seed from the initial-state shapes
+        // and let `resize` do a one-time grow.
+        let mut next = self
+            .prev_states
+            .take()
+            .unwrap_or_else(|| self.initial_states.clone());
         for (i, name) in ["r1o", "r2o", "r3o", "r4o"].iter().enumerate() {
             let (shape, data) = outputs
                 .get(*name)
                 .ok_or_else(|| anyhow!("rvm output `{name}` missing"))?
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow!("extract {name}: {e}"))?;
-            next_states[i] = (shape.iter().copied().collect(), data.to_vec());
+            next[i].0.clear();
+            next[i].0.extend(shape.iter().copied());
+            if next[i].1.len() != data.len() {
+                next[i].1.resize(data.len(), 0.0);
+            }
+            next[i].1.copy_from_slice(data);
         }
-        self.prev_states = Some(next_states);
+        self.prev_states = Some(next);
 
         Ok(Mask {
             data: mask,

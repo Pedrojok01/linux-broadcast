@@ -104,7 +104,7 @@ pub fn is_installed() -> bool {
 pub fn reconcile(desired: bool, exec_path: &Path) -> Result<()> {
     let on_disk = is_installed();
     match (desired, on_disk) {
-        (true, false) | (true, true) => install(exec_path),
+        (true, _) => install(exec_path),
         (false, true) => uninstall(),
         (false, false) => Ok(()),
     }

@@ -21,14 +21,11 @@ use gstreamer_app as gst_app;
 use lb_pipeline::pipeline::{SinkBuilder, SourceBuilder};
 use lb_pipeline::{Background, Command, Pipeline, PipelineConfig, PipelineState};
 
-// Empty model bytes — these tests only run with `Background::None`, so
-// the feeder short-circuits before invoking the segmenter. The
-// Segmenter::from_bytes call still happens at thread spawn (loads the
-// ONNX session), so we need real bytes there.
-//
-// To avoid a 450 KB blob in the test crate, we embed the same model the
-// app embeds. The path is workspace-relative.
-const MODEL_BINARY_ONNX: &[u8] = include_bytes!("../../../models/selfie_segmenter.onnx");
+// Real model bytes — these tests only run with `Background::None`, so
+// the feeder short-circuits before invoking the segmenter, but
+// Segmenter::from_bytes still runs at thread spawn (loads the ONNX
+// session) and needs valid bytes. We embed the same models the app
+// embeds; the path is workspace-relative.
 const MODEL_MULTICLASS_ONNX: &[u8] = include_bytes!("../../../models/selfie_multiclass.onnx");
 const MODEL_RVM_ONNX: &[u8] = include_bytes!("../../../models/rvm.onnx");
 
@@ -40,7 +37,7 @@ fn cfg() -> PipelineConfig {
         height: 240,
         framerate: 30,
         background: Background::None,
-        model: lb_pipeline::ModelKind::SelfieBinary,
+        model: lb_pipeline::ModelKind::SelfieMulticlass,
         preview_tx: None,
         framing: false,
     }
@@ -130,7 +127,6 @@ fn start_pipeline(cfg: PipelineConfig) -> (Pipeline, Arc<Mutex<Option<gst_app::A
     let captured = Arc::new(Mutex::new(None));
     let p = Pipeline::start_with_builders(
         cfg,
-        MODEL_BINARY_ONNX,
         MODEL_MULTICLASS_ONNX,
         MODEL_RVM_ONNX,
         synthetic_source(),
@@ -231,13 +227,8 @@ fn lazy_state_walks_idle_to_live_to_idle() {
     p.stop();
 }
 
-/// Regression for the shutdown path the GUI's `App::shutdown_cleanup`
-/// drives on Quit: stop() then drop, with no panic and no hang. Used to
-/// trigger NVIDIA's EGL Wayland abort when followed by eframe's GL
-/// teardown — that's now bypassed via `std::process::exit(0)` in
-/// `App::on_exit`, but the underlying pipeline shutdown sequence must
-/// itself stay clean. Repeated stop() calls must be idempotent because
-/// `Pipeline::stop` runs once, then `drop` re-asserts the same state.
+/// `stop()` then `drop()` must be clean and idempotent: `Pipeline::stop`
+/// runs explicitly on GUI Quit, then `drop` re-asserts the same teardown.
 #[test]
 fn shutdown_after_live_is_clean_and_idempotent() {
     let c = cfg();

@@ -76,9 +76,9 @@ fn install_desktop_file(data: &Path) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("linux-broadcast"));
 
     // Quote the Exec path. Per the XDG Desktop Entry spec, paths with
-    // spaces must be enclosed in double quotes; without this a dev build
-    // sitting under "Coding/Projets Perso/" gets truncated at the first
-    // space and the launcher fails with "Could not find the program".
+    // spaces must be enclosed in double quotes; without this a build
+    // living under any path containing a space gets truncated at the
+    // first space and the launcher fails with "Could not find the program".
     let exec_field = quote_exec(&exe);
 
     let want = format!(
@@ -109,9 +109,9 @@ fn install_desktop_file(data: &Path) -> Result<()> {
 }
 
 /// XDG Desktop Entry spec quoting for Exec=. Paths with spaces *must* be
-/// wrapped in double quotes; embedded `"`, `` ` ``, `$`, `\` need a
-/// preceding backslash. We also escape these inside un-quoted paths
-/// defensively, but in practice unix paths only need the space-handling.
+/// wrapped in double quotes; once quoted, embedded `"`, `` ` ``, `$`, `\`
+/// need a preceding backslash. Paths that don't need quoting are returned
+/// unmodified — in practice unix paths only need the space-handling.
 pub(crate) fn quote_exec(path: &Path) -> String {
     let s = path.to_string_lossy();
     let needs_quoting = s

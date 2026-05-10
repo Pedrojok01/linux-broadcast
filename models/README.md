@@ -1,16 +1,8 @@
 # Bundled segmentation models
 
-LinuxBroadcast embeds three ONNX models at compile time via `include_bytes!`
+LinuxBroadcast embeds two ONNX models at compile time via `include_bytes!`
 (see `crates/app/src/main.rs`). They ship inside the binary; no first-run
 download.
-
-## `selfie_segmenter.onnx`
-
-- **Task:** binary foreground / background segmentation, 256×256 input.
-- **Source:** [`onnx-community/mediapipe_selfie_segmentation`](https://huggingface.co/onnx-community/mediapipe_selfie_segmentation) on Hugging Face. Pre-converted to ONNX from MediaPipe's TFLite weights.
-- **Upstream:** [Google MediaPipe — Selfie Segmentation](https://developers.google.com/mediapipe/solutions/vision/image_segmenter).
-- **License:** Apache License 2.0 — see [`Apache-2.0-LICENSE.txt`](Apache-2.0-LICENSE.txt).
-- **SHA-256:** `3241ac4ad8aa35bdaf33946776db29f7c283a413aa0b0dacb9483594b4531aad`
 
 ## `selfie_multiclass.onnx`
 
@@ -30,10 +22,6 @@ download.
 ## Re-fetching
 
 ```bash
-# selfie_segmenter — pull the pre-converted ONNX from HF.
-curl -L -o models/selfie_segmenter.onnx \
-  https://huggingface.co/onnx-community/mediapipe_selfie_segmentation/resolve/main/onnx/model.onnx
-
 # selfie_multiclass — TFLite → ONNX via uv-managed Python.
 curl -L -o /tmp/selfie_multiclass.tflite \
   https://huggingface.co/yolain/selfie_multiclass_256x256/resolve/main/selfie_multiclass_256x256.tflite
