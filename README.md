@@ -2,8 +2,6 @@
 
 <img src="./packaging/LinuxBroadcast.png" width="96" height="96" alt="LinuxBroadcast logo" />
 
-<br><br>
-
 <h1><strong>LinuxBroadcast</strong></h1>
 
 <p>
@@ -16,6 +14,8 @@
   <img src="https://img.shields.io/badge/MSRV-1.88-orange.svg" alt="MSRV 1.88">
   <img src="https://img.shields.io/badge/platform-linux--x86__64-lightgrey" alt="Platform: Linux x86_64">
 </p>
+
+<img src="./assets/screenshot.png" alt="LinuxBroadcast running with a replaced background and the live preview pane" />
 
 </div>
 
@@ -44,8 +44,9 @@ flowchart LR
 
 - [Features](#features)
 - [Install & run](#install--run)
-  - [Option A — `.deb` (recommended)](#option-a--deb-recommended)
-  - [Option B — Build from source](#option-b--build-from-source)
+  - [Option A — `.deb` (Debian / Ubuntu / Mint)](#option-a--deb-debian--ubuntu--mint)
+  - [Option B — AUR (Arch / Manjaro / EndeavourOS)](#option-b--aur-arch--manjaro--endeavouros)
+  - [Option C — Build from source](#option-c--build-from-source)
   - [Start on login](#start-on-login)
   - [Lazy mode (camera on demand)](#lazy-mode-camera-on-demand)
 - [Using it](#using-it)
@@ -72,7 +73,7 @@ Out of scope: audio / microphone effects.
 
 ## Install & run
 
-### Option A — `.deb` (recommended)
+### Option A — `.deb` (Debian / Ubuntu / Mint)
 
 Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The package depends on `v4l2loopback-dkms (≥ 0.12.8)` and the GStreamer plugin set; everything else is statically baked into the binary.
 
@@ -90,7 +91,20 @@ That's it. Behind the scenes the package:
 
 Want it always running so Zoom / Meet / Signal / Firefox just see "LinuxBroadcast" in their camera list at every login? Open the GUI and flip **Start on login** in the sidebar — see [Start on login](#start-on-login) below.
 
-### Option B — Build from source
+### Option B — AUR (Arch / Manjaro / EndeavourOS)
+
+```bash
+# With an AUR helper:
+yay -S linux-broadcast-bin
+# or:
+paru -S linux-broadcast-bin
+```
+
+`linux-broadcast-bin` repackages the official `.deb` from GitHub Releases, so you get the same binary, the same `/etc/modprobe.d` + `/etc/modules-load.d` drop-ins, and the same desktop integration. The AUR `install` hook reloads `v4l2loopback` immediately after install (DKMS rebuild permitting) and refreshes the desktop / icon caches.
+
+The AUR dep on `v4l2loopback-dkms` will be resolved by your helper. If you'd rather use `v4l2loopback-dkms-git` or a kernel-specific `v4l2loopback-*` flavour, install it first and AUR will accept it as a `provides` match.
+
+### Option C — Build from source
 
 Use this when hacking on the code; the `.deb` is the right choice for everyday use.
 
@@ -185,7 +199,7 @@ Multiclass leaves plenty of headroom for 1080p; RVM at 1080p needs `downsample_r
 
 ## Troubleshooting
 
-- **`/dev/video10` doesn't appear.** With the `.deb`, this is handled automatically: the postinst does `modprobe -r` first to drop any stale module, then reloads it with the right params. For source builds, run those two commands by hand (see [step 2 above](#2-create-the-virtual-camera-device-development-only)).
+- **`/dev/video10` doesn't appear.** With the `.deb` or AUR package, this is handled automatically: the install hook does `modprobe -r` first to drop any stale module, then reloads it with the right params. For source builds, run those two commands by hand (see [step 2 above](#2-create-the-virtual-camera-device-development-only)).
 - **`/dev/video10` is "busy" or "not a video capture device".** That's `exclusive_caps=1` doing its job: the device only exposes CAPTURE while LinuxBroadcast is producing frames. Real apps see it; raw `ffplay` may not until the producer is running.
 - **`apt install v4l2loopback-dkms` fails on kernel 6.8+.** You have the broken 0.12.7 — install ≥ 0.12.8 from upstream or your distro backports.
 - **The window icon shows in the title bar but the taskbar entry stays generic on Wayland.** First launch installs `~/.local/share/icons/.../LinuxBroadcast.png` and a matching `.desktop` file; KDE may need `kbuildsycoca6 --noincremental` once or a re-login to refresh its sycoca cache.

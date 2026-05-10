@@ -1,0 +1,95 @@
+name: Publish to AUR
+
+# Runs after the Release workflow has published the .deb so we can pin
+# sha256sums against the actual asset. release publishes assets one-shot,
+# so by the time the `release` event fires the .deb is reachable.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.2). Defaults to the latest release."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Push linux-broadcast-bin to AUR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag="${DISPATCH_TAG:-$RELEASE_TAG}"
+          if [ -z "$tag" ]; then
+            echo "No tag resolved. Re-run with workflow_dispatch and provide one." >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for .deb asset to be reachable
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}_amd64.deb"
+          for attempt in $(seq 1 20); do
+            if curl -sfLI "$url" -o /dev/null; then
+              echo "Asset available: $url"
+              exit 0
+            fi
+            echo "Attempt $attempt: $url not ready yet, sleeping 15s..."
+            sleep 15
+          done
+          echo "Timed out waiting for $url" >&2
+          exit 1
+
+      - name: Pin pkgver and sha256 in PKGBUILD
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}_amd64.deb"
+          curl -sSfL "$url" -o /tmp/lb.deb
+          sum="$(sha256sum /tmp/lb.deb | awk '{print $1}')"
+
+          sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+          sed -i -E "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+          sed -i -E "s|^sha256sums=.*|sha256sums=('${sum}')|" packaging/aur/PKGBUILD
+
+          echo "----- PKGBUILD after substitutions -----"
+          cat packaging/aur/PKGBUILD
+
+      - name: Regenerate .SRCINFO
+        run: |
+          docker run --rm -v "$PWD/packaging/aur:/aur" archlinux:base-devel bash -c '
+            useradd -m builder
+            cp -r /aur/. /tmp/aur
+            chown -R builder /tmp/aur
+            su builder -c "cd /tmp/aur && makepkg --printsrcinfo" > /aur/.SRCINFO
+          '
+          echo "----- .SRCINFO after regeneration -----"
+          cat packaging/aur/.SRCINFO
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: linux-broadcast-bin
+          pkgbuild: packaging/aur/PKGBUILD
+          assets: |
+            packaging/aur/linux-broadcast.install
+          commit_username: Pedrojok01
+          commit_email: pedrojok@pm.me
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "linux-broadcast-bin ${{ steps.tag.outputs.version }}-1"
+          ssh_keyscan_types: rsa,ed25519,ecdsa
