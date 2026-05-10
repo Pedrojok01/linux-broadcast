@@ -317,10 +317,7 @@ impl Compositor {
         // moves both layers together — but Blur always needs it for the
         // blur, regardless of framing.
         let needs_plate = matches!(background, Background::Blur { .. })
-            || matches!(
-                (background, framing),
-                (Background::Image { .. }, Some(_))
-            );
+            || matches!((background, framing), (Background::Image { .. }, Some(_)));
         if needs_plate {
             self.materialize_plate(frame, width, height);
         }

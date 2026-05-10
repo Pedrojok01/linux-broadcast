@@ -90,12 +90,7 @@ pub(super) fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// Settings-section toggle row: title + subtitle on the left, pill
 /// switch on the right. Returns `true` on click so the caller can flip
 /// the underlying value and run any side effects.
-pub(super) fn toggle_row(
-    ui: &mut egui::Ui,
-    active: bool,
-    title: &str,
-    subtitle: &str,
-) -> bool {
+pub(super) fn toggle_row(ui: &mut egui::Ui, active: bool, title: &str, subtitle: &str) -> bool {
     let row_h = 36.0;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_h),

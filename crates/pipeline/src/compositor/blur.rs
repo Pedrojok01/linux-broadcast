@@ -58,8 +58,7 @@ fn blur_vertical(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
                 dst[y * stride + col + c] = round_u8(sum * inv_win);
                 let y_out = (y as isize - r as isize).clamp(0, max_y) as usize;
                 let y_in = (y as isize + r as isize + 1).clamp(0, max_y) as usize;
-                sum += src[y_in * stride + col + c] as f32
-                    - src[y_out * stride + col + c] as f32;
+                sum += src[y_in * stride + col + c] as f32 - src[y_out * stride + col + c] as f32;
             }
         }
         for y in 0..h {

@@ -528,8 +528,7 @@ impl Feeder {
                             // sitting near the edge — at the cap, src_x
                             // gets clamped instead and the user appears
                             // slightly off-centre but in frame.
-                            let dist_to_nearer_edge =
-                                raw_src_x.min(frame_w_f - raw_src_x).max(0.0);
+                            let dist_to_nearer_edge = raw_src_x.min(frame_w_f - raw_src_x).max(0.0);
                             let required_zoom = if dist_to_nearer_edge > 0.5 {
                                 center_x / dist_to_nearer_edge
                             } else {

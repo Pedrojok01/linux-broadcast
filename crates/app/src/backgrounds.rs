@@ -100,7 +100,7 @@ fn list_in(dir: &Path) -> Vec<LibraryEntry> {
             Some((LibraryEntry { path: p, label }, mtime))
         })
         .collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
     out.into_iter().map(|(e, _)| e).collect()
 }
 
