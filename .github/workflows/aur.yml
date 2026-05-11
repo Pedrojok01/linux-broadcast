@@ -1,17 +1,19 @@
-name: Publish to AUR
+name: Publish to AUR (manual)
 
-# Runs after the Release workflow has published the .deb so we can pin
-# sha256sums against the actual asset. release publishes assets one-shot,
-# so by the time the `release` event fires the .deb is reachable.
+# Manual safety valve. The normal AUR push happens as the `aur` job in
+# release.yml so it runs in the same workflow as the .deb build (events
+# fired by GITHUB_TOKEN don't trigger downstream workflows, which would
+# leave a `release: published` trigger here silently dead).
+#
+# Use this when you need to re-publish to AUR without re-tagging:
+#   gh workflow run aur.yml -f tag=v0.1.2
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.1.2). Defaults to the latest release."
-        required: false
+        description: "Tag to publish (e.g. v0.1.2). Required."
+        required: true
 
 permissions:
   contents: read
@@ -27,13 +29,8 @@ jobs:
         id: tag
         env:
           DISPATCH_TAG: ${{ inputs.tag }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          tag="${DISPATCH_TAG:-$RELEASE_TAG}"
-          if [ -z "$tag" ]; then
-            echo "No tag resolved. Re-run with workflow_dispatch and provide one." >&2
-            exit 1
-          fi
+          tag="${DISPATCH_TAG}"
           version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -42,7 +39,7 @@ jobs:
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}_amd64.deb"
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}-1_amd64.deb"
           for attempt in $(seq 1 20); do
             if curl -sfLI "$url" -o /dev/null; then
               echo "Asset available: $url"
@@ -59,7 +56,7 @@ jobs:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}_amd64.deb"
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}-1_amd64.deb"
           curl -sSfL "$url" -o /tmp/lb.deb
           sum="$(sha256sum /tmp/lb.deb | awk '{print $1}')"
 

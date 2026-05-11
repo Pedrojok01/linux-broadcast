@@ -212,6 +212,10 @@ crates/
   app/           # eframe/egui GUI, theme, config, background library
 models/          # bundled ONNX (multiclass / RVM)
 assets/fonts/    # Inter + JetBrains Mono
+packaging/
+  scripts/       # Debian postinst / prerm / postrm
+  aur/           # PKGBUILD, .SRCINFO, install hook for linux-broadcast-bin
+  *.desktop      # menu entry / icon / modprobe.d & modules-load.d conffiles
 DESIGN.md        # design tokens (colour, spacing, type) + rationale
 CLAUDE.md        # in-depth dev notes (pipeline, gotchas, model details)
 ```

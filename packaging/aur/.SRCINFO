@@ -19,7 +19,7 @@ pkgbase = linux-broadcast-bin
 	provides = linux-broadcast=0.1.2
 	conflicts = linux-broadcast
 	options = !strip
-	source = linux-broadcast-0.1.2.deb::https://github.com/Pedrojok01/linux-broadcast/releases/download/v0.1.2/linux-broadcast_0.1.2_amd64.deb
+	source = linux-broadcast-0.1.2.deb::https://github.com/Pedrojok01/linux-broadcast/releases/download/v0.1.2/linux-broadcast_0.1.2-1_amd64.deb
 	sha256sums = SKIP
 
 pkgname = linux-broadcast-bin

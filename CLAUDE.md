@@ -163,6 +163,30 @@ Maintainer scripts at `packaging/scripts/`:
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`: it checks the tag matches `[workspace.package].version`, runs `cargo deb`, and publishes a GitHub Release with auto-generated notes and the `.deb` attached.
 
+### Packaging (`packaging/aur/` — Arch / AUR)
+
+The `linux-broadcast-bin` AUR package repackages the GitHub Release `.deb` so Arch users get the same binary, conffiles, and desktop entry as Debian users.
+
+| File | Purpose |
+|---|---|
+| `packaging/aur/PKGBUILD` | `pkgname=linux-broadcast-bin`, `provides=("linux-broadcast=$pkgver")`, `conflicts=('linux-broadcast')`. `package()` extracts `data.tar.{zst,xz}` from the `.deb` into `$pkgdir` and relocates `usr/share/doc/$pkg/copyright` → `usr/share/licenses/$pkg/LICENSE` to match Arch's FHS. `options=('!strip')` because `cargo --release` already strips. |
+| `packaging/aur/linux-broadcast.install` | `post_install` / `post_upgrade` / `post_remove` hooks. Mirror `packaging/scripts/postinst` semantics: drop stale `v4l2loopback`, reload, refresh desktop / icon caches. |
+| `packaging/aur/.SRCINFO` | **Must be byte-identical to `makepkg --printsrcinfo` output** for the current PKGBUILD. The `aur-lint` workflow diffs them on PRs. Regenerate via the docker one-liner in that workflow's error message. |
+
+Two workflows automate the loop:
+
+- **`.github/workflows/aur-lint.yml`** (PR-time gate on `packaging/aur/**`): runs `makepkg --printsrcinfo` inside `archlinux:base-devel`, diffs against the committed `.SRCINFO`, runs `namcap` on the PKGBUILD and fails on `E:` lines (advisory `W:`/`I:` are surfaced but non-fatal).
+- **`release.yml`'s `aur` job** (`needs: deb`, runs on every `v*` tag push): waits up to ~5 min for the just-uploaded `.deb` URL to be reachable, downloads it, computes sha256, sed-rewrites `pkgver` + `sha256sums` in PKGBUILD, regenerates `.SRCINFO`, and pushes to AUR via `KSXGitHub/github-actions-deploy-aur` using the `AUR_SSH_KEY` repo secret (ed25519 private key registered on the AUR account).
+- **`.github/workflows/aur.yml`** is a `workflow_dispatch`-only safety valve (`gh workflow run aur.yml -f tag=v0.1.2`) for re-publishing to AUR without re-tagging.
+
+Non-obvious bits:
+
+- **AUR publishing lives in `release.yml`, not its own workflow.** Tried that first; `release: published` events fired by `GITHUB_TOKEN` don't trigger downstream workflows. Putting both jobs in the same workflow with `needs: deb` sidesteps the cross-workflow trigger entirely.
+- **`sha256sums=('SKIP')` is committed.** Real sums only exist at release time — the `.deb` doesn't exist when the PKGBUILD is edited, and pinning a stale sum would block the workflow's substitution. The lint workflow is fine with `SKIP`; namcap warns about it advisorily.
+- **`v4l2loopback-dkms` is an AUR dep itself.** Helpers (`yay`, `paru`) handle the transitive AUR install. Do not change to a non-AUR alias.
+- **AUR repo init is one-time, manual.** `KSXGitHub/...-deploy-aur` only updates an existing AUR repo. The first push (via `git clone ssh://aur@aur.archlinux.org/linux-broadcast-bin.git` + push) reserves the package name.
+- **AUR pushes are over SSH only**, IPv4-only on most consumer ISPs in practice. The CI runner doesn't care; for local pushes set `Host aur.archlinux.org / AddressFamily inet` in `~/.ssh/config`.
+
 ### Adding a new background mode
 
 1. Add a variant to `Background` in `compositor.rs`.

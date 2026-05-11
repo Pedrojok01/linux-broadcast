@@ -71,3 +71,67 @@ jobs:
         with:
           files: target/debian/*.deb
           generate_release_notes: true
+
+  aur:
+    name: Publish linux-broadcast-bin to AUR
+    needs: deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for .deb asset to be reachable
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}-1_amd64.deb"
+          for attempt in $(seq 1 20); do
+            if curl -sfLI "$url" -o /dev/null; then
+              echo "Asset available: $url"
+              exit 0
+            fi
+            echo "Attempt $attempt: $url not ready yet, sleeping 15s..."
+            sleep 15
+          done
+          echo "Timed out waiting for $url" >&2
+          exit 1
+
+      - name: Pin pkgver and sha256 in PKGBUILD
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast_${VERSION}-1_amd64.deb"
+          curl -sSfL "$url" -o /tmp/lb.deb
+          sum="$(sha256sum /tmp/lb.deb | awk '{print $1}')"
+
+          sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+          sed -i -E "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+          sed -i -E "s|^sha256sums=.*|sha256sums=('${sum}')|" packaging/aur/PKGBUILD
+
+      - name: Regenerate .SRCINFO
+        run: |
+          docker run --rm -v "$PWD/packaging/aur:/aur" archlinux:base-devel bash -c '
+            useradd -m builder
+            cp -r /aur/. /tmp/aur
+            chown -R builder /tmp/aur
+            su builder -c "cd /tmp/aur && makepkg --printsrcinfo" > /aur/.SRCINFO
+          '
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: linux-broadcast-bin
+          pkgbuild: packaging/aur/PKGBUILD
+          assets: |
+            packaging/aur/linux-broadcast.install
+          commit_username: Pedrojok01
+          commit_email: pedrojok@pm.me
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "linux-broadcast-bin ${{ steps.ver.outputs.version }}-1"
+          ssh_keyscan_types: rsa,ed25519,ecdsa
