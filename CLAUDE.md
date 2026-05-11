@@ -34,9 +34,13 @@ LB_DUMP_ICON=1 cargo run --release -p linux-broadcast
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
-# Build a local .deb (target/debian/linux-broadcast_<ver>_amd64.deb).
+# Build a local .deb (target/debian/linux-broadcast_<ver>-1_amd64.deb).
 cargo install cargo-deb   # one-time
 cargo deb -p linux-broadcast
+
+# Cut a release. Bumps Cargo.toml + path-dep + Cargo.lock, runs CI
+# checks, commits, tags. --push to send to origin and let CI ship.
+scripts/release.sh 0.1.3 --push
 
 # Verify the virtual cam from another terminal (only works while the
 # pipeline is running — exclusive_caps=1 hides /dev/video10 otherwise).
@@ -176,8 +180,8 @@ The `linux-broadcast-bin` AUR package repackages the GitHub Release `.deb` so Ar
 Two workflows automate the loop:
 
 - **`.github/workflows/aur-lint.yml`** (PR-time gate on `packaging/aur/**`): runs `makepkg --printsrcinfo` inside `archlinux:base-devel`, diffs against the committed `.SRCINFO`, runs `namcap` on the PKGBUILD and fails on `E:` lines (advisory `W:`/`I:` are surfaced but non-fatal).
-- **`release.yml`'s `aur` job** (`needs: deb`, runs on every `v*` tag push): waits up to ~5 min for the just-uploaded `.deb` URL to be reachable, downloads it, computes sha256, sed-rewrites `pkgver` + `sha256sums` in PKGBUILD, regenerates `.SRCINFO`, and pushes to AUR via `KSXGitHub/github-actions-deploy-aur` using the `AUR_SSH_KEY` repo secret (ed25519 private key registered on the AUR account).
-- **`.github/workflows/aur.yml`** is a `workflow_dispatch`-only safety valve (`gh workflow run aur.yml -f tag=v0.1.2`) for re-publishing to AUR without re-tagging.
+- **`release.yml`'s `aur` job** (`needs: deb`, runs on every `v*` tag push): waits up to ~5 min for the just-uploaded `.deb` URL to be reachable, downloads it, computes sha256, sed-rewrites `pkgver` + `sha256sums` in PKGBUILD, regenerates `.SRCINFO`, and pushes to AUR using `ssh-keyscan` + `git push` directly (the `AUR_SSH_KEY` repo secret is the ed25519 private key registered on the AUR account).
+- **`.github/workflows/aur.yml`** is a `workflow_dispatch`-only safety valve (`gh workflow run aur.yml -f tag=v0.1.2`) for re-publishing to AUR without re-tagging. Uses the same inline ssh + git push as the release job.
 
 Non-obvious bits:
 

@@ -78,15 +78,40 @@ jobs:
           echo "----- .SRCINFO after regeneration -----"
           cat packaging/aur/.SRCINFO
 
-      - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
-        with:
-          pkgname: linux-broadcast-bin
-          pkgbuild: packaging/aur/PKGBUILD
-          assets: |
-            packaging/aur/linux-broadcast.install
-          commit_username: Pedrojok01
-          commit_email: pedrojok@pm.me
-          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "linux-broadcast-bin ${{ steps.tag.outputs.version }}-1"
-          ssh_keyscan_types: rsa,ed25519,ecdsa
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -4 -t rsa,ed25519,ecdsa aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+              User aur
+              IdentityFile ~/.ssh/aur_key
+              IdentitiesOnly yes
+              AddressFamily inet
+          EOF
+          chmod 600 ~/.ssh/config
+
+          git clone ssh://aur@aur.archlinux.org/linux-broadcast-bin.git /tmp/aur-repo
+          cp packaging/aur/PKGBUILD          /tmp/aur-repo/PKGBUILD
+          cp packaging/aur/.SRCINFO          /tmp/aur-repo/.SRCINFO
+          cp packaging/aur/linux-broadcast.install /tmp/aur-repo/linux-broadcast.install
+
+          cd /tmp/aur-repo
+          git config user.name "Pedrojok01"
+          git config user.email "pedrojok@pm.me"
+          git add PKGBUILD .SRCINFO linux-broadcast.install
+
+          if git diff --cached --quiet; then
+            echo "No AUR-side changes — already at $VERSION-1."
+            exit 0
+          fi
+          git commit -m "linux-broadcast-bin ${VERSION}-1"
+          git push origin master
