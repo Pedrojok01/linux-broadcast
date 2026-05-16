@@ -49,11 +49,10 @@ const HEAD_TOP_ROW_FRACTION: f32 = 0.02;
 /// keeps the framing from feeling completely flat.
 pub const FG_ZOOM: f32 = 1.03;
 /// Maximum zoom factor allowed when adaptive zoom kicks in to recentre
-/// an off-centre user. Past ~1.2× the wall starts visibly zooming and
-/// segmentation edges / pixelation become noticeable. Users
-/// significantly past this offset get clamped (appear off-centre but
-/// still in frame) rather than zoom even further.
-pub const FG_ZOOM_MAX: f32 = 1.20;
+/// an off-centre user. Sized to keep the visible portrait crop modest:
+/// users who sit further off than this cap can compensate appear
+/// off-centre (still fully in frame) rather than trigger a tighter zoom.
+pub const FG_ZOOM_MAX: f32 = 1.10;
 /// Where the silhouette's top edge should land in the output frame, as
 /// a fraction of frame height. Small enough to feel like a tight
 /// portrait crop, large enough that mask noise above the head doesn't

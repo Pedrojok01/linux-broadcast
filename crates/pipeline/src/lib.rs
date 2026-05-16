@@ -31,6 +31,7 @@
 pub mod compositor;
 pub mod consumer_watch;
 pub mod framing;
+mod idle_loader;
 pub mod lazy;
 pub mod pipeline;
 pub mod segmenter;

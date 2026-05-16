@@ -36,6 +36,7 @@ use gstreamer_app as gst_app;
 use crate::compositor::{Background, Compositor, Framing};
 use crate::consumer_watch::Consumer;
 use crate::framing::{AnchorLock, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
+use crate::idle_loader::IdleLoader;
 use crate::pipeline::{
     Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
     log_negotiated_input,
@@ -58,12 +59,12 @@ pub(crate) const DEACTIVATION_DEBOUNCE: Duration = Duration::from_millis(3_000);
 /// state machine to feel responsive without burning power.
 const IDLE_TICK: Duration = Duration::from_millis(100);
 
-/// While Idle (camera released), the feeder still pushes a still-frame
-/// to the sink at this rate so any consumer that opens `/dev/video10`
-/// sees a steady stream. Picked to be slow enough that the memcpy cost
-/// is negligible, fast enough that no WebRTC consumer trips its
-/// "no frames" timeout (typically 1–3 s).
-const IDLE_PUSH_INTERVAL: Duration = Duration::from_millis(200);
+/// While Idle (camera released), the feeder still pushes a frame to the
+/// sink at this rate so consumers always see motion. ~10 Hz keeps the
+/// 8-segment rotating spinner readable (~0.8 s per revolution) without
+/// approaching Live-mode throughput; one tick lag at 100 ms still beats
+/// any WebRTC consumer's "no frames" timeout (typically 1–3 s).
+const IDLE_PUSH_INTERVAL: Duration = Duration::from_millis(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
@@ -145,6 +146,8 @@ pub(crate) fn spawn_feeder(
     )
     .context("load segmentation model")?;
 
+    let idle_loader = IdleLoader::new(cfg.width, cfg.height);
+
     let cfg_for_thread = cfg.clone();
     let handle = std::thread::Builder::new()
         .name("lb-feeder".into())
@@ -174,6 +177,7 @@ pub(crate) fn spawn_feeder(
                 start_failure_count: 0,
                 start_failure_backoff_until: None,
                 last_published_pids: HashSet::new(),
+                idle_loader,
                 idle_frame: None,
                 last_idle_push: None,
             };
@@ -232,14 +236,14 @@ struct Feeder {
     /// PIDs included in the most recent `state_pub` write. Used to skip
     /// redundant publishes when nothing the GUI cares about has changed.
     last_published_pids: HashSet<u32>,
-    /// Last successfully composited frame. Re-pushed at `IDLE_PUSH_INTERVAL`
-    /// while the lazy state is not Live, so consumers of `/dev/video10`
-    /// always see *something* instead of an empty stream — making the
-    /// virtual cam robust against portal-mediated consumers our `/proc`
-    /// watcher can't observe (PipeWire-backed Slack / Chromium / …).
-    /// `None` only on the very first tick, before any composite has run;
-    /// `pump_idle_frame` falls back to a freshly-built black RGBA frame
-    /// in that case.
+    /// Procedural drawer for the Idle-state frame. Produces a dark
+    /// background + LinuxBroadcast logo + rotating spinner directly
+    /// into `idle_frame` on every tick — replaces the historical
+    /// "re-push last live frame" path, which leaked the previous
+    /// call's image into the next session.
+    idle_loader: IdleLoader,
+    /// Scratch buffer the idle loader renders into. Owned across pushes
+    /// so we keep one heap allocation instead of one per tick.
     idle_frame: Option<Vec<u8>>,
     /// Last time `pump_idle_frame` actually pushed a buffer. Used to
     /// throttle to `IDLE_PUSH_INTERVAL` regardless of how often the
@@ -384,6 +388,9 @@ impl Feeder {
             self.smoother.reset();
             self.anchor_lock.reset();
             self.compositor.reset_bg_plate();
+            // The next pump_idle_frame tick will overwrite idle_frame
+            // with a fresh loader render, wiping the last-call image.
+            self.last_idle_push = None;
         }
 
         let prev = self.state;
@@ -617,23 +624,20 @@ impl Feeder {
             );
         }
 
-        // Save the freshly composited frame so the Idle path can keep
-        // re-pushing it after the camera is released. Doing this *after*
-        // push_to_sink avoids paying the clone cost when the push fails
-        // (e.g. sink in the middle of a state change).
+        // Reset the idle-push throttle so the next tick after we drop
+        // out of Live re-pushes the loader immediately — no visible gap
+        // on the consumer side.
         if pushed {
-            self.idle_frame = Some(frame_rgba);
-            // Reset the idle-push throttle so the very next tick after
-            // we drop out of Live re-pushes immediately — no visible
-            // gap on the consumer side.
             self.last_idle_push = None;
         }
     }
 
-    /// Push a still-frame to the sink while the lazy state is not Live.
-    /// Throttled to `IDLE_PUSH_INTERVAL`. Uses the last live composite
-    /// when available, falls back to a freshly-built black RGBA frame
-    /// (cached in `self.idle_frame` so subsequent ticks reuse it).
+    /// Render the next loader frame (dark bg + logo + rotating spinner)
+    /// and push it to the sink. Throttled to `IDLE_PUSH_INTERVAL` so a
+    /// fast idle tick doesn't burn CPU. The output is also forwarded to
+    /// the GUI preview channel so the preview pane mirrors what
+    /// `/dev/video10` consumers see, instead of sitting on its own
+    /// "no frames yet" placeholder.
     fn pump_idle_frame(&mut self) {
         let now = Instant::now();
         if let Some(last) = self.last_idle_push
@@ -642,19 +646,22 @@ impl Feeder {
             return;
         }
 
-        if self.idle_frame.is_none() {
-            let pixels = (self.cfg.width as usize) * (self.cfg.height as usize);
-            let mut black = Vec::with_capacity(pixels * 4);
-            for _ in 0..pixels {
-                black.extend_from_slice(&[0, 0, 0, 255]);
-            }
-            self.idle_frame = Some(black);
+        // Take the scratch buffer out, render into it, push, put it
+        // back — keeps one heap allocation across pushes while still
+        // letting `push_to_sink` borrow `&mut self`.
+        let mut frame = self.idle_frame.take().unwrap_or_default();
+        self.idle_loader.render(&mut frame);
+
+        if self.preview_enabled
+            && let Some(tx) = &self.preview_tx
+        {
+            let _ = tx.try_send(PreviewFrame {
+                width: self.cfg.width,
+                height: self.cfg.height,
+                rgba: frame.clone(),
+            });
         }
 
-        // Take the buffer out, push, put it back. Avoids cloning the
-        // ~3.7 MB Vec every tick while still letting `push_to_sink`
-        // borrow `&mut self`.
-        let frame = self.idle_frame.take().expect("idle_frame just populated");
         let _ = self.push_to_sink(&frame);
         self.idle_frame = Some(frame);
         self.last_idle_push = Some(now);

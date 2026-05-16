@@ -2351,6 +2351,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
+ "image",
  "log",
  "ort",
  "proptest",

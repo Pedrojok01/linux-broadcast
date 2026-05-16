@@ -28,6 +28,7 @@ crossbeam-channel.workspace = true
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+image.workspace = true
 
 [lints]
 workspace = true
