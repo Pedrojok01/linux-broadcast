@@ -46,12 +46,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::activation::{ActivationEvent, EguiWaker};
 use crate::autostart;
 use crate::backgrounds::{self, LibraryEntry};
 use crate::cameras::{CameraEntry, enumerate};
 use crate::config::{Config, Mode};
 use crate::theme::{self, color};
 use crate::tray::{Tray, TrayEvent};
+use crate::wayland_activation::{self, WaylandHandleSlot, WaylandHandles};
 use crate::{MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX};
 
 const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 850.0];
@@ -107,7 +109,12 @@ fn is_minimized(ctx: &egui::Context) -> bool {
 /// tray's Quit menu actually exits. This lets a single instance own
 /// `/dev/video10` for the whole session, addressing the "I autostarted
 /// it on login and now have no way to stop it" pain point.
-pub fn run(headless: bool) -> Result<()> {
+pub fn run(
+    headless: bool,
+    activation_rx: Receiver<ActivationEvent>,
+    waker: EguiWaker,
+    wayland_handles: WaylandHandleSlot,
+) -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size(INITIAL_WINDOW_SIZE)
         .with_min_inner_size(MIN_WINDOW_SIZE)
@@ -130,7 +137,21 @@ pub fn run(headless: bool) -> Result<()> {
         opts,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc, headless)))
+            // Publish the egui context to the shared waker before any
+            // activation or tray event can fire. `set` only succeeds
+            // once; subsequent App::new invocations (would only happen
+            // if eframe ever recreates the app, which it currently
+            // doesn't) silently ignore — the slot is shared across the
+            // process. Both the D-Bus handler and the tray menu handler
+            // read it to nudge this loop out of idle.
+            let _ = waker.set(cc.egui_ctx.clone());
+            Ok(Box::new(App::new(
+                cc,
+                headless,
+                activation_rx,
+                waker,
+                wayland_handles,
+            )))
         }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
@@ -221,10 +242,31 @@ pub(super) struct App {
     /// `None` before the first send. Used to edge-trigger so we don't
     /// flood the command channel every frame.
     last_gui_preview_active: Option<bool>,
+    /// Activation events from the D-Bus service in `activation.rs`. A
+    /// second `linux-broadcast` launch fires `Activate`, which lands here
+    /// and triggers the same `set_visible(true)` path as the tray's Show
+    /// menu. Disconnected silently when D-Bus is unavailable — drained
+    /// every frame either way, the absent sender just means no events.
+    activation_rx: Receiver<ActivationEvent>,
+    /// Shared cache of winit's raw `wl_display` / `wl_surface` pointers
+    /// for the D-Bus thread's direct xdg-activation path. Populated
+    /// from the first frame of `update()` once `eframe::Frame` is
+    /// available. `None` on X11.
+    wayland_handles: WaylandHandleSlot,
+    /// Cleared after the first frame populates the Wayland slot — keeps
+    /// `update()` from re-running the (cheap but pointless) capture
+    /// every tick.
+    wayland_capture_pending: bool,
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>, headless: bool) -> Self {
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        headless: bool,
+        activation_rx: Receiver<ActivationEvent>,
+        waker: EguiWaker,
+        wayland_handles: WaylandHandleSlot,
+    ) -> Self {
         let cfg = Config::load();
         // Bring the on-disk autostart entry in line with the saved
         // preference. Cheap to call, no-op when in sync.
@@ -236,7 +278,7 @@ impl App {
         let cameras = enumerate(&cfg.sink_device);
         let library = backgrounds::list();
 
-        let tray = match Tray::install() {
+        let tray = match Tray::install(waker) {
             Ok(t) => Some(t),
             Err(e) => {
                 log::warn!("tray icon install failed: {e:#} — Quit only via menu inside the GUI");
@@ -278,6 +320,9 @@ impl App {
             force_unhide_on_first_frame,
             headless_minimize_pending,
             last_gui_preview_active: None,
+            activation_rx,
+            wayland_handles,
+            wayland_capture_pending: true,
         };
 
         // Always start the pipeline at launch — both GUI and headless.
@@ -445,7 +490,19 @@ impl App {
     /// close-button intercept, the preview heartbeat. Returns whether
     /// the window is currently minimized — the caller uses that to skip
     /// the rest of the layout for this frame.
-    fn handle_lifecycle(&mut self, ctx: &egui::Context) -> bool {
+    fn handle_lifecycle(&mut self, ctx: &egui::Context, frame: &eframe::Frame) -> bool {
+        // First frame: cache winit's raw Wayland handles so the D-Bus
+        // activation thread can apply tokens without waiting for the
+        // egui loop to wake. No-op on X11.
+        if self.wayland_capture_pending {
+            if let Some(h) = WaylandHandles::capture(frame, frame)
+                && self.wayland_handles.set(h).is_ok()
+            {
+                log::info!("cached Wayland handles for direct xdg-activation");
+            }
+            self.wayland_capture_pending = false;
+        }
+
         // 0a. One-shot: headless cold start. `with_visible(false)` on the
         //     ViewportBuilder is best-effort on Wayland; explicitly send
         //     `Minimized(true)` from the first frame so the compositor
@@ -471,6 +528,13 @@ impl App {
         // 1. Tray events first — they may toggle visibility or quit, and
         //    we want both effects applied before we lay out a frame.
         self.handle_tray_events(ctx);
+
+        // 1b. D-Bus activation: a second `linux-broadcast` launch
+        //     (.desktop click, terminal relaunch) fires `Activate`,
+        //     which lands here and reuses the tray's Show path. Drained
+        //     even when the channel's sender is gone — try_iter is a
+        //     no-op in that case.
+        self.handle_activation_events(ctx, frame);
 
         // 2. Close-button intercept: turn the close request into a hide
         //    unless `quit_requested` is set (i.e. the tray's Quit just
@@ -514,6 +578,51 @@ impl App {
                 }
             }
         }
+    }
+
+    fn handle_activation_events(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // Coalesce: any number of Activate events in a single frame are
+        // equivalent to one. Keep the latest non-empty token — a newer
+        // token is more likely to still be valid for the compositor.
+        let mut got = false;
+        let mut latest_token: Option<String> = None;
+        while let Ok(evt) = self.activation_rx.try_recv() {
+            got = true;
+            let ActivationEvent::Activate { token } = evt;
+            if token.is_some() {
+                latest_token = token;
+            }
+        }
+        if !got {
+            return;
+        }
+
+        // On Wayland, feed the token to the compositor through
+        // xdg-activation-v1 *before* the toolkit-level focus commands.
+        // Without this step, set_minimized(false) + Focus are dropped
+        // for focus-stealing prevention — see wayland_activation.rs.
+        // No-op on X11 / when no token came along / when the
+        // compositor doesn't speak xdg-activation-v1.
+        if let Some(token) = &latest_token {
+            match wayland_activation::apply_token(frame, frame, token) {
+                Ok(true) => log::info!("applied xdg-activation token ({} chars)", token.len()),
+                Ok(false) => log::info!("xdg-activation skipped: not a Wayland session"),
+                Err(e) => log::warn!("xdg-activation apply failed: {e:#}"),
+            }
+        } else {
+            log::info!("activation requested without token — toolkit-level fallback only");
+        }
+
+        self.set_visible(ctx, true);
+
+        // Belt-and-braces for compositors that still don't surface the
+        // window (token expired, no xdg-activation support, etc.): ask
+        // for the urgency / attention hint so the taskbar entry
+        // highlights and the user can click it manually.
+        ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Critical,
+        ));
+        ctx.request_repaint();
     }
 
     /// Idempotent visibility request. Doesn't track local state — every
@@ -565,8 +674,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let minimized = self.handle_lifecycle(ctx);
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let minimized = self.handle_lifecycle(ctx, frame);
 
         // While minimized, skip layout entirely. eframe's repaint
         // request keeps the loop ticking so tray events still land.

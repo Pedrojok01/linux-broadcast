@@ -2456,12 +2456,18 @@ dependencies = [
  "gtk",
  "image",
  "lb-pipeline",
+ "libc",
  "log",
+ "raw-window-handle",
  "rfd",
  "serde",
  "tempfile",
  "toml 0.8.2",
  "tray-icon",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "zbus",
 ]
 
 [[package]]

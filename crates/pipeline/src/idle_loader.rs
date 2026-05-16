@@ -10,10 +10,10 @@
 //! participants.
 
 const BG: [u8; 4] = [0x10, 0x14, 0x18, 0xFF];
-const PANEL: [u8; 4] = [0x0E, 0x11, 0x16, 0xFF];
-const STROKE: [u8; 4] = [0x2A, 0x31, 0x3B, 0xFF];
-const FRAME: [u8; 4] = [0xE6, 0xEA, 0xF0, 0xFF];
-const ACCENT: [u8; 4] = [0x5B, 0xD4, 0xC0, 0xFF];
+const PANEL: [u8; 3] = [0x0E, 0x11, 0x16];
+const STROKE: [u8; 3] = [0x2A, 0x31, 0x3B];
+const FRAME: [u8; 3] = [0xE6, 0xEA, 0xF0];
+const ACCENT: [u8; 3] = [0x5B, 0xD4, 0xC0];
 const DOT: [u8; 3] = [0xC8, 0xCF, 0xD8];
 
 /// Stateful procedural drawer for the Idle-state still. Keeps a scratch
@@ -151,12 +151,25 @@ fn fill_solid(buf: &mut [u8], _w: u32, c: [u8; 4]) {
     }
 }
 
-fn put(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, c: [u8; 4]) {
-    if x < 0 || y < 0 || x as u32 >= w || y as u32 >= h {
+/// Alpha-blend a single RGB color over a pixel with coverage in
+/// `[0, 1]`. Skips when out of bounds or coverage is zero.
+fn blend(buf: &mut [u8], w: u32, h: u32, x: i32, y: i32, color: [u8; 3], coverage: f32) {
+    if x < 0 || y < 0 || x as u32 >= w || y as u32 >= h || coverage <= 0.0 {
         return;
     }
+    let a = coverage.clamp(0.0, 1.0);
+    let inv = 1.0 - a;
     let i = ((y as u32 * w + x as u32) * 4) as usize;
-    buf[i..i + 4].copy_from_slice(&c);
+    buf[i] = (buf[i] as f32 * inv + color[0] as f32 * a) as u8;
+    buf[i + 1] = (buf[i + 1] as f32 * inv + color[1] as f32 * a) as u8;
+    buf[i + 2] = (buf[i + 2] as f32 * inv + color[2] as f32 * a) as u8;
+}
+
+/// Convert a signed distance to the shape boundary into edge coverage.
+/// Negative `d` is inside; positive is outside. A 1-px wide AA band
+/// centred on the boundary keeps the visual edge crisp at any size.
+fn aa_coverage(signed_distance: f32) -> f32 {
+    (0.5 - signed_distance).clamp(0.0, 1.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -169,17 +182,18 @@ fn fill_rounded_rect(
     rw: f32,
     rh: f32,
     r: f32,
-    c: [u8; 4],
+    c: [u8; 3],
 ) {
-    let x0 = x as i32;
-    let y0 = y as i32;
-    let x1 = (x + rw) as i32;
-    let y1 = (y + rh) as i32;
-    for py in y0..y1 {
-        for px in x0..x1 {
-            if inside_rounded(px as f32 + 0.5, py as f32 + 0.5, x, y, rw, rh, r) {
-                put(buf, w, h, px, py, c);
-            }
+    // Pad the iteration box by 1 px so the AA band on the outside of the
+    // boundary is sampled.
+    let x0 = (x - 1.0).floor() as i32;
+    let y0 = (y - 1.0).floor() as i32;
+    let x1 = (x + rw + 1.0).ceil() as i32;
+    let y1 = (y + rh + 1.0).ceil() as i32;
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let d = signed_dist_rounded(px as f32 + 0.5, py as f32 + 0.5, x, y, rw, rh, r);
+            blend(buf, w, h, px, py, c, aa_coverage(d));
         }
     }
 }
@@ -195,44 +209,30 @@ fn stroke_rounded_rect(
     rh: f32,
     r: f32,
     weight: f32,
-    c: [u8; 4],
+    c: [u8; 3],
 ) {
-    let x0 = (x - weight) as i32;
-    let y0 = (y - weight) as i32;
-    let x1 = (x + rw + weight) as i32;
-    let y1 = (y + rh + weight) as i32;
     let half = weight * 0.5;
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let cx = px as f32 + 0.5;
-            let cy = py as f32 + 0.5;
-            let d = signed_dist_rounded(cx, cy, x, y, rw, rh, r);
-            if d.abs() <= half {
-                put(buf, w, h, px, py, c);
-            }
+    let x0 = (x - weight - 1.0).floor() as i32;
+    let y0 = (y - weight - 1.0).floor() as i32;
+    let x1 = (x + rw + weight + 1.0).ceil() as i32;
+    let y1 = (y + rh + weight + 1.0).ceil() as i32;
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let d = signed_dist_rounded(px as f32 + 0.5, py as f32 + 0.5, x, y, rw, rh, r);
+            // Distance from the centre of the stroke band; coverage is
+            // 1 inside the band and falls off with a 1-px AA edge.
+            blend(buf, w, h, px, py, c, aa_coverage(d.abs() - half));
         }
     }
 }
 
-fn fill_circle(buf: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, r: f32, c: [u8; 4]) {
-    let x0 = (cx - r - 1.0) as i32;
-    let y0 = (cy - r - 1.0) as i32;
-    let x1 = (cx + r + 1.0) as i32;
-    let y1 = (cy + r + 1.0) as i32;
-    for py in y0..=y1 {
-        for px in x0..=x1 {
-            let dx = px as f32 + 0.5 - cx;
-            let dy = py as f32 + 0.5 - cy;
-            if dx * dx + dy * dy <= r * r {
-                put(buf, w, h, px, py, c);
-            }
-        }
-    }
+fn fill_circle(buf: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, r: f32, c: [u8; 3]) {
+    fill_circle_aa(buf, w, h, cx, cy, r, c, 1.0);
 }
 
 /// Anti-aliased filled circle with separate opacity. Blends `color`
-/// (RGB) over the underlying pixel using `opacity ∈ [0,1]` and a 1-px
-/// edge smoothing band, so dots read cleanly at small radii.
+/// over the underlying pixel using `opacity ∈ [0,1]` and a 1-px AA
+/// edge so dots read cleanly at small radii.
 #[allow(clippy::too_many_arguments)]
 fn fill_circle_aa(
     buf: &mut [u8],
@@ -250,42 +250,12 @@ fn fill_circle_aa(
     let y1 = (cy + r + 1.0).ceil() as i32;
     for py in y0..=y1 {
         for px in x0..=x1 {
-            if px < 0 || py < 0 || px as u32 >= w || py as u32 >= h {
-                continue;
-            }
             let dx = px as f32 + 0.5 - cx;
             let dy = py as f32 + 0.5 - cy;
             let d = (dx * dx + dy * dy).sqrt();
-            // Smooth edge over a 1-px band centred on r.
-            let edge = (r - d + 0.5).clamp(0.0, 1.0);
-            if edge <= 0.0 {
-                continue;
-            }
-            let a = opacity * edge;
-            let i = ((py as u32 * w + px as u32) * 4) as usize;
-            let inv = 1.0 - a;
-            buf[i] = (buf[i] as f32 * inv + color[0] as f32 * a) as u8;
-            buf[i + 1] = (buf[i + 1] as f32 * inv + color[1] as f32 * a) as u8;
-            buf[i + 2] = (buf[i + 2] as f32 * inv + color[2] as f32 * a) as u8;
+            blend(buf, w, h, px, py, color, opacity * aa_coverage(d - r));
         }
     }
-}
-
-fn inside_rounded(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> bool {
-    if px < x || px > x + w || py < y || py > y + h {
-        return false;
-    }
-    if px >= x + r && px <= x + w - r {
-        return true;
-    }
-    if py >= y + r && py <= y + h - r {
-        return true;
-    }
-    let cx = px.clamp(x + r, x + w - r);
-    let cy = py.clamp(y + r, y + h - r);
-    let dx = px - cx;
-    let dy = py - cy;
-    dx * dx + dy * dy <= r * r
 }
 
 fn signed_dist_rounded(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {

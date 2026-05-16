@@ -39,6 +39,30 @@ fs2 = "0.4"
 tray-icon = "0.22"
 gtk = "0.18"
 
+# D-Bus activation: the running instance owns a well-known name on the
+# session bus and serves the freedesktop `org.freedesktop.Application`
+# interface; a second launch sends `Activate` to raise the existing
+# window instead of silently exiting on the flock. Blocking API only —
+# zbus 5 hosts its own internal worker so we don't pull in tokio.
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
+
+# Wayland xdg-activation-v1 client. Pinned to the same versions winit /
+# eframe already pull in so we don't double-link libwayland. The
+# `client_system` feature on `wayland-backend` is what enables
+# `Backend::from_foreign_display` — we share winit's existing wl_display
+# rather than opening a second connection. Used only on the Wayland
+# session path, no-op on X11.
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# libc::_exit for the tray-Quit watchdog. We need to bypass atexit
+# handlers because gstreamer / glib install ones that block on pipeline
+# drain — fine on graceful shutdown, fatal on a force-exit from a
+# stuck egui loop.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 
