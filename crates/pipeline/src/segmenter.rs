@@ -43,6 +43,7 @@ pub enum ModelKind {
 /// A segmentation mask with its native resolution. Variants of `Segmenter`
 /// may return masks at different sizes — RVM at frame size, multiclass at
 /// 256×256 — so callers must respect `width`/`height`.
+#[derive(Clone)]
 pub struct Mask {
     pub data: Vec<f32>,
     pub width: u32,

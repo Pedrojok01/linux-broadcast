@@ -28,7 +28,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, select, tick};
+use crossbeam_channel::{Receiver, Sender, select};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -41,7 +41,8 @@ use crate::pipeline::{
     Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
     log_negotiated_input,
 };
-use crate::segmenter::{ModelKind, Segmenter};
+use crate::profile::Profiler;
+use crate::segmenter::{Mask, ModelKind, Segmenter};
 use crate::temporal::{DEFAULT_ALPHA, MaskSmoother, RVM_ALPHA};
 
 /// How long a consumer must remain present before we light the camera.
@@ -148,6 +149,18 @@ pub(crate) fn spawn_feeder(
 
     let idle_loader = IdleLoader::new(cfg.width, cfg.height);
 
+    // Inference cadence: run segmentation once every N Live ticks and
+    // reuse the cached mask on the skipped ticks. 1 = infer every frame
+    // (full quality, RVM-bound output FPS). 2 = infer every other frame
+    // (~half the inference cost, output FPS bound by composite instead;
+    // mask lags the frame by up to one tick during motion). Clamped to
+    // ≥1. Overridable at runtime via `LB_INFER_INTERVAL`.
+    let infer_interval = std::env::var("LB_INFER_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+
     let cfg_for_thread = cfg.clone();
     let handle = std::thread::Builder::new()
         .name("lb-feeder".into())
@@ -180,6 +193,11 @@ pub(crate) fn spawn_feeder(
                 idle_loader,
                 idle_frame: None,
                 last_idle_push: None,
+                infer_interval,
+                infer_tick: 0,
+                cached_mask: None,
+                cached_framing: None,
+                profiler: Profiler::new(infer_interval),
             };
             feeder.run(cmd_rx, watcher_rx, stop_flag);
         })
@@ -249,6 +267,21 @@ struct Feeder {
     /// throttle to `IDLE_PUSH_INTERVAL` regardless of how often the
     /// outer select wakes up.
     last_idle_push: Option<Instant>,
+    /// Run segmentation once every `infer_interval` Live ticks; reuse the
+    /// cached mask on the rest. 1 = infer every frame.
+    infer_interval: u64,
+    /// Live-tick counter driving the inference cadence. Reset on every
+    /// Live exit so each engagement re-infers on its first frame.
+    infer_tick: u64,
+    /// Most recent smoothed mask, reused on ticks that skip inference.
+    /// `None` until the first inference of a Live engagement (and after
+    /// every Live exit), which forces an inference regardless of cadence.
+    cached_mask: Option<Mask>,
+    /// Auto-frame transform that accompanied `cached_mask`, reused on the
+    /// same skipped ticks so framing stays consistent with the mask.
+    cached_framing: Option<Framing>,
+    /// Per-stage timing, active only under `LB_PROFILE`.
+    profiler: Profiler,
 }
 
 impl Feeder {
@@ -258,15 +291,22 @@ impl Feeder {
         watcher_rx: Receiver<Vec<Consumer>>,
         stop_flag: Arc<AtomicBool>,
     ) {
-        // Idle ticker — fires regularly so the state machine wakes even
-        // when no commands or consumer events arrive (we still need to
-        // observe debounce windows expiring).
-        let idler = tick(IDLE_TICK);
-
         while !stop_flag.load(Ordering::Relaxed) {
-            // 1. Multiplex control inputs without blocking on any one
-            //    channel for too long — we want to come back and pump
-            //    frames from the source appsink quickly when Live.
+            // 1. Multiplex control inputs. The parking time depends on
+            //    state: while Live we must NOT sleep here — `pump_one_frame`
+            //    blocks on the source appsink's `try_pull_sample`, which is
+            //    our real pace-maker (≈ camera framerate). Parking the full
+            //    `IDLE_TICK` between Live frames would cap output at
+            //    `1000/IDLE_TICK` fps (10 fps) regardless of how fast the
+            //    segment/composite stages run. While not Live there are no
+            //    frames to pull, so we park for one tick to stay responsive
+            //    to control/watcher events and observe debounce expiry
+            //    without spinning.
+            let park = if matches!(self.state, State::Live) {
+                Duration::ZERO
+            } else {
+                IDLE_TICK
+            };
             select! {
                 recv(cmd_rx) -> msg => match msg {
                     Ok(Command::Stop) => return self.shutdown(),
@@ -282,7 +322,7 @@ impl Feeder {
                         log::warn!("consumer watcher disconnected");
                     }
                 },
-                recv(idler) -> _ => {}
+                default(park) => {}
             }
 
             // 2. Step the state machine. Transitions may build / drop
@@ -318,6 +358,9 @@ impl Feeder {
                     // the live bbox instead of panning from a stale rect.
                     self.anchor_lock.reset();
                 }
+                // Drop the cached framing either way so skipped-inference
+                // ticks don't keep applying a stale crop after the toggle.
+                self.cached_framing = None;
             }
             Command::Stop => unreachable!("handled in run()"),
         }
@@ -388,6 +431,12 @@ impl Feeder {
             self.smoother.reset();
             self.anchor_lock.reset();
             self.compositor.reset_bg_plate();
+            // Drop the inference cache so the next engagement re-infers on
+            // its first frame instead of compositing a mask from the last
+            // call against a fresh, unrelated scene.
+            self.cached_mask = None;
+            self.cached_framing = None;
+            self.infer_tick = 0;
             // The next pump_idle_frame tick will overwrite idle_frame
             // with a fresh loader render, wiping the last-call image.
             self.last_idle_push = None;
@@ -478,11 +527,72 @@ impl Feeder {
         self.last_published_pids = pids_now;
     }
 
+    /// Compute the auto-frame transform from a freshly segmented mask.
+    /// Returns `None` when framing is off or `AnchorLock` hasn't engaged
+    /// yet. Pulled out of `pump_one_frame` so the cached-mask path can
+    /// recompute framing only when inference actually runs.
+    fn compute_framing(&mut self, mask: &Mask) -> Option<Framing> {
+        if !self.framing_enabled {
+            return None;
+        }
+        let frame_w_f = self.cfg.width as f32;
+        let frame_h_f = self.cfg.height as f32;
+        let frame_idx = self.frame_idx;
+        let framerate = self.cfg.framerate as u64;
+        self.anchor_lock.update(mask).map(|anchor| {
+            let center_x = frame_w_f * 0.5;
+            let raw_src_x = anchor.cx_norm * frame_w_f;
+
+            // Adaptive zoom: pick the smallest zoom that both meets the
+            // FG_ZOOM minimum and keeps the recentred crop window strictly
+            // inside [0, frame_w]. Centred user → 1.05×; off-centre user →
+            // bumps just enough to recentre cleanly. Capped at FG_ZOOM_MAX
+            // so the wall doesn't visibly zoom for users sitting near the
+            // edge — at the cap, src_x gets clamped instead and the user
+            // appears slightly off-centre but in frame.
+            let dist_to_nearer_edge = raw_src_x.min(frame_w_f - raw_src_x).max(0.0);
+            let required_zoom = if dist_to_nearer_edge > 0.5 {
+                center_x / dist_to_nearer_edge
+            } else {
+                FG_ZOOM_MAX
+            };
+            let zoom = required_zoom.clamp(FG_ZOOM, FG_ZOOM_MAX);
+            let half_crop_w = center_x / zoom;
+            let src_x = raw_src_x.clamp(half_crop_w, frame_w_f - half_crop_w);
+
+            // Vertical: place head at TOP_HEADROOM, but never higher than
+            // what's needed to keep the source bottom mapped to (at least)
+            // the output bottom. Uses the dynamic zoom so the headroom math
+            // agrees with the horizontal crop sizing.
+            let src_y = anchor.top_y_norm * frame_h_f;
+            let min_dst_y = frame_h_f - (frame_h_f - src_y) * zoom;
+            let dst_y = (frame_h_f * TOP_HEADROOM).max(min_dst_y);
+
+            let f = Framing {
+                src_anchor_x: src_x,
+                src_anchor_y: src_y,
+                dst_anchor_x: center_x,
+                dst_anchor_y: dst_y,
+                zoom,
+            };
+            if frame_idx == 1 || frame_idx.is_multiple_of(framerate * 2) {
+                log::debug!(
+                    "auto-frame: cx={:.3} top_y={:.3} zoom={:.2}",
+                    anchor.cx_norm,
+                    anchor.top_y_norm,
+                    f.zoom,
+                );
+            }
+            f
+        })
+    }
+
     /// Pull one sample from the source appsink (with a short timeout),
-    /// run segmentation + composite, push the result into the sink
-    /// appsrc, and stash a copy as the new idle still-frame. No-op if
-    /// the pull times out (camera lag).
+    /// produce a mask (segment or reuse the cache per `infer_interval`),
+    /// composite, and push the result into the sink appsrc. No-op if the
+    /// pull times out (camera lag).
     fn pump_one_frame(&mut self) {
+        let t_start = Instant::now();
         let appsink = match self.source.as_ref() {
             Some((_, s)) => s.clone(),
             None => return,
@@ -502,105 +612,74 @@ impl Feeder {
         };
 
         let mut frame_rgba = map.as_slice().to_vec();
+        drop(map);
         let frame_w = self.cfg.width;
         let frame_h = self.cfg.height;
         let bg = self.background.clone();
+        let t_pull = t_start.elapsed();
+
+        let mut segment_dur: Option<Duration> = None;
+        let t_comp_start;
 
         // Segmentation runs whenever there's bg work to do (any non-None
         // bg) OR auto-frame needs the silhouette anchor (any mode). In
-        // `Background::None + framing` the compositor crops the raw
-        // camera frame around the locked centroid — the mask is only
-        // there so `AnchorLock` has something to lock onto.
+        // `Background::None + framing` the compositor crops the raw camera
+        // frame around the locked centroid — the mask is only there so
+        // `AnchorLock` has something to lock onto.
         if !matches!(bg, Background::None) || self.framing_enabled {
-            match self
-                .segmenter
-                .segment(&frame_rgba, frame_w as usize, frame_h as usize)
-            {
-                Ok(mut mask) => {
-                    self.smoother.smooth(&mut mask.data);
-                    let framing = if self.framing_enabled {
-                        self.anchor_lock.update(&mask).map(|anchor| {
-                            let frame_w_f = frame_w as f32;
-                            let frame_h_f = frame_h as f32;
-                            let center_x = frame_w_f * 0.5;
-                            let raw_src_x = anchor.cx_norm * frame_w_f;
+            // Infer on a 1-in-N cadence; the first frame of an engagement
+            // (cache empty) always infers regardless of the interval.
+            let do_infer =
+                self.cached_mask.is_none() || self.infer_tick.is_multiple_of(self.infer_interval);
+            self.infer_tick = self.infer_tick.wrapping_add(1);
 
-                            // Adaptive zoom: pick the smallest zoom that
-                            // both meets the FG_ZOOM minimum and keeps
-                            // the recentred crop window strictly inside
-                            // [0, frame_w]. Centred user → 1.05×;
-                            // off-centre user → bumps just enough to
-                            // recentre cleanly. Capped at FG_ZOOM_MAX so
-                            // the wall doesn't visibly zoom for users
-                            // sitting near the edge — at the cap, src_x
-                            // gets clamped instead and the user appears
-                            // slightly off-centre but in frame.
-                            let dist_to_nearer_edge = raw_src_x.min(frame_w_f - raw_src_x).max(0.0);
-                            let required_zoom = if dist_to_nearer_edge > 0.5 {
-                                center_x / dist_to_nearer_edge
-                            } else {
-                                FG_ZOOM_MAX
-                            };
-                            let zoom = required_zoom.clamp(FG_ZOOM, FG_ZOOM_MAX);
-                            let half_crop_w = center_x / zoom;
-                            let src_x = raw_src_x.clamp(half_crop_w, frame_w_f - half_crop_w);
-
-                            // Vertical: place head at TOP_HEADROOM, but
-                            // never higher than what's needed to keep the
-                            // source bottom mapped to (at least) the
-                            // output bottom. Uses the dynamic zoom so the
-                            // headroom math agrees with the horizontal
-                            // crop sizing.
-                            let src_y = anchor.top_y_norm * frame_h_f;
-                            let min_dst_y = frame_h_f - (frame_h_f - src_y) * zoom;
-                            let dst_y = (frame_h_f * TOP_HEADROOM).max(min_dst_y);
-
-                            let f = Framing {
-                                src_anchor_x: src_x,
-                                src_anchor_y: src_y,
-                                dst_anchor_x: center_x,
-                                dst_anchor_y: dst_y,
-                                zoom,
-                            };
-                            if self.frame_idx == 1
-                                || self.frame_idx.is_multiple_of(self.cfg.framerate as u64 * 2)
-                            {
-                                log::debug!(
-                                    "auto-frame: cx={:.3} top_y={:.3} zoom={:.2}",
-                                    anchor.cx_norm,
-                                    anchor.top_y_norm,
-                                    f.zoom,
-                                );
-                            }
-                            f
-                        })
-                    } else {
-                        None
-                    };
-                    if let Err(e) = self.compositor.composite(
-                        &mut frame_rgba,
-                        frame_w,
-                        frame_h,
-                        &mask,
-                        &bg,
-                        framing,
-                    ) {
-                        log::error!("composite: {e:#}");
+            if do_infer {
+                let t_seg = Instant::now();
+                match self
+                    .segmenter
+                    .segment(&frame_rgba, frame_w as usize, frame_h as usize)
+                {
+                    Ok(mut mask) => {
+                        self.smoother.smooth(&mut mask.data);
+                        segment_dur = Some(t_seg.elapsed());
+                        self.cached_framing = self.compute_framing(&mask);
+                        self.cached_mask = Some(mask);
+                    }
+                    Err(e) => {
+                        log::error!("segment: {e:#}");
                         return;
                     }
                 }
-                Err(e) => {
-                    log::error!("segment: {e:#}");
+            }
+
+            // Composite the fresh camera frame against the latest mask —
+            // on skipped ticks that mask is up to `infer_interval - 1`
+            // frames old, so the foreground moves at full FPS while the
+            // silhouette edge lags slightly during motion.
+            t_comp_start = Instant::now();
+            if let Some(mask) = self.cached_mask.as_ref() {
+                let framing = self.cached_framing;
+                if let Err(e) =
+                    self.compositor
+                        .composite(&mut frame_rgba, frame_w, frame_h, mask, &bg, framing)
+                {
+                    log::error!("composite: {e:#}");
                     return;
                 }
             }
         } else {
-            // Pure passthrough: keep recurrent state clean for the next
-            // non-trivial engagement.
+            // Pure passthrough: keep recurrent state clean and drop the
+            // cache so the next non-trivial engagement re-infers at once.
             self.smoother.reset();
             self.segmenter.reset();
+            self.cached_mask = None;
+            self.cached_framing = None;
+            self.infer_tick = 0;
+            t_comp_start = Instant::now();
         }
+        let t_composite = t_comp_start.elapsed();
 
+        let t_push_start = Instant::now();
         if self.preview_enabled
             && let Some(tx) = &self.preview_tx
         {
@@ -613,6 +692,7 @@ impl Feeder {
         }
 
         let pushed = self.push_to_sink(&frame_rgba);
+        let t_push = t_push_start.elapsed();
         if pushed
             && (self.frame_idx == 1 || self.frame_idx.is_multiple_of(self.cfg.framerate as u64))
         {
@@ -630,6 +710,9 @@ impl Feeder {
         if pushed {
             self.last_idle_push = None;
         }
+
+        self.profiler
+            .record(t_pull, segment_dur, t_composite, t_push, t_start.elapsed());
     }
 
     /// Render the next loader frame (dark bg + logo + rotating spinner)

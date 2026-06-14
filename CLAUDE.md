@@ -46,6 +46,15 @@ scripts/release.sh 0.1.3 --push
 # pipeline is running — exclusive_caps=1 hides /dev/video10 otherwise).
 ffplay -fflags nobuffer -f v4l2 -input_format yuyv422 \
   -video_size 1280x720 /dev/video10
+
+# Profiling / throughput. LB_PROFILE=1 prints per-stage feeder timings
+# (pull / segment / composite / push + effective FPS) to stderr while
+# Live. LB_INFER_INTERVAL=N runs segmentation once every N Live frames
+# and reuses the cached mask on the rest (default 1 = every frame; 2 ≈
+# half the inference cost for a ~1-frame mask lag during motion).
+# crates/pipeline/examples/bench.rs is a headless harness for both; see
+# PERF_RESULTS.md for the methodology and numbers.
+LB_PROFILE=1 LB_INFER_INTERVAL=2 cargo run --release -p linux-broadcast
 ```
 
 System dev packages are listed in [README §Build from source](README.md#option-b--build-from-source). Pin `v4l2loopback-dkms ≥ 0.12.8` — 0.12.7 fails to build on kernel 6.8+.

@@ -34,6 +34,7 @@ pub mod framing;
 mod idle_loader;
 pub mod lazy;
 pub mod pipeline;
+mod profile;
 pub mod segmenter;
 pub mod temporal;
 
