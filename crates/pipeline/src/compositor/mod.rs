@@ -88,6 +88,11 @@ pub const BLUR_MAX_RADIUS: usize = 32;
 /// Radius (px) at and above which the second blur pass kicks in to push
 /// the box-kernel output closer to a Gaussian.
 const BLUR_TWO_PASS_THRESHOLD: usize = 8;
+/// Linear shrink factor for the blur. The plate is downscaled by this on
+/// each axis before blurring and upscaled back after — a background blur
+/// is low-frequency, so the result is visually identical at ~`N²` less
+/// blur work. The blur radius is scaled down to match.
+const BLUR_DOWNSCALE: usize = 4;
 
 /// Affine remap describing the auto-frame transform. The same field set
 /// drives two different paths inside [`Compositor::composite`]:
@@ -189,15 +194,20 @@ pub struct Compositor {
     /// `B_estimate` for alpha decontamination in `asymmetric_blend` and
     /// as the input to the box blur in `Background::Blur`.
     plate_materialized: Vec<u8>,
-    /// Background plane for `Background::Blur`: starts as a copy of
-    /// `plate_materialized`, then box-blurred in place. Reused across
-    /// frames to dodge a 1280×720×4 = 3.6 MB allocation per tick.
+    /// Frame-resolution background plane for `Background::Blur`: the
+    /// upscaled result of blurring `blur_small`. Reused across frames to
+    /// dodge a 1280×720×4 = 3.6 MB allocation per tick.
     blur_out: Vec<u8>,
-    /// Scratch buffer used as the intermediate for the separable box
-    /// blur (horizontal pass writes here, vertical pass reads from it).
-    blur_tmp: Vec<u8>,
-    /// Long-running estimate of the room behind the user. Updated
-    /// every non-`None` composite. See `BgPlate`.
+    /// Downscaled plate the blur actually runs on. A background blur is
+    /// low-frequency, so blurring a `BLUR_DOWNSCALE`-shrunk copy and
+    /// upscaling is visually identical to blurring at full resolution for
+    /// a fraction of the work. `blur_small_tmp` is the separable-pass
+    /// intermediate at the same reduced size.
+    blur_small: Vec<u8>,
+    blur_small_tmp: Vec<u8>,
+    /// Long-running estimate of the room behind the user. Updated only on
+    /// composites that consume it (Blur, or Image with framing). See
+    /// `BgPlate`.
     plate: BgPlate,
 }
 
@@ -214,7 +224,8 @@ impl Compositor {
             composite_scratch: Vec::new(),
             plate_materialized: Vec::new(),
             blur_out: Vec::new(),
-            blur_tmp: Vec::new(),
+            blur_small: Vec::new(),
+            blur_small_tmp: Vec::new(),
             plate: BgPlate::new(),
         }
     }
@@ -302,23 +313,18 @@ impl Compositor {
 
         self.prepare_mask(mask, width, height)?;
 
-        // Fold this frame into the temporal background plate. Done for
-        // every non-None path so switching modes finds a primed plate
-        // instead of a cold start. Cost is one O(N) pass; trivial next
-        // to segmentation.
-        self.plate
-            .update(frame, &self.upsampled_mask, width, height);
-
-        // Materialize the plate first whenever the frame will need it.
-        // Blur always consumes it as the blur input. Image+framing
-        // consumes it as the `B_estimate` for alpha decontamination
-        // (Image+no-framing doesn't need it). Blur+framing no longer
-        // needs the plate for decontamination — the post-composite crop
-        // moves both layers together — but Blur always needs it for the
-        // blur, regardless of framing.
+        // The temporal plate is only consumed by Blur (as the blur input)
+        // and Image+framing (as the `B_estimate` for alpha
+        // decontamination). Image without framing never touches it, so we
+        // skip both the per-frame O(N) plate update and its
+        // materialization there. Switching into a plate-consuming mode
+        // re-primes the plate over the next ~1-2 s via the existing
+        // cold-start fallback.
         let needs_plate = matches!(background, Background::Blur { .. })
             || matches!((background, framing), (Background::Image { .. }, Some(_)));
         if needs_plate {
+            self.plate
+                .update(frame, &self.upsampled_mask, width, height);
             self.materialize_plate(frame, width, height);
         }
 
@@ -420,30 +426,70 @@ impl Compositor {
         }
     }
 
-    /// Build the bg plane for `Background::Blur` into `self.blur_out`:
-    /// copy the materialized plate (caller must have populated it),
-    /// then run a one- or two-pass separable box blur over it.
+    /// Build the bg plane for `Background::Blur` into `self.blur_out`.
+    ///
+    /// The materialized plate (caller must have populated it) is
+    /// downscaled by `BLUR_DOWNSCALE`, box-blurred at the reduced size
+    /// (radius scaled to match), then upscaled back to frame resolution.
+    /// A blur is low-frequency so this is visually identical to a
+    /// full-resolution blur at a fraction of the cost.
     fn run_blur(&mut self, width: u32, height: u32, strength: f32) {
         let w = width as usize;
         let h = height as usize;
         let n = (w * h) * 4;
 
         self.blur_out.resize(n, 0);
-        self.blur_tmp.resize(n, 0);
         debug_assert_eq!(self.plate_materialized.len(), n);
-        self.blur_out.copy_from_slice(&self.plate_materialized);
 
         let s = strength.clamp(0.0, 1.0);
         let span = (BLUR_MAX_RADIUS - BLUR_MIN_RADIUS) as f32;
         let radius = (BLUR_MIN_RADIUS as f32 + s * span).round() as usize;
         if radius == 0 {
+            self.blur_out.copy_from_slice(&self.plate_materialized);
             return;
         }
 
-        box_blur_rgba(&mut self.blur_out, &mut self.blur_tmp, w, h, radius);
+        let sw = (w / BLUR_DOWNSCALE).max(1);
+        let sh = (h / BLUR_DOWNSCALE).max(1);
+        let sn = sw * sh * 4;
+        self.blur_small.resize(sn, 0);
+        self.blur_small_tmp.resize(sn, 0);
+        let r = (radius / BLUR_DOWNSCALE).max(1);
+
+        // Disjoint borrows of the buffers + the shared resizer.
+        let Self {
+            resizer,
+            plate_materialized,
+            blur_small,
+            blur_small_tmp,
+            blur_out,
+            ..
+        } = self;
+
+        // Downscale the plate into blur_small.
+        let src = ImageRef::new(width, height, plate_materialized.as_slice(), fr::PixelType::U8x4)
+            .expect("blur downscale src");
+        let mut dst =
+            Image::from_slice_u8(sw as u32, sh as u32, blur_small.as_mut_slice(), fr::PixelType::U8x4)
+                .expect("blur downscale dst");
+        resizer
+            .resize(&src, &mut dst, &Self::resize_opts())
+            .expect("blur downscale");
+
+        // Blur at the reduced size (cheap), one or two passes.
+        box_blur_rgba(blur_small, blur_small_tmp, sw, sh, r);
         if radius >= BLUR_TWO_PASS_THRESHOLD {
-            box_blur_rgba(&mut self.blur_out, &mut self.blur_tmp, w, h, radius);
+            box_blur_rgba(blur_small, blur_small_tmp, sw, sh, r);
         }
+
+        // Upscale the blurred small plate back to frame resolution.
+        let src = ImageRef::new(sw as u32, sh as u32, blur_small.as_slice(), fr::PixelType::U8x4)
+            .expect("blur upscale src");
+        let mut dst = Image::from_slice_u8(width, height, blur_out.as_mut_slice(), fr::PixelType::U8x4)
+            .expect("blur upscale dst");
+        resizer
+            .resize(&src, &mut dst, &Self::resize_opts())
+            .expect("blur upscale");
     }
 
     /// Make sure `self.upsampled_mask` holds the mask at frame resolution.
