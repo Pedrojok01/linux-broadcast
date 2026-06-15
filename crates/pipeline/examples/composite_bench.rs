@@ -54,6 +54,7 @@ fn synth_mask(w: usize, h: usize) -> Mask {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench(
     label: &str,
     comp: &mut Compositor,
