@@ -25,10 +25,16 @@ fast_image_resize.workspace = true
 
 crossbeam-channel.workspace = true
 
+[features]
+# Optional NVIDIA GPU acceleration via ort's CUDA execution provider.
+# Off by default — default builds stay pure-CPU with no extra runtime deps.
+cuda = ["ort/cuda"]
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
 image.workspace = true
+env_logger.workspace = true
 
 [lints]
 workspace = true

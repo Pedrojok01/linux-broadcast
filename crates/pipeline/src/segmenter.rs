@@ -113,14 +113,39 @@ impl MpInner {
 }
 
 fn build_session(onnx: &[u8]) -> Result<Session> {
-    Session::builder()
+    let mut builder = Session::builder()
         .map_err(|e| anyhow!("ort Session::builder: {e}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| anyhow!("set optimization level: {e}"))?
         .with_intra_threads(num_threads())
-        .map_err(|e| anyhow!("set intra threads: {e}"))?
+        .map_err(|e| anyhow!("set intra threads: {e}"))?;
+
+    #[cfg(feature = "cuda")]
+    register_cuda(&mut builder);
+
+    builder
         .commit_from_memory(onnx)
         .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))
+}
+
+/// Best-effort CUDA execution-provider registration.
+///
+/// ONNX Runtime silently falls back to CPU if the EP cannot register (no
+/// GPU, missing CUDA/cuDNN runtime), so this never fails the build. The
+/// explicit `register` path is used only to log which EP is active.
+/// `LB_FORCE_CPU=1` skips registration to A/B against CPU on the same binary.
+#[cfg(feature = "cuda")]
+fn register_cuda(builder: &mut ort::session::builder::SessionBuilder) {
+    use ort::ep::{self, ExecutionProvider};
+
+    if std::env::var_os("LB_FORCE_CPU").is_some() {
+        log::info!("LB_FORCE_CPU set — ONNX Runtime using CPU execution provider");
+        return;
+    }
+    match ep::CUDA::default().register(builder) {
+        Ok(()) => log::info!("ONNX Runtime: CUDA execution provider registered"),
+        Err(e) => log::warn!("ONNX Runtime: CUDA EP registration failed ({e}); using CPU"),
+    }
 }
 
 fn resize_opts() -> ResizeOptions {
