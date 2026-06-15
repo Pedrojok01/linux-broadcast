@@ -27,3 +27,4 @@ __pycache__/
 .cursor/
 .agents/
 .codex/
+docs/**/*

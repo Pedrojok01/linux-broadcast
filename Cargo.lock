@@ -2347,6 +2347,7 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "env_logger",
  "fast_image_resize",
  "gstreamer",
  "gstreamer-app",

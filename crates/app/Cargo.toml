@@ -67,6 +67,11 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # stuck egui loop.
 libc = "0.2"
 
+[features]
+# Re-export the pipeline's CUDA feature so `cargo build -p linux-broadcast
+# --features cuda` produces a GPU-capable binary.
+cuda = ["lb-pipeline/cuda"]
+
 [dev-dependencies]
 tempfile = "3"
 
