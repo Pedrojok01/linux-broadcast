@@ -116,12 +116,12 @@ sudo apt install -y \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libxkbcommon-dev libwayland-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
+  libgtk-3-dev libayatana-appindicator3-dev \
   v4l2loopback-dkms \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
-The `libgtk-3-dev` / `libxdo-dev` / `libayatana-appindicator3-dev` trio is pulled in by the `tray-icon` crate at build time; at runtime only `libayatana-appindicator3-1` is required (already declared in the `.deb`'s `Depends`).
+The `libgtk-3-dev` / `libayatana-appindicator3-dev` pair is pulled in by the `tray-icon` crate at build time; at runtime only `libayatana-appindicator3-1` is required (already declared in the `.deb`'s `Depends`).
 
 #### 2. Create the virtual camera device (development only)
 
