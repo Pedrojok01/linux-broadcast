@@ -226,14 +226,23 @@ The pipeline is **always running** while LinuxBroadcast is open — there's no S
 
 ## Performance
 
-Reference numbers on a **Logitech C920 + single x86 core, 1280×720**:
+Reference numbers on **1280×720, Logitech C920**. CPU = one x86 core; GPU = NVIDIA RTX 4060 Ti via the optional [`cuda`](#gpu-acceleration-optional-nvidia) feature (measured with RVM, the default model).
 
-| Model | Inference / frame | Throughput |
+**Segmentation (inference) per frame:**
+
+| Model | CPU | GPU |
 |---|---|---|
-| Selfie multiclass | ~10 ms | 30 fps (camera-bound) |
-| RVM (`downsample_ratio=0.5`) | ~40–60 ms | ~15 fps |
+| Selfie multiclass (256×256) | ~10 ms | — |
+| RVM (`downsample_ratio=0.5`) | ~40–60 ms | ~12 ms |
 
-Multiclass leaves plenty of headroom for 1080p; RVM at 1080p needs `downsample_ratio=0.25` (set in `crates/pipeline/src/segmenter.rs`).
+**End-to-end throughput (RVM):**
+
+| Background mode | CPU | GPU |
+|---|---|---|
+| Virtual background | ~15 fps | 30 fps (camera-bound) |
+| Blur | ~13 fps | 30 fps (camera-bound) |
+
+Composite is CPU-side either way: ~2 ms for a virtual background, ~10 ms for blur (a downscaled-plate blur, down from ~40 ms). On GPU, segmentation drops ~5× (~64 → ~12 ms) and frees a CPU core, so both modes clear the camera's 30 fps ceiling. Multiclass leaves room for 1080p; RVM at 1080p needs `downsample_ratio=0.25` (in `crates/pipeline/src/segmenter.rs`).
 
 ## Troubleshooting
 
