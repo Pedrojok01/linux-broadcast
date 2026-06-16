@@ -42,7 +42,7 @@ use crate::pipeline::{
     log_negotiated_input,
 };
 use crate::profile::Profiler;
-use crate::segmenter::{Mask, ModelKind, Segmenter};
+use crate::segmenter::{Backend, Mask, ModelKind, Segmenter};
 use crate::temporal::{DEFAULT_ALPHA, MaskSmoother, RVM_ALPHA};
 
 /// How long a consumer must remain present before we light the camera.
@@ -137,7 +137,7 @@ pub(crate) fn spawn_feeder(
     state_pub: Arc<Mutex<PipelineState>>,
     stop_flag: Arc<AtomicBool>,
     source_builder: SourceBuilder,
-) -> Result<std::thread::JoinHandle<()>> {
+) -> Result<(std::thread::JoinHandle<()>, Backend)> {
     let segmenter = Segmenter::from_bytes(
         cfg.model,
         match cfg.model {
@@ -146,6 +146,7 @@ pub(crate) fn spawn_feeder(
         },
     )
     .context("load segmentation model")?;
+    let backend = segmenter.backend();
 
     let idle_loader = IdleLoader::new(cfg.width, cfg.height);
 
@@ -202,7 +203,7 @@ pub(crate) fn spawn_feeder(
             feeder.run(cmd_rx, watcher_rx, stop_flag);
         })
         .context("spawn lb-feeder")?;
-    Ok(handle)
+    Ok((handle, backend))
 }
 
 struct Feeder {

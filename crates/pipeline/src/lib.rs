@@ -41,7 +41,7 @@ pub mod temporal;
 pub use compositor::{Background, Compositor};
 pub use consumer_watch::Consumer;
 pub use pipeline::{Command, Pipeline, PipelineConfig, PipelineState, PreviewFrame};
-pub use segmenter::{Mask, ModelKind, Segmenter};
+pub use segmenter::{Backend, Mask, ModelKind, Segmenter};
 
 /// Native input resolution of the MediaPipe Selfie Multiclass model
 /// (256×256). RVM does not use these constants — its mask is emitted at

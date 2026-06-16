@@ -29,6 +29,14 @@ use ort::value::TensorRef;
 
 use crate::{MODEL_H, MODEL_W};
 
+/// Which execution backend a built session ended up using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
 /// Which segmentation model the pipeline should run with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelKind {
@@ -52,16 +60,18 @@ pub struct Mask {
 
 /// Public segmenter — internal implementation switches on `ModelKind`.
 pub enum Segmenter {
-    Multiclass(MpInner),
-    // Boxed because `RvmInner` carries the four recurrent-state buffers
-    // and is significantly larger than `MpInner`. Heap allocation cost
-    // is paid once at construction; per-frame dispatch is unchanged.
+    Multiclass(Box<MpInner>),
+    // Both inners are boxed: `RvmInner` carries the four recurrent-state
+    // buffers and `MpInner` an embedded ORT `Session`, so the unboxed enum
+    // is large and lopsided. Heap allocation cost is paid once at
+    // construction; per-frame dispatch is unchanged.
     Rvm(Box<RvmInner>),
 }
 
 /// Session + reusable buffers for the multiclass MediaPipe model.
 pub struct MpInner {
     session: Session,
+    backend: Backend,
     input_name: String,
     resizer: fr::Resizer,
     /// Reusable input buffer in float32. Layout depends on `kind`.
@@ -72,7 +82,7 @@ pub struct MpInner {
 impl Segmenter {
     pub fn from_bytes(kind: ModelKind, onnx: &[u8]) -> Result<Self> {
         match kind {
-            ModelKind::SelfieMulticlass => Ok(Segmenter::Multiclass(MpInner::new(onnx)?)),
+            ModelKind::SelfieMulticlass => Ok(Segmenter::Multiclass(Box::new(MpInner::new(onnx)?))),
             ModelKind::Rvm => Ok(Segmenter::Rvm(Box::new(RvmInner::new(onnx)?))),
         }
     }
@@ -91,11 +101,19 @@ impl Segmenter {
             inner.reset();
         }
     }
+
+    /// Execution backend the session ended up using.
+    pub fn backend(&self) -> Backend {
+        match self {
+            Segmenter::Multiclass(inner) => inner.backend,
+            Segmenter::Rvm(inner) => inner.backend,
+        }
+    }
 }
 
 impl MpInner {
     fn new(onnx: &[u8]) -> Result<Self> {
-        let session = build_session(onnx)?;
+        let (session, backend) = build_session(onnx)?;
         let input_name = session
             .inputs()
             .first()
@@ -104,6 +122,7 @@ impl MpInner {
             .to_string();
         Ok(MpInner {
             session,
+            backend,
             input_name,
             resizer: fr::Resizer::new(),
             input_buf: vec![0.0_f32; MODEL_H * MODEL_W * 3],
@@ -112,7 +131,7 @@ impl MpInner {
     }
 }
 
-fn build_session(onnx: &[u8]) -> Result<Session> {
+fn build_session(onnx: &[u8]) -> Result<(Session, Backend)> {
     let mut builder = Session::builder()
         .map_err(|e| anyhow!("ort Session::builder: {e}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -120,12 +139,25 @@ fn build_session(onnx: &[u8]) -> Result<Session> {
         .with_intra_threads(num_threads())
         .map_err(|e| anyhow!("set intra threads: {e}"))?;
 
-    #[cfg(feature = "cuda")]
-    register_cuda(&mut builder);
+    let backend = {
+        #[cfg(feature = "cuda")]
+        {
+            if register_cuda(&mut builder) {
+                Backend::Gpu
+            } else {
+                Backend::Cpu
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Backend::Cpu
+        }
+    };
 
-    builder
+    let session = builder
         .commit_from_memory(onnx)
-        .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))
+        .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))?;
+    Ok((session, backend))
 }
 
 /// Best-effort CUDA execution-provider registration.
@@ -134,17 +166,25 @@ fn build_session(onnx: &[u8]) -> Result<Session> {
 /// GPU, missing CUDA/cuDNN runtime), so this never fails the build. The
 /// explicit `register` path is used only to log which EP is active.
 /// `LB_FORCE_CPU=1` skips registration to A/B against CPU on the same binary.
+///
+/// Returns `true` only when the CUDA EP actually registered.
 #[cfg(feature = "cuda")]
-fn register_cuda(builder: &mut ort::session::builder::SessionBuilder) {
+fn register_cuda(builder: &mut ort::session::builder::SessionBuilder) -> bool {
     use ort::ep::{self, ExecutionProvider};
 
     if std::env::var_os("LB_FORCE_CPU").is_some() {
         log::info!("LB_FORCE_CPU set — ONNX Runtime using CPU execution provider");
-        return;
+        return false;
     }
     match ep::CUDA::default().register(builder) {
-        Ok(()) => log::info!("ONNX Runtime: CUDA execution provider registered"),
-        Err(e) => log::warn!("ONNX Runtime: CUDA EP registration failed ({e}); using CPU"),
+        Ok(()) => {
+            log::info!("ONNX Runtime: CUDA execution provider registered");
+            true
+        }
+        Err(e) => {
+            log::warn!("ONNX Runtime: CUDA EP registration failed ({e}); using CPU");
+            false
+        }
     }
 }
 
@@ -259,6 +299,7 @@ const RVM_DOWNSAMPLE_RATIO: f32 = 0.50;
 
 pub struct RvmInner {
     session: Session,
+    backend: Backend,
     /// Initial-frame recurrent state: zeros at shape `[1, C, 1, 1]` per
     /// state. Built once at construction, fed in on the first call after
     /// `reset()`. RVM's graph accepts any spatial size for `r*i` and
@@ -278,8 +319,10 @@ pub struct RvmInner {
 
 impl RvmInner {
     fn new(onnx: &[u8]) -> Result<Self> {
+        let (session, backend) = build_session(onnx)?;
         Ok(RvmInner {
-            session: build_session(onnx)?,
+            session,
+            backend,
             initial_states: [
                 (vec![1, 16, 1, 1], vec![0.0; 16]),
                 (vec![1, 20, 1, 1], vec![0.0; 20]),

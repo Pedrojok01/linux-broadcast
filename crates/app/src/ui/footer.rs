@@ -1,5 +1,5 @@
 use eframe::egui::{self, Color32, Stroke};
-use lb_pipeline::PipelineState;
+use lb_pipeline::{Backend, PipelineState};
 
 use super::App;
 use crate::theme::{color, space};
@@ -21,6 +21,10 @@ impl App {
                     ui.label(egui::RichText::new("●").color(dot_color).small());
                     ui.add_space(space::XS);
                     ui.label(egui::RichText::new(label).small().color(label_color));
+                    if self.backend == Backend::Gpu {
+                        ui.add_space(space::SM);
+                        gpu_badge(ui);
+                    }
                     ui.add_space(space::MD);
                     sep(ui);
                     ui.add_space(space::MD);
@@ -94,6 +98,25 @@ fn footer_status(running: bool, state: &PipelineState) -> (Color32, String, Colo
             color::ACCENT,
         ),
     }
+}
+
+/// Small accent-colored chip shown in the footer when the segmenter runs
+/// on the GPU. Renders nothing on CPU (caller gates on `Backend::Gpu`).
+fn gpu_badge(ui: &mut egui::Ui) {
+    egui::Frame::none()
+        .fill(color::ACCENT_SOFT)
+        .stroke(Stroke::new(1.0, color::ACCENT))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("GPU")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color::ACCENT),
+            );
+        });
 }
 
 fn sep(ui: &mut egui::Ui) {

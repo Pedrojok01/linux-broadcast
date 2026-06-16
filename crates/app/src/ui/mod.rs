@@ -41,7 +41,9 @@ mod widgets;
 use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui::{self, ViewportCommand};
-use lb_pipeline::{Background, Command, Pipeline, PipelineConfig, PipelineState, PreviewFrame};
+use lb_pipeline::{
+    Backend, Background, Command, Pipeline, PipelineConfig, PipelineState, PreviewFrame,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -218,6 +220,9 @@ pub(super) struct App {
     /// with consumer list). Refreshed every `update()` call from
     /// `Pipeline::state()`. Used by the footer.
     pipeline_state: PipelineState,
+    /// Execution backend the running pipeline's segmenter uses. Drives the
+    /// footer's "GPU" badge; defaults to `Cpu` (no badge) when not running.
+    backend: Backend,
     error: Option<String>,
     /// System tray handle. Held for the whole process lifetime. `None`
     /// only if the OS has no working tray host (logged at install time);
@@ -314,6 +319,7 @@ impl App {
             preview_tex: None,
             last_preview_size: None,
             pipeline_state: PipelineState::default(),
+            backend: Backend::default(),
             error: initial_error,
             tray,
             quit_requested: false,
@@ -383,6 +389,7 @@ impl App {
         match Pipeline::start(pcfg, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX) {
             Ok(p) => {
                 let cmd_tx = p.cmd_sender();
+                self.backend = p.backend();
                 // Push the saved toggle states to the freshly started
                 // pipeline so they survive Stop+Start cycles (model
                 // swaps, camera swaps).
@@ -415,6 +422,7 @@ impl App {
         self.preview_tex = None;
         self.last_preview_size = None;
         self.pipeline_state = PipelineState::default();
+        self.backend = Backend::default();
         // The next pipeline starts at gui_preview_active = false; clear
         // the cache so the next heartbeat re-sends.
         self.last_gui_preview_active = None;

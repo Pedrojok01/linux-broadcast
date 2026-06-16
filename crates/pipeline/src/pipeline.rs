@@ -31,7 +31,7 @@ use std::time::Duration;
 use crate::compositor::Background;
 use crate::consumer_watch::{Consumer, Watcher};
 use crate::lazy::spawn_feeder;
-use crate::segmenter::ModelKind;
+use crate::segmenter::{Backend, ModelKind};
 
 /// Builder for the source GStreamer graph. Production code uses
 /// [`build_source_pipeline`] (the default); tests substitute a closure
@@ -154,6 +154,7 @@ pub struct Pipeline {
     state: Arc<Mutex<PipelineState>>,
     feeder: Option<std::thread::JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
+    backend: Backend,
 }
 
 impl Pipeline {
@@ -220,7 +221,7 @@ impl Pipeline {
         let watcher_rx = watcher.events().clone();
 
         // 4. Feeder thread.
-        let feeder = spawn_feeder(
+        let (feeder, backend) = spawn_feeder(
             cfg,
             multiclass_onnx,
             rvm_onnx,
@@ -239,11 +240,18 @@ impl Pipeline {
             feeder: Some(feeder),
             stop_flag,
             _watcher: watcher,
+            backend,
         })
     }
 
     pub fn cmd_sender(&self) -> Sender<Command> {
         self.cmd_tx.clone()
+    }
+
+    /// Execution backend the segmenter ended up using (CPU or GPU).
+    /// Fixed for the lifetime of the pipeline — model/EP are chosen at start.
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// Snapshot the current public state. Cheap; backed by an
