@@ -293,10 +293,11 @@ fn segment_multiclass(
 
 /// Internal compute resolution = input × downsample_ratio. The official
 /// recommendation is 0.375–0.4 at 720p for speed and 0.5 at 720p for
-/// "higher quality" (sharper hair / shoulder edges). 0.5 → 640×360
-/// internal compute on a 1280×720 frame; ~50 % more inference cost than
-/// 0.4 in exchange for visibly tighter mattes.
-const RVM_DOWNSAMPLE_RATIO: f32 = 0.50;
+/// "higher quality" (sharper hair / shoulder edges). Picked per backend:
+/// CPU keeps the cheaper 0.5; GPU spends its headroom on 0.75 → 960×540
+/// internal compute on a 1280×720 frame for tighter hair / shoulder edges.
+const RVM_DOWNSAMPLE_RATIO_CPU: f32 = 0.50;
+const RVM_DOWNSAMPLE_RATIO_GPU: f32 = 0.75;
 
 pub struct RvmInner {
     session: Session,
@@ -388,7 +389,10 @@ impl RvmInner {
             .try_into()
             .map_err(|_| anyhow!("expected 4 state values"))?;
 
-        let ratio = [RVM_DOWNSAMPLE_RATIO];
+        let ratio = match self.backend {
+            Backend::Gpu => [RVM_DOWNSAMPLE_RATIO_GPU],
+            Backend::Cpu => [RVM_DOWNSAMPLE_RATIO_CPU],
+        };
         let ratio_value = TensorRef::from_array_view(([1_i64], &ratio[..]))
             .map_err(|e| anyhow!("ort Value downsample_ratio: {e}"))?;
 
