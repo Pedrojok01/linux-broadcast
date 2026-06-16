@@ -49,6 +49,7 @@ flowchart LR
   - [Option C — Build from source](#option-c--build-from-source)
   - [Start on login](#start-on-login)
   - [Lazy mode (camera on demand)](#lazy-mode-camera-on-demand)
+- [GPU acceleration (optional, NVIDIA)](#gpu-acceleration-optional-nvidia)
 - [Using it](#using-it)
 - [Performance](#performance)
 - [Troubleshooting](#troubleshooting)
@@ -103,6 +104,43 @@ paru -S linux-broadcast-bin
 `linux-broadcast-bin` repackages the official `.deb` from GitHub Releases, so you get the same binary, the same `/etc/modprobe.d` + `/etc/modules-load.d` drop-ins, and the same desktop integration. The AUR `install` hook reloads `v4l2loopback` immediately after install (DKMS rebuild permitting) and refreshes the desktop / icon caches.
 
 The AUR dep on `v4l2loopback-dkms` will be resolved by your helper. If you'd rather use `v4l2loopback-dkms-git` or a kernel-specific `v4l2loopback-*` flavour, install it first and AUR will accept it as a `provides` match.
+
+## GPU acceleration (optional, NVIDIA)
+
+LinuxBroadcast runs segmentation on the CPU by default. On an NVIDIA RTX-class
+GPU you can offload it to the GPU (~5× faster inference, frees a CPU core) by
+installing the optional `linux-broadcast-cuda` add-on **and** the NVIDIA CUDA 13
+runtime + cuDNN 9. Without them, LinuxBroadcast transparently stays on the CPU.
+
+1. Install the add-on package (ships only the ONNX Runtime CUDA provider libs):
+
+   ```bash
+   sudo apt install ./linux-broadcast-cuda_<version>-1_amd64.deb
+   ```
+
+2. Install the NVIDIA CUDA 13 runtime libraries (NVIDIA's apt repo):
+
+   ```bash
+   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/cuda-keyring_1.1-1_all.deb
+   sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
+   sudo apt install cuda-libraries-13-3      # runtime libs only, no driver/toolkit
+   ```
+   (On Ubuntu 24.04 use the `ubuntu2404` repo path.)
+
+3. Install cuDNN 9 for CUDA 13. Ubuntu 26.04 has no apt package yet; use NVIDIA's
+   redistributable tarball:
+
+   ```bash
+   wget https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.23.1.3_cuda13-archive.tar.xz
+   tar -xf cudnn-linux-x86_64-9.23.1.3_cuda13-archive.tar.xz
+   sudo mkdir -p /usr/local/cudnn/lib
+   sudo cp -a cudnn-linux-x86_64-9.23.1.3_cuda13-archive/lib/libcudnn*.so* /usr/local/cudnn/lib/
+   echo /usr/local/cudnn/lib | sudo tee /etc/ld.so.conf.d/cudnn.conf && sudo ldconfig
+   ```
+
+Verify it engaged: `RUST_LOG=info linux-broadcast` logs
+`ONNX Runtime: CUDA execution provider registered`. A working NVIDIA driver
+(`nvidia-smi`) supporting CUDA 13 is required.
 
 ### Option C — Build from source
 
