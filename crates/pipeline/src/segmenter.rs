@@ -131,61 +131,62 @@ impl MpInner {
     }
 }
 
+/// Build the inference session. With the `cuda` feature, attempt a GPU
+/// session first and fall back to CPU if CUDA cannot be used.
+///
+/// The returned [`Backend`] reflects *actual* execution, not mere
+/// registration: GPU is reported only when a CUDA session was committed
+/// successfully. The CUDA EP is built with `error_on_failure`, and the CUDA
+/// device initializes at commit — so if the GPU is missing/unusable, either
+/// registration or commit errors and we transparently rebuild on CPU. A
+/// committed CUDA session therefore means the device is genuinely in use.
+/// `LB_FORCE_CPU=1` skips the GPU attempt entirely.
 fn build_session(onnx: &[u8]) -> Result<(Session, Backend)> {
-    let mut builder = Session::builder()
+    #[cfg(feature = "cuda")]
+    {
+        if std::env::var_os("LB_FORCE_CPU").is_some() {
+            log::info!("LB_FORCE_CPU set — ONNX Runtime using CPU execution provider");
+        } else {
+            match build_cuda_session(onnx) {
+                Ok(session) => {
+                    log::info!("ONNX Runtime: CUDA execution provider active");
+                    return Ok((session, Backend::Gpu));
+                }
+                Err(e) => log::warn!("ONNX Runtime: CUDA unavailable ({e}); using CPU"),
+            }
+        }
+    }
+    Ok((build_cpu_session(onnx)?, Backend::Cpu))
+}
+
+/// Session builder with the optimization level and thread count we use for
+/// every session, regardless of backend.
+fn base_builder() -> Result<ort::session::builder::SessionBuilder> {
+    Session::builder()
         .map_err(|e| anyhow!("ort Session::builder: {e}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| anyhow!("set optimization level: {e}"))?
         .with_intra_threads(num_threads())
-        .map_err(|e| anyhow!("set intra threads: {e}"))?;
-
-    let backend = {
-        #[cfg(feature = "cuda")]
-        {
-            if register_cuda(&mut builder) {
-                Backend::Gpu
-            } else {
-                Backend::Cpu
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            Backend::Cpu
-        }
-    };
-
-    let session = builder
-        .commit_from_memory(onnx)
-        .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))?;
-    Ok((session, backend))
+        .map_err(|e| anyhow!("set intra threads: {e}"))
 }
 
-/// Best-effort CUDA execution-provider registration.
-///
-/// ONNX Runtime silently falls back to CPU if the EP cannot register (no
-/// GPU, missing CUDA/cuDNN runtime), so this never fails the build. The
-/// explicit `register` path is used only to log which EP is active.
-/// `LB_FORCE_CPU=1` skips registration to A/B against CPU on the same binary.
-///
-/// Returns `true` only when the CUDA EP actually registered.
-#[cfg(feature = "cuda")]
-fn register_cuda(builder: &mut ort::session::builder::SessionBuilder) -> bool {
-    use ort::ep::{self, ExecutionProvider};
+fn build_cpu_session(onnx: &[u8]) -> Result<Session> {
+    base_builder()?
+        .commit_from_memory(onnx)
+        .map_err(|e| anyhow!("commit ONNX model from memory: {e}"))
+}
 
-    if std::env::var_os("LB_FORCE_CPU").is_some() {
-        log::info!("LB_FORCE_CPU set — ONNX Runtime using CPU execution provider");
-        return false;
-    }
-    match ep::CUDA::default().register(builder) {
-        Ok(()) => {
-            log::info!("ONNX Runtime: CUDA execution provider registered");
-            true
-        }
-        Err(e) => {
-            log::warn!("ONNX Runtime: CUDA EP registration failed ({e}); using CPU");
-            false
-        }
-    }
+/// Commit a session with the CUDA EP. Errors (propagated to the caller as a
+/// CPU fallback) if CUDA can't register or the device can't initialize at
+/// commit, so success implies the GPU is actually in use.
+#[cfg(feature = "cuda")]
+fn build_cuda_session(onnx: &[u8]) -> Result<Session> {
+    use ort::ep::CUDA;
+    base_builder()?
+        .with_execution_providers([CUDA::default().build().error_on_failure()])
+        .map_err(|e| anyhow!("register CUDA EP: {e}"))?
+        .commit_from_memory(onnx)
+        .map_err(|e| anyhow!("commit ONNX model (CUDA): {e}"))
 }
 
 fn resize_opts() -> ResizeOptions {
