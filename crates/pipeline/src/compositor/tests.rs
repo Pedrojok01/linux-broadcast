@@ -97,19 +97,20 @@ fn mask_full_background_replaces_frame() {
 }
 
 #[test]
-fn mask_half_blends_midpoint() {
-    // mask = 0.5, grey input + red bg → per-channel midpoint within ±2.
+fn mask_half_blends_refined_midpoint() {
+    // mask = 0.5, grey input + red bg. The no-framing Image path applies
+    // refine_mask, so the effective α is (0.5 − 0.10) / 0.90 = 0.444, not
+    // 0.5. out_R ≈ 100*0.444 + 255*0.556 = 186; out_G/B ≈ 100*0.444 = 44.
     let (w, h) = (16, 16);
     let mut frame = solid_frame(w, h, [100, 100, 100, 255]);
     let mask = mask_const(w, h, 0.5);
     let mut c = Compositor::new();
     c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h), None)
         .unwrap();
-    // out_R ≈ 100*0.5 + 255*0.5 = 177; out_G/B ≈ 100*0.5 + 0*0.5 = 50.
     for px in frame.chunks_exact(4) {
-        assert!((px[0] as i32 - 177).abs() <= 2, "R={}", px[0]);
-        assert!((px[1] as i32 - 50).abs() <= 2, "G={}", px[1]);
-        assert!((px[2] as i32 - 50).abs() <= 2, "B={}", px[2]);
+        assert!((px[0] as i32 - 186).abs() <= 2, "R={}", px[0]);
+        assert!((px[1] as i32 - 44).abs() <= 2, "G={}", px[1]);
+        assert!((px[2] as i32 - 44).abs() <= 2, "B={}", px[2]);
         assert_eq!(px[3], 255);
     }
 }
@@ -126,11 +127,12 @@ fn mismatched_mask_size_upsamples() {
     c.composite(&mut frame, fw, fh, &mask, &red_image_bg(fw, fh), None)
         .unwrap();
     assert_eq!(frame.len(), (fw * fh * 4) as usize);
-    // First pixel ≈ midpoint blend of (40,40,40) over (255,0,0) at α=0.5.
+    // Constant 0.5 mask upsamples to 0.5, then refine_mask → 0.444 on the
+    // no-framing Image path. out ≈ (40,40,40)*0.444 over (255,0,0)*0.556.
     let px = &frame[..4];
-    assert!((px[0] as i32 - 147).abs() <= 3);
-    assert!((px[1] as i32 - 20).abs() <= 3);
-    assert!((px[2] as i32 - 20).abs() <= 3);
+    assert!((px[0] as i32 - 159).abs() <= 3, "R={}", px[0]);
+    assert!((px[1] as i32 - 17).abs() <= 3, "G={}", px[1]);
+    assert!((px[2] as i32 - 17).abs() <= 3, "B={}", px[2]);
 }
 
 #[test]
@@ -426,6 +428,97 @@ fn refine_mask_preserves_high_alpha_silhouette() {
         let pi = (y * w as usize + 4) * 4;
         assert_eq!(&frame[pi..pi + 3], &[0, 200, 0], "fg lost at y={y}");
     }
+}
+
+#[test]
+fn image_no_framing_kills_low_alpha_halo() {
+    // No-framing Image path: a uniform sub-HALO_LO α (0.05) is the soft
+    // tail RVM leaves outside the real silhouette. refine_mask must clamp
+    // it to 0 so the virtual backdrop shows through cleanly with no
+    // green fringe from the camera frame.
+    let (w, h) = (16, 16);
+    let mut frame = solid_frame(w, h, [0, 200, 0, 255]); // green camera
+    let mask = mask_const(w, h, 0.05);
+    let mut c = Compositor::new();
+    c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h), None)
+        .unwrap();
+    for px in frame.chunks_exact(4) {
+        assert_eq!(&px[..3], &[255, 0, 0], "halo leaked: {px:?}");
+    }
+}
+
+#[test]
+fn image_no_framing_halo_clamp_boundary() {
+    // α just below HALO_LO (0.10) clamps to pure background; α just above
+    // keeps a sliver of foreground. Pins the threshold on the no-framing
+    // Image path so a future HALO_LO change is a deliberate test update.
+    let (w, h) = (8, 8);
+    let below = mask_const(w, h, 0.09);
+    let above = mask_const(w, h, 0.11);
+
+    let mut frame_below = solid_frame(w, h, [0, 200, 0, 255]);
+    let mut c = Compositor::new();
+    c.composite(&mut frame_below, w, h, &below, &red_image_bg(w, h), None)
+        .unwrap();
+    assert_eq!(&frame_below[..3], &[255, 0, 0], "α<HALO_LO must be pure bg");
+
+    let mut frame_above = solid_frame(w, h, [0, 200, 0, 255]);
+    c.composite(&mut frame_above, w, h, &above, &red_image_bg(w, h), None)
+        .unwrap();
+    // refine_mask(0.11) ≈ 0.0111 → a faint green contribution survives, so
+    // green is non-zero and red is below the pure-bg 255.
+    assert!(
+        frame_above[1] > 0,
+        "α>HALO_LO must keep some fg, G={}",
+        frame_above[1]
+    );
+    assert!(
+        frame_above[0] < 255,
+        "α>HALO_LO must dilute bg, R={}",
+        frame_above[0]
+    );
+}
+
+#[test]
+fn decontaminated_blend_recovers_true_foreground() {
+    use super::blend::decontaminated_blend;
+
+    // Model a contaminated edge pixel. True foreground is black hair
+    // (F = 0); the real wall behind it is light grey (B_real = 200). The
+    // camera observes the α-blend C = α·F + (1-α)·B_real at α = 0.5, so
+    // C = 100. The plate estimates B_real = 200. Compositing over a blue
+    // virtual bg must recover F ≈ 0 and output α·F + (1-α)·blue, NOT the
+    // naive α·C + (1-α)·blue (which would leak the wall's grey into the
+    // edge).
+    let frame_in = [100u8, 100, 100, 255]; // observed camera pixel C
+    let bg = [0u8, 0, 255, 255]; // blue virtual background
+    let plate = [200u8, 200, 200, 255]; // estimated real wall B_real
+    let mask = [0.55f32]; // refine_mask(0.55) = 0.5
+
+    let mut frame = frame_in;
+    decontaminated_blend(&mut frame, &bg, &plate, &mask);
+
+    // f_clean = (100 − 0.5·200) / 0.5 = 0 → out = 0·0.5 + bg·0.5.
+    assert!(
+        frame[0] <= 1,
+        "R should drop to ~0 (wall removed), got {}",
+        frame[0]
+    );
+    assert!(frame[1] <= 1, "G should drop to ~0, got {}", frame[1]);
+    assert!(
+        (frame[2] as i32 - 127).abs() <= 1,
+        "B ≈ 255·0.5, got {}",
+        frame[2]
+    );
+
+    // Contrast with the naive (non-decontaminated) blend, which would
+    // leave the grey wall in the edge: R = 100·0.5 = 50.
+    let naive_r = (100.0 * 0.5) as u8;
+    assert!(
+        frame[0] < naive_r,
+        "decontam R ({}) must beat naive R ({naive_r})",
+        frame[0]
+    );
 }
 
 #[test]

@@ -139,3 +139,48 @@ fn clamp_idx(s: f32, max: usize) -> (usize, usize, f32) {
     let hi = ((s0 as isize) + 1).clamp(0, max_i) as usize;
     (lo, hi, frac)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::refine_mask;
+
+    #[test]
+    fn clamps_low_alpha_tail_to_zero() {
+        assert_eq!(refine_mask(0.0), 0.0);
+        assert_eq!(refine_mask(0.05), 0.0);
+        // The HALO_LO boundary itself maps to 0 (inclusive).
+        assert_eq!(refine_mask(0.10), 0.0);
+    }
+
+    #[test]
+    fn preserves_and_saturates_high_alpha() {
+        assert_eq!(refine_mask(1.0), 1.0);
+        // Just above the floor stays soft (not snapped to 0 or 1).
+        let r = refine_mask(0.11);
+        assert!(r > 0.0 && r < 0.05, "expected small positive α, got {r}");
+    }
+
+    #[test]
+    fn rescales_midrange_linearly() {
+        // (m − 0.10) / (1 − 0.10): 0.55 → 0.5, 0.10 → 0.0, 1.0 → 1.0.
+        assert!(
+            (refine_mask(0.55) - 0.5).abs() < 1e-6,
+            "{}",
+            refine_mask(0.55)
+        );
+    }
+
+    #[test]
+    fn is_monotonic_non_decreasing() {
+        let mut prev = -1.0;
+        for i in 0..=100 {
+            let m = i as f32 / 100.0;
+            let r = refine_mask(m);
+            assert!(
+                r >= prev,
+                "refine_mask not monotonic at m={m}: {r} < {prev}"
+            );
+            prev = r;
+        }
+    }
+}

@@ -72,7 +72,7 @@ use fast_image_resize::{
 };
 
 use crate::Mask;
-use blend::{asymmetric_blend, blend};
+use blend::{asymmetric_blend, blend, decontaminated_blend};
 use blur::box_blur_rgba;
 use plate::{BgPlate, PLATE_CONF_THRESHOLD, compute_bg_mean};
 use sample::crop_and_rescale_in_place;
@@ -313,15 +313,16 @@ impl Compositor {
 
         self.prepare_mask(mask, width, height)?;
 
-        // The temporal plate is only consumed by Blur (as the blur input)
-        // and Image+framing (as the `B_estimate` for alpha
-        // decontamination). Image without framing never touches it, so we
-        // skip both the per-frame O(N) plate update and its
-        // materialization there. Switching into a plate-consuming mode
+        // The temporal plate feeds the Blur blur input and the
+        // `B_estimate` for alpha decontamination in both Image paths
+        // (framed and not). Only `Background::None` skips it, and that
+        // already returned above. Switching into a plate-consuming mode
         // re-primes the plate over the next ~1-2 s via the existing
         // cold-start fallback.
-        let needs_plate = matches!(background, Background::Blur { .. })
-            || matches!((background, framing), (Background::Image { .. }, Some(_)));
+        let needs_plate = matches!(
+            background,
+            Background::Blur { .. } | Background::Image { .. }
+        );
         if needs_plate {
             self.plate
                 .update(frame, &self.upsampled_mask, width, height);
@@ -367,7 +368,15 @@ impl Compositor {
                         f,
                     );
                 } else {
-                    blend(frame, &self.bg_scaled, &self.upsampled_mask);
+                    // Same halo clamp + alpha decontamination as the
+                    // framing path, minus the remap — keeps the
+                    // no-framing edge quality on par with auto-frame on.
+                    decontaminated_blend(
+                        frame,
+                        &self.bg_scaled,
+                        &self.plate_materialized,
+                        &self.upsampled_mask,
+                    );
                 }
             }
         }

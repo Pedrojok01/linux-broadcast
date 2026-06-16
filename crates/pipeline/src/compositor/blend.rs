@@ -118,3 +118,51 @@ pub(super) fn asymmetric_blend(
         }
     }
 }
+
+/// In-place `Background::Image` blend with the same halo clamp and alpha
+/// decontamination as [`asymmetric_blend`], minus the auto-frame remap.
+/// Foreground = current `frame`; `bg` and `plate` are frame-resolution.
+///
+/// Applies `refine_mask` to drop the soft halo tail, then recovers the
+/// clean foreground `F = (C − (1-α)·B_real) / α` from the observed camera
+/// pixel `C` using the temporal `plate` as `B_real`, before compositing
+/// over the virtual `bg`. This is what keeps the no-framing edge quality
+/// on par with the framing path.
+pub(super) fn decontaminated_blend(frame: &mut [u8], bg: &[u8], plate: &[u8], mask: &[f32]) {
+    debug_assert_eq!(bg.len(), frame.len());
+    debug_assert_eq!(plate.len(), frame.len());
+    for (((px, bg_px), plate_px), &m_raw) in frame
+        .chunks_exact_mut(4)
+        .zip(bg.chunks_exact(4))
+        .zip(plate.chunks_exact(4))
+        .zip(mask.iter())
+    {
+        let m = refine_mask(m_raw);
+        if m <= 0.0 {
+            px[0] = bg_px[0];
+            px[1] = bg_px[1];
+            px[2] = bg_px[2];
+            px[3] = 255;
+            continue;
+        }
+
+        let fg = [px[0] as f32, px[1] as f32, px[2] as f32];
+        let f_clean = if m >= DECONTAM_MIN_ALPHA {
+            let inv_m = 1.0 / m;
+            let one_minus_m = 1.0 - m;
+            [
+                ((fg[0] - one_minus_m * plate_px[0] as f32) * inv_m).clamp(0.0, 255.0),
+                ((fg[1] - one_minus_m * plate_px[1] as f32) * inv_m).clamp(0.0, 255.0),
+                ((fg[2] - one_minus_m * plate_px[2] as f32) * inv_m).clamp(0.0, 255.0),
+            ]
+        } else {
+            fg
+        };
+
+        let inv = 1.0 - m;
+        px[0] = (f_clean[0] * m + bg_px[0] as f32 * inv) as u8;
+        px[1] = (f_clean[1] * m + bg_px[1] as f32 * inv) as u8;
+        px[2] = (f_clean[2] * m + bg_px[2] as f32 * inv) as u8;
+        px[3] = 255;
+    }
+}
