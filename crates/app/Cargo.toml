@@ -19,7 +19,7 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
-lb-pipeline = { path = "../pipeline", version = "0.1.5" }
+lb-pipeline = { path = "../pipeline", version = "0.2.0" }
 
 eframe.workspace = true
 egui.workspace = true
