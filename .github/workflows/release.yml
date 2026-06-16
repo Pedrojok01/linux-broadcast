@@ -237,7 +237,12 @@ jobs:
               AddressFamily inet
           EOF
           chmod 600 ~/.ssh/config
-          git clone ssh://aur@aur.archlinux.org/linux-broadcast-cuda.git /tmp/aur-repo
+          # The AUR repo must be created manually once (see packaging/aur-cuda/
+          # PKGBUILD). Until then, skip without failing the release.
+          if ! git clone ssh://aur@aur.archlinux.org/linux-broadcast-cuda.git /tmp/aur-repo; then
+            echo "::warning::AUR repo linux-broadcast-cuda not reachable yet — skipping AUR publish (create it once, then re-run)."
+            exit 0
+          fi
           cp packaging/aur-cuda/PKGBUILD /tmp/aur-repo/PKGBUILD
           cp packaging/aur-cuda/.SRCINFO /tmp/aur-repo/.SRCINFO
           cd /tmp/aur-repo

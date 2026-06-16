@@ -13,9 +13,14 @@ OUT="target/debian"
 # 1. Ensure the CUDA 13 provider libs exist in the ort cache.
 ORT_CUDA_VERSION=13 cargo build --release -p linux-broadcast --features cuda
 
-# 2. Locate the CUDA-13 provider libs (disambiguate from any cuda-12 cache).
+# 2. Locate the CUDA-13 provider libs. The cache can hold several build-hash
+# dirs (cuda-12 and older cuda-13 builds), so filter to cuda-13 (NEEDED
+# libcublasLt.so.13) and take the NEWEST by mtime — the build just produced
+# above — to avoid shipping an ABI-mismatched .so.
 DIR=$(find "$HOME/.cache/ort.pyke.io" -name 'libonnxruntime_providers_cuda.so' \
-  -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -q libcublasLt.so.13 && echo "$(dirname "$1")"' _ {} \; | head -1)
+  -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -q libcublasLt.so.13 \
+    && printf "%s %s\n" "$(stat -c %Y "$1")" "$(dirname "$1")"' _ {} \; \
+  | sort -rn | head -1 | cut -d' ' -f2-)
 [ -n "$DIR" ] || { echo "error: CUDA 13 provider libs not found in ort cache" >&2; exit 1; }
 
 # 3. Assemble the .deb tree.
