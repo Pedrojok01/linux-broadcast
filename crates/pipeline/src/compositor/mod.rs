@@ -576,9 +576,10 @@ fn resize_rgba(
     dw: u32,
     dh: u32,
 ) -> Result<()> {
-    let s = ImageRef::new(sw, sh, src, fr::PixelType::U8x4).map_err(|e| anyhow!("resize src: {e}"))?;
-    let mut d =
-        Image::from_slice_u8(dw, dh, dst, fr::PixelType::U8x4).map_err(|e| anyhow!("resize dst: {e}"))?;
+    let s =
+        ImageRef::new(sw, sh, src, fr::PixelType::U8x4).map_err(|e| anyhow!("resize src: {e}"))?;
+    let mut d = Image::from_slice_u8(dw, dh, dst, fr::PixelType::U8x4)
+        .map_err(|e| anyhow!("resize dst: {e}"))?;
     resizer
         .resize(&s, &mut d, &Compositor::resize_opts())
         .map_err(|e| anyhow!("resize: {e}"))
