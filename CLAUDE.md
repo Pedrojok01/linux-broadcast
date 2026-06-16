@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## Project
 
-Background-replacement virtual webcam for Linux. Captures a webcam frame, runs MediaPipe / RVM segmentation on CPU via `ort` (ONNX Runtime), composites the foreground over a blurred background, a saved image, or passes the frame through unchanged, and writes the result to a `v4l2loopback` virtual camera that Zoom / Meet / Teams / Firefox / OBS consume.
+Background-replacement virtual webcam for Linux. Captures a webcam frame, runs MediaPipe / RVM segmentation through `ort` (ONNX Runtime) — on CPU by default, or on an NVIDIA GPU via the optional `cuda` feature — composites the foreground over a blurred background, a saved image, or passes the frame through unchanged, and writes the result to a `v4l2loopback` virtual camera that Zoom / Meet / Teams / Firefox / OBS consume.
 
 Out of scope: audio / microphone effects.
 
@@ -38,6 +38,11 @@ cargo fmt --all
 cargo install cargo-deb   # one-time
 cargo deb -p linux-broadcast
 
+# GPU build / packages. The cuda feature is off by default; ORT_CUDA_VERSION=13
+# is supplied by .cargo/config.toml. See "GPU acceleration" below.
+cargo run --release -p linux-broadcast --features cuda
+packaging/build-cuda-addon.sh   # builds the linux-broadcast-cuda add-on .deb
+
 # Cut a release. Bumps Cargo.toml + path-dep + Cargo.lock, runs CI
 # checks, commits, tags. --push to send to origin and let CI ship.
 scripts/release.sh 0.1.3 --push
@@ -52,8 +57,9 @@ ffplay -fflags nobuffer -f v4l2 -input_format yuyv422 \
 # Live. LB_INFER_INTERVAL=N runs segmentation once every N Live frames
 # and reuses the cached mask on the rest (default 1 = every frame; 2 ≈
 # half the inference cost for a ~1-frame mask lag during motion).
-# crates/pipeline/examples/bench.rs is a headless harness for both; see
-# PERF_RESULTS.md for the methodology and numbers.
+# Headless benches under crates/pipeline/examples/: bench.rs (full feeder
+# loop, needs an ffmpeg consumer), infer_bench.rs (segment-only, CPU vs GPU),
+# composite_bench.rs (composite stage per background mode).
 LB_PROFILE=1 LB_INFER_INTERVAL=2 cargo run --release -p linux-broadcast
 ```
 
@@ -136,12 +142,21 @@ Live setting changes (background mode, blur strength, image swap, GUI preview to
 
 Two ONNX files, both `include_bytes!`'d in `crates/app/src/main.rs`. **RVM is the default** — blur radius and auto-frame are tuned against it; **multiclass** is the low-CPU fallback (visible mask flicker at hair / glasses / low-contrast edges).
 
-- **`models/rvm.onnx`** — Robust Video Matting, MobileNetV3 fp32. Recurrent: 4 state tensors held on the segmenter, `Segmenter::reset()` clears them on `Background::None` switch or input-dimension change. Internal compute scaled by `RVM_DOWNSAMPLE_RATIO` (currently 0.5 → ~640×360 internal on a 720p frame, ~40–60 ms/frame on one x86 core). Output mask is at frame resolution; the compositor's `prepare_mask` skips upsampling when sizes match.
+- **`models/rvm.onnx`** — Robust Video Matting, MobileNetV3 fp32. Recurrent: 4 state tensors held on the segmenter, `Segmenter::reset()` clears them on `Background::None` switch or input-dimension change. Internal compute scaled by `RVM_DOWNSAMPLE_RATIO` (currently 0.5 → ~640×360 internal on a 720p frame, ~40–60 ms/frame on one x86 core, ~12 ms with the `cuda` feature). Output mask is at frame resolution; the compositor's `prepare_mask` skips upsampling when sizes match.
 - **`models/selfie_multiclass.onnx`** — MediaPipe selfie multiclass, 256×256 NHWC, 6 classes. Per-frame, ~2–3× cheaper than RVM at 720p.
 
 `Mask` is a public `(data, width, height)` so each model declares its native resolution; the compositor handles either. Active model is `lb_pipeline::ModelKind` (re-exported as `config::Model`); the GUI dropdown drives a Stop+Start on change.
 
 For SHA-256s, license details, and re-fetch / TFLite→ONNX recipes, see [`models/README.md`](models/README.md).
+
+### GPU acceleration (optional `cuda` feature)
+
+Off by default. `--features cuda` runs inference through ONNX Runtime's CUDA execution provider (~5× faster RVM: ~12 ms vs ~64 ms/frame). Design:
+
+- **One binary, runtime auto-detect.** `segmenter.rs::build_session` tries a CUDA session first and falls back to a CPU session on any failure. `Backend::Gpu` is reported (and the GUI footer's `GPU` badge shown) **only when a CUDA session actually commits** — the EP is built with `error_on_failure` and the device initializes at commit, so a usable GPU is required for success; otherwise it transparently rebuilds on CPU. `LB_FORCE_CPU=1` skips the GPU attempt. The cuda-built binary hard-links **no** CUDA libraries (verified via `readelf -d`) — they live only in the dlopened provider `.so`.
+- **`ORT_CUDA_VERSION=13`** is set in `.cargo/config.toml` (a no-op for CPU builds); without it `ort` may fetch the CUDA-12 binaries.
+- **Packaging is "Shape B"** (see Packaging below): the main `.deb` ships the cuda binary with no provider libs; the optional `linux-broadcast-cuda` add-on ships just the provider `.so`s. ONNX Runtime locates providers in the **invocation path's directory (argv[0])**, so the binary installs to `/usr/lib/linux-broadcast/` next to the providers, with `/usr/bin/linux-broadcast` a wrapper that `exec`s the real path (a symlink would resolve the wrong dir).
+- **CUDA 13 runtime + cuDNN 9 are the user's responsibility** (large, NVIDIA-licensed); absent → automatic CPU fallback.
 
 ### Auto-framing
 
@@ -161,7 +176,8 @@ For SHA-256s, license details, and re-fetch / TFLite→ONNX recipes, see [`model
 
 | Asset | Installed to | Notes |
 |---|---|---|
-| `target/release/linux-broadcast` | `/usr/bin/linux-broadcast` | The binary. |
+| `target/release/linux-broadcast` | `/usr/lib/linux-broadcast/linux-broadcast` | The cuda-feature binary (`features = ["cuda"]` in the deb metadata; auto-detects GPU, runs CPU without the add-on). Lives in `/usr/lib` so it sits next to the optional provider `.so`s. |
+| `packaging/linux-broadcast.wrapper` | `/usr/bin/linux-broadcast` | Wrapper that `exec`s the real binary, so ONNX Runtime resolves providers from `/usr/lib/linux-broadcast/`. |
 | `packaging/LinuxBroadcast.desktop` | `/usr/share/applications/` | System launcher; `desktop_install.rs` skips its per-user clone when this exists. |
 | `packaging/LinuxBroadcast.png` | `/usr/share/icons/hicolor/64x64/apps/` | Pre-rendered via `LB_DUMP_ICON=1` so `cargo deb` doesn't execute the binary at packaging time. Regenerate when the logo changes. |
 | `packaging/linux-broadcast.modprobe.conf` | `/etc/modprobe.d/linux-broadcast.conf` | **conffile** — `options v4l2loopback devices=1 video_nr=10 card_label="LinuxBroadcast" exclusive_caps=1 max_buffers=2`. |
@@ -174,7 +190,9 @@ Maintainer scripts at `packaging/scripts/`:
 
 `apt purge` removes the conffiles; `apt remove` keeps them for re-install.
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`: it checks the tag matches `[workspace.package].version`, runs `cargo deb`, and publishes a GitHub Release with auto-generated notes and the `.deb` attached.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`: it checks the tag matches `[workspace.package].version`, builds the cuda main `.deb` (`cargo build --features cuda` + `cargo deb --no-build`) and the GPU add-on (`packaging/build-cuda-addon.sh`), and publishes a GitHub Release with both `.deb`s attached.
+
+**GPU add-on (`linux-broadcast-cuda`).** Built by `packaging/build-cuda-addon.sh` (a hand-rolled `dpkg-deb` data-only package — cargo-deb builds from a crate). Ships only `libonnxruntime_providers_{shared,cuda}.so` (~48 MB compressed) into `/usr/lib/linux-broadcast/`, `Depends: linux-broadcast (= <ver>-1)` so the provider ABI matches the binary's `ort` build. The script locates the libs by newest-mtime CUDA-13 build in the `ort` cache. Installing it (+ system CUDA 13 / cuDNN 9) makes the runtime auto-detect engage the GPU.
 
 ### Packaging (`packaging/aur/` — Arch / AUR)
 
@@ -188,8 +206,9 @@ The `linux-broadcast-bin` AUR package repackages the GitHub Release `.deb` so Ar
 
 Two workflows automate the loop:
 
-- **`.github/workflows/aur-lint.yml`** (PR-time gate on `packaging/aur/**`): runs `makepkg --printsrcinfo` inside `archlinux:base-devel`, diffs against the committed `.SRCINFO`, runs `namcap` on the PKGBUILD and fails on `E:` lines (advisory `W:`/`I:` are surfaced but non-fatal).
+- **`.github/workflows/aur-lint.yml`** (PR-time gate on `packaging/aur/**` and `packaging/aur-cuda/**`): runs `makepkg --printsrcinfo` inside `archlinux:base-devel` for each package, diffs against the committed `.SRCINFO`, runs `namcap` on each PKGBUILD and fails on `E:` lines (advisory `W:`/`I:` are surfaced but non-fatal).
 - **`release.yml`'s `aur` job** (`needs: deb`, runs on every `v*` tag push): waits up to ~5 min for the just-uploaded `.deb` URL to be reachable, downloads it, computes sha256, sed-rewrites `pkgver` + `sha256sums` in PKGBUILD, regenerates `.SRCINFO`, and pushes to AUR using `ssh-keyscan` + `git push` directly (the `AUR_SSH_KEY` repo secret is the ed25519 private key registered on the AUR account).
+- **`release.yml`'s `aur-cuda` job** does the same for the `linux-broadcast-cuda` add-on (`packaging/aur-cuda/`, repackages the add-on `.deb`'s provider libs, `depends=('linux-broadcast')`). It **skips gracefully** if the `linux-broadcast-cuda` AUR repo doesn't exist yet (one-time manual init required, as for the main package).
 - **`.github/workflows/aur.yml`** is a `workflow_dispatch`-only safety valve (`gh workflow run aur.yml -f tag=v0.1.2`) for re-publishing to AUR without re-tagging. Uses the same inline ssh + git push as the release job.
 
 Non-obvious bits:
@@ -227,5 +246,5 @@ The GUI crate has no tests — surface is mostly egui layout. Don't add UI snaps
 
 ## Roadmap
 
-- CPU/GPU usage in footer.
-- Throughput benchmarks per model on a stable reference machine, published in the repo so contributors can spot regressions on a model swap.
+- CPU usage in footer (the GPU badge already shows when the CUDA EP is active).
+- Publish per-model throughput numbers from a stable reference machine (the `infer_bench` / `composite_bench` harnesses exist) so contributors can spot regressions on a model swap.
