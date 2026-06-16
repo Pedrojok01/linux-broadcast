@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "packaging/aur/**"
+      - "packaging/aur-cuda/**"
       - ".github/workflows/aur-lint.yml"
   pull_request:
     paths:
       - "packaging/aur/**"
+      - "packaging/aur-cuda/**"
       - ".github/workflows/aur-lint.yml"
 
 permissions:
@@ -26,23 +28,29 @@ jobs:
         run: |
           set -euo pipefail
           useradd -m builder
-          cp -r packaging/aur /tmp/aur
-          chown -R builder /tmp/aur
 
-          # makepkg refuses to run as root.
-          su builder -c "cd /tmp/aur && makepkg --printsrcinfo" > /tmp/canonical_srcinfo
+          for dir in packaging/aur packaging/aur-cuda; do
+            echo "===== validating $dir ====="
+            work="/tmp/$(basename "$dir")"
+            rm -rf "$work"
+            cp -r "$dir" "$work"
+            chown -R builder "$work"
 
-          echo "----- canonical .SRCINFO from PKGBUILD -----"
-          cat /tmp/canonical_srcinfo
-          echo "--------------------------------------------"
+            # makepkg refuses to run as root.
+            su builder -c "cd '$work' && makepkg --printsrcinfo" > /tmp/canonical_srcinfo
 
-          if ! diff -u packaging/aur/.SRCINFO /tmp/canonical_srcinfo; then
-            echo
-            echo "::error::packaging/aur/.SRCINFO is out of sync with PKGBUILD."
-            echo "Regenerate locally with:"
-            echo "  docker run --rm -v \"\$PWD/packaging/aur:/aur\" archlinux:base-devel bash -c 'useradd -m b && cp -r /aur/. /tmp/aur && chown -R b /tmp/aur && su b -c \"cd /tmp/aur && makepkg --printsrcinfo\"' > packaging/aur/.SRCINFO"
-            exit 1
-          fi
+            echo "----- canonical .SRCINFO from $dir/PKGBUILD -----"
+            cat /tmp/canonical_srcinfo
+            echo "--------------------------------------------"
+
+            if ! diff -u "$dir/.SRCINFO" /tmp/canonical_srcinfo; then
+              echo
+              echo "::error::$dir/.SRCINFO is out of sync with PKGBUILD."
+              echo "Regenerate locally with:"
+              echo "  docker run --rm -v \"\$PWD/$dir:/aur\" archlinux:base-devel bash -c 'useradd -m b && cp -r /aur/. /tmp/aur && chown -R b /tmp/aur && su b -c \"cd /tmp/aur && makepkg --printsrcinfo\"' > $dir/.SRCINFO"
+              exit 1
+            fi
+          done
 
       - name: Run namcap on PKGBUILD
         run: |
@@ -50,9 +58,12 @@ jobs:
           # namcap reports informational notices on -bin packages (no
           # build()/check() hooks) — treat as advisory, fail only on
           # E: errors.
-          if namcap packaging/aur/PKGBUILD | tee /tmp/namcap.log | grep -E '^[A-Za-z0-9_/.-]+ E:'; then
-            echo "::error::namcap reported errors above."
-            exit 1
-          fi
-          echo "namcap output (advisory):"
-          cat /tmp/namcap.log
+          for dir in packaging/aur packaging/aur-cuda; do
+            echo "===== namcap $dir/PKGBUILD ====="
+            if namcap "$dir/PKGBUILD" | tee /tmp/namcap.log | grep -E '^[A-Za-z0-9_/.-]+ E:'; then
+              echo "::error::namcap reported errors above for $dir/PKGBUILD."
+              exit 1
+            fi
+            echo "namcap output (advisory):"
+            cat /tmp/namcap.log
+          done
