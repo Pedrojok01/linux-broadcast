@@ -335,7 +335,7 @@ impl Compositor {
                 // If framing is on, snapshot the composite and
                 // crop+rescale the whole thing — Plate ghost (if any)
                 // moves with the silhouette and is never exposed.
-                self.run_blur(width, height, *strength);
+                self.run_blur(width, height, *strength)?;
                 blend(frame, &self.blur_out, &self.upsampled_mask);
                 if let Some(f) = framing {
                     self.ensure_composite_scratch(frame.len());
@@ -433,7 +433,7 @@ impl Compositor {
     /// (radius scaled to match), then upscaled back to frame resolution.
     /// A blur is low-frequency so this is visually identical to a
     /// full-resolution blur at a fraction of the cost.
-    fn run_blur(&mut self, width: u32, height: u32, strength: f32) {
+    fn run_blur(&mut self, width: u32, height: u32, strength: f32) -> Result<()> {
         let w = width as usize;
         let h = height as usize;
         let n = (w * h) * 4;
@@ -446,7 +446,7 @@ impl Compositor {
         let radius = (BLUR_MIN_RADIUS as f32 + s * span).round() as usize;
         if radius == 0 {
             self.blur_out.copy_from_slice(&self.plate_materialized);
-            return;
+            return Ok(());
         }
 
         let sw = (w / BLUR_DOWNSCALE).max(1);
@@ -466,30 +466,31 @@ impl Compositor {
             ..
         } = self;
 
-        // Downscale the plate into blur_small.
-        let src = ImageRef::new(width, height, plate_materialized.as_slice(), fr::PixelType::U8x4)
-            .expect("blur downscale src");
-        let mut dst =
-            Image::from_slice_u8(sw as u32, sh as u32, blur_small.as_mut_slice(), fr::PixelType::U8x4)
-                .expect("blur downscale dst");
-        resizer
-            .resize(&src, &mut dst, &Self::resize_opts())
-            .expect("blur downscale");
-
-        // Blur at the reduced size (cheap), one or two passes.
+        // Downscale the plate, blur at the reduced size, upscale back.
+        resize_rgba(
+            resizer,
+            plate_materialized.as_slice(),
+            width,
+            height,
+            blur_small.as_mut_slice(),
+            sw as u32,
+            sh as u32,
+        )?;
         box_blur_rgba(blur_small, blur_small_tmp, sw, sh, r);
-        if radius >= BLUR_TWO_PASS_THRESHOLD {
+        // Second pass for a closer-to-Gaussian kernel. Threshold scaled to
+        // the reduced resolution so it tracks the kernel that actually runs.
+        if r >= (BLUR_TWO_PASS_THRESHOLD / BLUR_DOWNSCALE).max(1) {
             box_blur_rgba(blur_small, blur_small_tmp, sw, sh, r);
         }
-
-        // Upscale the blurred small plate back to frame resolution.
-        let src = ImageRef::new(sw as u32, sh as u32, blur_small.as_slice(), fr::PixelType::U8x4)
-            .expect("blur upscale src");
-        let mut dst = Image::from_slice_u8(width, height, blur_out.as_mut_slice(), fr::PixelType::U8x4)
-            .expect("blur upscale dst");
-        resizer
-            .resize(&src, &mut dst, &Self::resize_opts())
-            .expect("blur upscale");
+        resize_rgba(
+            resizer,
+            blur_small.as_slice(),
+            sw as u32,
+            sh as u32,
+            blur_out.as_mut_slice(),
+            width,
+            height,
+        )
     }
 
     /// Make sure `self.upsampled_mask` holds the mask at frame resolution.
@@ -563,6 +564,24 @@ impl Default for Compositor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Bilinear-resize an RGBA8 buffer from `(sw, sh)` into `dst` at `(dw, dh)`.
+fn resize_rgba(
+    resizer: &mut fr::Resizer,
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    dst: &mut [u8],
+    dw: u32,
+    dh: u32,
+) -> Result<()> {
+    let s = ImageRef::new(sw, sh, src, fr::PixelType::U8x4).map_err(|e| anyhow!("resize src: {e}"))?;
+    let mut d =
+        Image::from_slice_u8(dw, dh, dst, fr::PixelType::U8x4).map_err(|e| anyhow!("resize dst: {e}"))?;
+    resizer
+        .resize(&s, &mut d, &Compositor::resize_opts())
+        .map_err(|e| anyhow!("resize: {e}"))
 }
 
 /// Cheap content fingerprint for an RGBA buffer. We hash the source
