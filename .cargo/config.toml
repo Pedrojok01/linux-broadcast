@@ -1,0 +1,6 @@
+# ort-sys reads ORT_CUDA_VERSION when the `cuda` feature is enabled, to pick
+# the CUDA 13 ONNX Runtime binaries (the dev/CI driver advertises CUDA 13.2;
+# without this, ort auto-detects and can fetch the CUDA 12 build instead).
+# Ignored entirely by default (CPU) builds.
+[env]
+ORT_CUDA_VERSION = "13"
