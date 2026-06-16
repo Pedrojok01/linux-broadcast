@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Builds the linux-broadcast-cuda add-on .deb: only the ONNX Runtime CUDA
+# provider libraries, version-locked to the main package. The main binary
+# (cuda build) loads them from /usr/lib/linux-broadcast/ when present and the
+# user has CUDA 13 + cuDNN 9 installed; otherwise it runs on CPU.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+ARCH=amd64
+OUT="target/debian"
+
+# 1. Ensure the CUDA 13 provider libs exist in the ort cache.
+ORT_CUDA_VERSION=13 cargo build --release -p linux-broadcast --features cuda
+
+# 2. Locate the CUDA-13 provider libs (disambiguate from any cuda-12 cache).
+DIR=$(find "$HOME/.cache/ort.pyke.io" -name 'libonnxruntime_providers_cuda.so' \
+  -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -q libcublasLt.so.13 && echo "$(dirname "$1")"' _ {} \; | head -1)
+[ -n "$DIR" ] || { echo "error: CUDA 13 provider libs not found in ort cache" >&2; exit 1; }
+
+# 3. Assemble the .deb tree.
+PKG="linux-broadcast-cuda"
+ROOT="target/cuda-addon"
+rm -rf "$ROOT"
+mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/lib/linux-broadcast"
+cp "$DIR/libonnxruntime_providers_shared.so" "$DIR/libonnxruntime_providers_cuda.so" \
+   "$ROOT/usr/lib/linux-broadcast/"
+SIZE=$(du -ks "$ROOT/usr" | cut -f1)
+
+cat > "$ROOT/DEBIAN/control" <<EOF
+Package: $PKG
+Version: ${VERSION}-1
+Architecture: $ARCH
+Maintainer: Pedrojok01 <pedrojok@pm.me>
+Depends: linux-broadcast (= ${VERSION}-1)
+Section: video
+Priority: optional
+Installed-Size: $SIZE
+Description: GPU acceleration add-on for LinuxBroadcast (NVIDIA CUDA)
+ Drops the ONNX Runtime CUDA execution-provider libraries next to the
+ LinuxBroadcast binary. With an NVIDIA RTX-class GPU and the CUDA 13 runtime
+ plus cuDNN 9 installed, segmentation runs on the GPU; otherwise LinuxBroadcast
+ transparently continues on the CPU.
+ .
+ Requires (user-installed, not auto-resolved): CUDA 13 runtime libraries and
+ cuDNN 9 for CUDA 13. See /usr/share/doc/linux-broadcast/README.md.
+EOF
+
+mkdir -p "$OUT"
+DEB="$OUT/${PKG}_${VERSION}-1_${ARCH}.deb"
+dpkg-deb --build --root-owner-group "$ROOT" "$DEB"
+echo "built: $DEB"
+dpkg-deb -c "$DEB"
