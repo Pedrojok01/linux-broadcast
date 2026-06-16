@@ -54,7 +54,7 @@ jobs:
             gstreamer1.0-libav \
             libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+            libgtk-3-dev libayatana-appindicator3-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -63,8 +63,17 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
 
-      - name: Build Debian package
-        run: cargo deb -p linux-broadcast
+      - name: Build main Debian package (cuda build, auto-detects GPU at runtime)
+        # ORT_CUDA_VERSION=13 comes from .cargo/config.toml. The cuda binary
+        # hard-links no CUDA libs, so it runs CPU-only without the add-on.
+        run: |
+          cargo build --release -p linux-broadcast --features cuda
+          cargo deb -p linux-broadcast --no-build
+
+      - name: Build CUDA provider-libs add-on package
+        # No GPU needed: this only downloads + repackages the ONNX Runtime
+        # CUDA provider .so files into the linux-broadcast-cuda .deb.
+        run: packaging/build-cuda-addon.sh
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -162,4 +171,81 @@ jobs:
             exit 0
           fi
           git commit -m "linux-broadcast-bin ${VERSION}-1"
+          git push origin master
+
+  aur-cuda:
+    name: Publish linux-broadcast-cuda to AUR
+    needs: deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for add-on .deb asset to be reachable
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast-cuda_${VERSION}-1_amd64.deb"
+          for attempt in $(seq 1 20); do
+            if curl -sfLI "$url" -o /dev/null; then
+              echo "Asset available: $url"; exit 0
+            fi
+            echo "Attempt $attempt: $url not ready yet, sleeping 15s..."; sleep 15
+          done
+          echo "Timed out waiting for $url" >&2; exit 1
+
+      - name: Pin pkgver and sha256 in PKGBUILD
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/Pedrojok01/linux-broadcast/releases/download/v${VERSION}/linux-broadcast-cuda_${VERSION}-1_amd64.deb"
+          curl -sSfL "$url" -o /tmp/lb-cuda.deb
+          sum="$(sha256sum /tmp/lb-cuda.deb | awk '{print $1}')"
+          sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur-cuda/PKGBUILD
+          sed -i -E "s/^pkgrel=.*/pkgrel=1/" packaging/aur-cuda/PKGBUILD
+          sed -i -E "s|^sha256sums=.*|sha256sums=('${sum}')|" packaging/aur-cuda/PKGBUILD
+
+      - name: Regenerate .SRCINFO
+        run: |
+          docker run --rm -v "$PWD/packaging/aur-cuda:/aur" archlinux:base-devel bash -c '
+            useradd -m builder
+            cp -r /aur/. /tmp/aur
+            chown -R builder /tmp/aur
+            su builder -c "cd /tmp/aur && makepkg --printsrcinfo" > /aur/.SRCINFO
+          '
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh; chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key; chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -4 -t rsa,ed25519,ecdsa aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+              User aur
+              IdentityFile ~/.ssh/aur_key
+              IdentitiesOnly yes
+              AddressFamily inet
+          EOF
+          chmod 600 ~/.ssh/config
+          git clone ssh://aur@aur.archlinux.org/linux-broadcast-cuda.git /tmp/aur-repo
+          cp packaging/aur-cuda/PKGBUILD /tmp/aur-repo/PKGBUILD
+          cp packaging/aur-cuda/.SRCINFO /tmp/aur-repo/.SRCINFO
+          cd /tmp/aur-repo
+          git config user.name "Pedrojok01"
+          git config user.email "pedrojok@pm.me"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No AUR-side changes — already at $VERSION-1."; exit 0
+          fi
+          git commit -m "linux-broadcast-cuda ${VERSION}-1"
           git push origin master
