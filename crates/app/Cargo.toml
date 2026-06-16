@@ -98,10 +98,16 @@ the background, and exposes the result on /dev/video10 so Zoom, Meet,
 Teams, OBS, Firefox, and Chrome all see it as a regular webcam."""
 section = "video"
 priority = "optional"
+# The shipped binary is the cuda-feature build: it hard-links no CUDA
+# libraries (verified) so it runs pure-CPU when the optional
+# linux-broadcast-cuda provider libs / NVIDIA runtime are absent, and
+# auto-engages the GPU when they are present.
+features = ["cuda"]
 depends = "$auto, v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libayatana-appindicator3-1"
 recommends = "v4l-utils"
 assets = [
-    ["target/release/linux-broadcast", "usr/bin/", "755"],
+    ["target/release/linux-broadcast", "usr/lib/linux-broadcast/", "755"],
+    ["../../packaging/linux-broadcast.wrapper", "usr/bin/linux-broadcast", "755"],
     ["../../packaging/LinuxBroadcast.desktop", "usr/share/applications/", "644"],
     ["../../packaging/LinuxBroadcast.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
     ["../../packaging/linux-broadcast.modprobe.conf", "etc/modprobe.d/linux-broadcast.conf", "644"],

@@ -1,0 +1,6 @@
+#!/bin/sh
+# LinuxBroadcast launcher. The real binary lives in /usr/lib/linux-broadcast/
+# next to the optional CUDA provider libs; ONNX Runtime locates those providers
+# in the directory of the invoked path (argv[0]), so we exec the real absolute
+# path (NOT a symlink) to make that directory /usr/lib/linux-broadcast/.
+exec /usr/lib/linux-broadcast/linux-broadcast "$@"
