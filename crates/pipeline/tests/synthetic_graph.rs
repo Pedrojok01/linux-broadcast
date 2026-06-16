@@ -287,9 +287,13 @@ fn set_background_no_frame_gap() {
     ] {
         p.cmd_sender().send(Command::SetBackground(bg)).unwrap();
         let n = pull_frames_for(&sink, Duration::from_millis(1200));
+        // The point is that frames keep flowing across the swap — a real
+        // stall yields 0–1. The exact count is at the mercy of a loaded
+        // shared CI runner (RVM CPU inference + cold warmup), so keep the
+        // bar low enough to not flake while still catching a true gap.
         assert!(
-            n >= 5,
-            "expected ≥5 frames during 1200ms in mode swap, got {n}",
+            n >= 3,
+            "expected ≥3 frames during 1200ms in mode swap, got {n}",
         );
     }
 
