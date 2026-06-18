@@ -429,8 +429,8 @@ pub(crate) fn build_source_pipeline(
 ) -> Result<(gst::Pipeline, gst_app::AppSink)> {
     let pipeline = gst::Pipeline::new();
 
-    // v4l2src ! [image/jpeg ! jpegdec !] videoscale ! videoconvert !
-    // video/x-raw,RGBA,WxH ! appsink.
+    // v4l2src ! [image/jpeg ! jpegdec !] aspectratiocrop ! videoscale !
+    // videoconvert ! video/x-raw,RGBA,WxH ! appsink.
     //
     // Raw lets v4l2src negotiate whatever uncompressed format the camera
     // prefers (YUYV/NV12/…). MJPEG pins `image/jpeg` so the camera
@@ -441,10 +441,22 @@ pub(crate) fn build_source_pipeline(
     // path works at any target resolution. Constraining only at the
     // appsink end also avoids the 30/1-vs-30000/1001 framerate-fraction
     // mismatches that fail v4l2src negotiation.
+    //
+    // `aspectratiocrop` center-crops the camera frame to the *output*
+    // aspect ratio BEFORE videoscale, so videoscale only ever does a
+    // uniform (non-distorting) scale. Without it, a target whose ratio
+    // differs from the camera's (e.g. 16:9 cam → a 1280×900 output) gets
+    // stretched — people look squashed/elongated in conferencing apps.
     let src = gst::ElementFactory::make("v4l2src")
         .name("lb-source")
         .property("device", &cfg.source_device)
         .property("do-timestamp", true)
+        .build()?;
+    let src_crop = gst::ElementFactory::make("aspectratiocrop")
+        .property(
+            "aspect-ratio",
+            gst::Fraction::new(cfg.width as i32, cfg.height as i32),
+        )
         .build()?;
     let src_scale = gst::ElementFactory::make("videoscale").build()?;
     let src_convert = gst::ElementFactory::make("videoconvert").build()?;
@@ -479,15 +491,16 @@ pub(crate) fn build_source_pipeline(
         SourceCodec::Raw => None,
     };
 
-    pipeline.add_many([&src, &src_scale, &src_convert, &src_capsfilter])?;
+    pipeline.add_many([&src, &src_crop, &src_scale, &src_convert, &src_capsfilter])?;
     pipeline.add(appsink.upcast_ref::<gst::Element>())?;
     if let Some((jpeg_capsfilter, jpegdec)) = &jpeg_head {
         pipeline.add_many([jpeg_capsfilter, jpegdec])?;
-        gst::Element::link_many([&src, jpeg_capsfilter, jpegdec, &src_scale])?;
+        gst::Element::link_many([&src, jpeg_capsfilter, jpegdec, &src_crop])?;
     } else {
-        src.link(&src_scale)?;
+        src.link(&src_crop)?;
     }
     gst::Element::link_many([
+        &src_crop,
         &src_scale,
         &src_convert,
         &src_capsfilter,

@@ -102,8 +102,11 @@ impl Default for Config {
         Self {
             source_device: "/dev/video0".to_string(),
             sink_device: "/dev/video10".to_string(),
+            // 16:9 — must match common webcam aspect so the source isn't
+            // stretched into a non-standard output ratio. See the
+            // aspect-preserving crop in `lb_pipeline::build_source_pipeline`.
             width: 1280,
-            height: 900,
+            height: 720,
             framerate: 30,
             mode: Mode::Blur,
             blur_strength: 0.62,
@@ -180,6 +183,22 @@ mod tests {
 
     fn config_file(dir: &Path) -> PathBuf {
         dir.join("config.toml")
+    }
+
+    /// Regression guard: the default output resolution must be 16:9. A
+    /// non-16:9 default (it was once 1280×900) makes the source graph
+    /// stretch the 16:9 webcam capture vertically — people look distorted
+    /// in conferencing apps.
+    #[test]
+    fn default_resolution_is_16_9() {
+        let d = Config::default();
+        assert_eq!(
+            d.width * 9,
+            d.height * 16,
+            "default {}×{} is not 16:9",
+            d.width,
+            d.height,
+        );
     }
 
     #[test]
