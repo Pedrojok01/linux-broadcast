@@ -28,11 +28,23 @@ impl App {
                     ui.add_space(space::MD);
                     sep(ui);
                     ui.add_space(space::MD);
+                    // Append the camera's native capture format while Live so
+                    // the footer shows what the camera actually delivers (e.g.
+                    // "MJPEG 1280×720"), not just the device path.
+                    let capture_suffix = match &self.pipeline_state {
+                        PipelineState::Live {
+                            capture: Some(c), ..
+                        } => format!(" · {} {}×{}", c.codec.label(), c.width, c.height),
+                        _ => String::new(),
+                    };
                     ui.label(
-                        egui::RichText::new(format!("in  {}", self.cfg.source_device))
-                            .monospace()
-                            .small()
-                            .color(color::TEXT_MUTED),
+                        egui::RichText::new(format!(
+                            "in  {}{}",
+                            self.cfg.source_device, capture_suffix
+                        ))
+                        .monospace()
+                        .small()
+                        .color(color::TEXT_MUTED),
                     );
                     ui.add_space(space::MD);
                     ui.label(
@@ -72,7 +84,7 @@ fn footer_status(running: bool, state: &PipelineState) -> (Color32, String, Colo
         return (color::TEXT_MUTED, "Idle".to_string(), color::TEXT_MUTED);
     }
     match state {
-        PipelineState::Live { consumers } if !consumers.is_empty() => {
+        PipelineState::Live { consumers, .. } if !consumers.is_empty() => {
             // Show the first consumer; if there are several, append a count.
             let first = &consumers[0];
             let label = if consumers.len() == 1 {

@@ -23,6 +23,16 @@ impl App {
                             .strong()
                             .color(color::TEXT_WEAK),
                     );
+                    // Output resolution is always honest (the sink runs at the
+                    // config size even while idle), so it's always shown. The
+                    // fps is only real while Live — appended only when we have
+                    // a measurement, never as the misleading config target.
+                    let res_label = match &self.pipeline_state {
+                        lb_pipeline::PipelineState::Live { fps: Some(f), .. } => {
+                            format!("{}×{} · {f:.0} fps", self.cfg.width, self.cfg.height)
+                        }
+                        _ => format!("{}×{}", self.cfg.width, self.cfg.height),
+                    };
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         pill(
                             ui,
@@ -30,15 +40,7 @@ impl App {
                             color::TEXT_WEAK,
                             None,
                         );
-                        pill(
-                            ui,
-                            &format!(
-                                "{}×{} · {} fps",
-                                self.cfg.width, self.cfg.height, self.cfg.framerate
-                            ),
-                            color::TEXT_WEAK,
-                            None,
-                        );
+                        pill(ui, &res_label, color::TEXT_WEAK, None);
                         if self.running() {
                             pill(ui, "LIVE", color::TEXT, Some(color::DANGER));
                         }

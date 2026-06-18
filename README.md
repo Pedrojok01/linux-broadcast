@@ -65,9 +65,10 @@ flowchart LR
 - **Three background modes** — passthrough, blur (intensity slider, 4–32 px radius), replace with a saved image.
 - **Saved background library** — imports are copied to `~/.local/share/linux-broadcast/backgrounds/` so they survive across launches.
 - **Auto-frame** — a smoothed horizontal recenter plus a light foreground zoom that keeps the silhouette centered as you move. Off by default; toggle in the sidebar's *Settings*. Skipped when the background mode is *None* (no plane to paint over).
+- **Full-resolution capture** — automatically negotiates **MJPEG** so USB webcams deliver native HD at 30 fps; raw YUYV is bandwidth-capped to ~10 fps at 720p on USB 2.0. Falls back to raw automatically if the camera can't do MJPEG (`LB_FORCE_RAW=1` forces it).
 - **Lazy producer mode** — the physical webcam LED only lights when an app is actually reading the virtual cam, like NVIDIA Broadcast. See [Lazy mode](#lazy-mode-camera-on-demand).
 - **System tray** — the close button hides to the tray; `Quit` from the tray menu actually exits.
-- **Live preview pane** in the GUI; settings persist to `~/.config/linux-broadcast/config.toml`.
+- **Live preview pane** in the GUI; the footer shows the real output framerate and the camera's native capture format (e.g. `MJPEG 1280×720`). Settings persist to `~/.config/linux-broadcast/config.toml`.
 - **No CUDA, no PyTorch, no Python** — single Rust binary, ~25 MB plus the bundled ONNX/font assets.
 
 Out of scope: audio / microphone effects.
@@ -250,6 +251,7 @@ Composite is CPU-side either way: ~2 ms for a virtual background, ~10 ms for blu
 - **`/dev/video10` is "busy" or "not a video capture device".** That's `exclusive_caps=1` doing its job: the device only exposes CAPTURE while LinuxBroadcast is producing frames. Real apps see it; raw `ffplay` may not until the producer is running.
 - **`apt install v4l2loopback-dkms` fails on kernel 6.8+.** You have the broken 0.12.7 — install ≥ 0.12.8 from upstream or your distro backports.
 - **The window icon shows in the title bar but the taskbar entry stays generic on Wayland.** First launch installs `~/.local/share/icons/.../LinuxBroadcast.png` and a matching `.desktop` file; KDE may need `kbuildsycoca6 --noincremental` once or a re-login to refresh its sycoca cache.
+- **The image looks soft / low frame rate.** LinuxBroadcast auto-selects MJPEG for full-resolution 30 fps. A few cheap webcams ship a buggy hardware JPEG encoder; if the picture looks blocky, run with `LB_FORCE_RAW=1` to force uncompressed capture (lower max framerate, but no JPEG artefacts).
 
 ## Repo layout
 

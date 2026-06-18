@@ -61,6 +61,12 @@ ffplay -fflags nobuffer -f v4l2 -input_format yuyv422 \
 # loop, needs an ffmpeg consumer), infer_bench.rs (segment-only, CPU vs GPU),
 # composite_bench.rs (composite stage per background mode).
 LB_PROFILE=1 LB_INFER_INTERVAL=2 cargo run --release -p linux-broadcast
+
+# Source codec. The feeder auto-selects MJPEG (3× framerate on USB cams:
+# C920 720p is 30 fps MJPEG vs 10 fps raw YUYV) and falls back to raw if
+# the camera can't negotiate it. LB_FORCE_RAW=1 skips the MJPEG attempt
+# (escape hatch for cameras with a bad hardware JPEG encoder).
+LB_FORCE_RAW=1 cargo run --release -p linux-broadcast
 ```
 
 System dev packages are listed in [README §Build from source](README.md#option-b--build-from-source). Pin `v4l2loopback-dkms ≥ 0.12.8` — 0.12.7 fails to build on kernel 6.8+.
@@ -100,6 +106,7 @@ Cargo workspace, two crates:
                               ▼                               │
    ┌──────────  source graph (built on Live, dropped on Idle)  ─┐
    │ v4l2src device=$SOURCE                                     │
+   │   [ ! image/jpeg ! jpegdec ]   ← MJPEG path only           │
    │   ! videoscale ! videoconvert                              │
    │   ! video/x-raw,format=RGBA,width=W,height=H               │
    │   ! appsink (sync=false, drop=true, max-buffers=2)         │
@@ -120,8 +127,11 @@ Non-obvious settings — these took a session each to nail:
 - **`v4l2sink async=false`** — without it the pipeline deadlocks on the PLAYING transition: v4l2sink waits for a preroll buffer that the lazy feeder may never push.
 - **`v4l2src do-timestamp=true`** — without it the output stream's PTS is wrong and v4l2sink's pacing slips.
 - **Caps strategy:** the source-side capsfilter pins **only RGBA + width/height** (no framerate). Forcing 30/1 caused negotiation failures with the C920 (camera reports `30000/1001`). The appsrc-side caps **do** declare framerate, otherwise the sink-side videoconvert asserts `fps_n == out_fps_n`.
+- **Source codec auto-selects MJPEG, falls back to raw.** `v4l2src` can't decode MJPEG itself, so the source graph (`pipeline::build_source_pipeline`, parameterised by `SourceCodec`) optionally inserts an `image/jpeg` capsfilter + `jpegdec` before `videoscale`. The feeder's `start_source` (`lazy.rs`) tries MJPEG first, then raw, driving each attempt to PLAYING and waiting on `pipeline.state()` so a camera that can't negotiate `image/jpeg` fails synchronously and falls back. The resolved codec is memoised, so a raw-only camera pays the probe once per process. **Why it matters:** on bandwidth-limited USB cameras the compressed path is far faster — a C920 does 720p/1080p at 30 fps over MJPEG but is capped at 10 fps for raw YUYV. The `image/jpeg` caps pin **no** width/height (same framerate-fraction reasons), so the camera picks a native MJPEG mode and `videoscale` conforms it to the target — the win lands at any resolution, including non-native ones like the `1280×900` default. `LB_FORCE_RAW=1` skips the MJPEG attempt (escape hatch for the rare camera with a bad hardware JPEG encoder); mirrors the `LB_FORCE_CPU` idiom. `jpegdec` ships in `gstreamer1.0-plugins-good` — the same package as `v4l2src`/`v4l2sink`, so no new dependency.
 
 Live setting changes (background mode, blur strength, image swap, GUI preview toggle, auto-frame on/off) flow over a `crossbeam-channel` of `Command`s and apply on the next feeder tick — no graph rebuild. Camera, resolution, and **model** changes still require Stop+Start.
+
+The reverse direction (feeder → GUI) is `PipelineState`, an `Arc<Mutex<…>>` the GUI polls each frame. While Live it carries **measured output fps** (a cheap always-on ~1 s rolling meter on the feeder, independent of the `LB_PROFILE` profiler) and **`CaptureInfo`** — the camera's native capture `width×height` + codec read once per engagement from the named `lb-source` `v4l2src` src pad (read straight from the caps structure, since `image/jpeg` MJPEG caps don't parse as `VideoInfo`). These surface as the preview-pane fps pill and the footer's `in <dev> · MJPEG 1280×720` readout — real values, not the config target. `publish_state` dedups on state/consumer change to avoid ~30 lock+clone/s while Live; a `telemetry_dirty` flag lets the ~1 Hz fps/capture updates through.
 
 #### Lazy mode constants and consumer detection
 

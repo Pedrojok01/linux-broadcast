@@ -33,12 +33,38 @@ use crate::consumer_watch::{Consumer, Watcher};
 use crate::lazy::spawn_feeder;
 use crate::segmenter::{Backend, ModelKind};
 
+/// Which capture codec the source graph asks `v4l2src` to deliver.
+///
+/// `v4l2src` does not decode MJPEG itself, so the only way to use a
+/// camera's compressed modes is to pin `image/jpeg` caps and add a
+/// `jpegdec`. On bandwidth-limited USB cameras the compressed path is
+/// dramatically faster (e.g. a C920 does 720p at 30 fps over MJPEG vs
+/// 10 fps for raw YUYV). The feeder picks the codec via a try-MJPEG-
+/// then-fallback-to-raw policy; see `lazy::Feeder::start_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCodec {
+    /// Pin `image/jpeg` on `v4l2src` and decode with `jpegdec`.
+    Mjpeg,
+    /// Let `v4l2src` deliver raw frames (YUYV/NV12/…); today's behavior.
+    Raw,
+}
+
+impl SourceCodec {
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceCodec::Mjpeg => "MJPEG",
+            SourceCodec::Raw => "raw",
+        }
+    }
+}
+
 /// Builder for the source GStreamer graph. Production code uses
 /// [`build_source_pipeline`] (the default); tests substitute a closure
 /// that wires a `videotestsrc` so the synthetic-graph integration suite
 /// can run without `/dev/video0`. See [`Pipeline::start_with_builders`].
-pub type SourceBuilder =
-    Arc<dyn Fn(&PipelineConfig) -> Result<(gst::Pipeline, gst_app::AppSink)> + Send + Sync>;
+pub type SourceBuilder = Arc<
+    dyn Fn(&PipelineConfig, SourceCodec) -> Result<(gst::Pipeline, gst_app::AppSink)> + Send + Sync,
+>;
 
 /// Builder for the sink GStreamer graph. Production code uses
 /// [`build_sink_pipeline`] (the default); tests substitute a closure
@@ -132,6 +158,18 @@ pub enum Command {
     Stop,
 }
 
+/// Native camera capture format negotiated for the source graph. Distinct
+/// from the RGBA target the appsink reports: `width`/`height` are the
+/// camera's native dimensions and `codec` is how they're delivered (e.g.
+/// 1280×720 MJPEG vs an upscaled 800×448 YUYV). Surfaced in the GUI so the
+/// footer shows what the camera actually delivers.
+#[derive(Debug, Clone)]
+pub struct CaptureInfo {
+    pub width: u32,
+    pub height: u32,
+    pub codec: SourceCodec,
+}
+
 /// Public pipeline state, polled by the GUI for the footer indicator.
 #[derive(Debug, Clone, Default)]
 pub enum PipelineState {
@@ -140,7 +178,14 @@ pub enum PipelineState {
     Idle,
     /// Camera engaged; one or more consumers are reading
     /// `/dev/video10` (or the GUI preview heartbeat is asserting demand).
-    Live { consumers: Vec<Consumer> },
+    /// `fps` is the measured output framerate (rolling ~1 s window, `None`
+    /// until the first window completes); `capture` is the native camera
+    /// format. Both are populated by the feeder while Live.
+    Live {
+        consumers: Vec<Consumer>,
+        fps: Option<f32>,
+        capture: Option<CaptureInfo>,
+    },
 }
 
 pub struct Pipeline {
@@ -375,20 +420,29 @@ pub(crate) fn build_sink_pipeline(
     Ok((pipeline, appsrc))
 }
 
-/// Build the source graph. Returned `AppSink` is pulled by the feeder.
-/// The caller is expected to set the pipeline to PLAYING immediately;
-/// see `lazy::Feeder::start_source`.
+/// Build the source graph for the given capture `codec`. Returned
+/// `AppSink` is pulled by the feeder. The caller is expected to set the
+/// pipeline to PLAYING immediately; see `lazy::Feeder::start_source`.
 pub(crate) fn build_source_pipeline(
     cfg: &PipelineConfig,
+    codec: SourceCodec,
 ) -> Result<(gst::Pipeline, gst_app::AppSink)> {
     let pipeline = gst::Pipeline::new();
 
-    // Let v4l2src negotiate whatever format the camera prefers (YUYV,
-    // MJPEG-decoded, NV12, …). videoscale + videoconvert then bridge
-    // the camera-native caps to our RGBA target. Constraining only at
-    // the appsink end avoids 30/1-vs-30000/1001 framerate-fraction
+    // v4l2src ! [image/jpeg ! jpegdec !] videoscale ! videoconvert !
+    // video/x-raw,RGBA,WxH ! appsink.
+    //
+    // Raw lets v4l2src negotiate whatever uncompressed format the camera
+    // prefers (YUYV/NV12/…). MJPEG pins `image/jpeg` so the camera
+    // delivers its compressed modes — far higher framerate on USB —
+    // and jpegdec decodes. We deliberately do NOT pin width/height (or
+    // framerate) on the `image/jpeg` caps: the camera picks a native
+    // MJPEG resolution and videoscale conforms it to the target, so the
+    // path works at any target resolution. Constraining only at the
+    // appsink end also avoids the 30/1-vs-30000/1001 framerate-fraction
     // mismatches that fail v4l2src negotiation.
     let src = gst::ElementFactory::make("v4l2src")
+        .name("lb-source")
         .property("device", &cfg.source_device)
         .property("do-timestamp", true)
         .build()?;
@@ -410,15 +464,30 @@ pub(crate) fn build_source_pipeline(
         .enable_last_sample(false)
         .build();
 
-    pipeline.add_many([
-        &src,
-        &src_scale,
-        &src_convert,
-        &src_capsfilter,
-        appsink.upcast_ref(),
-    ])?;
+    // jpeg head, only present on the MJPEG path. jpegdec has static pads
+    // so it links statically with link_many (decodebin would not, and
+    // would not force MJPEG anyway).
+    let jpeg_head = match codec {
+        SourceCodec::Mjpeg => {
+            let jpeg_caps = gst::Caps::builder("image/jpeg").build();
+            let jpeg_capsfilter = gst::ElementFactory::make("capsfilter")
+                .property("caps", &jpeg_caps)
+                .build()?;
+            let jpegdec = gst::ElementFactory::make("jpegdec").build()?;
+            Some((jpeg_capsfilter, jpegdec))
+        }
+        SourceCodec::Raw => None,
+    };
+
+    pipeline.add_many([&src, &src_scale, &src_convert, &src_capsfilter])?;
+    pipeline.add(appsink.upcast_ref::<gst::Element>())?;
+    if let Some((jpeg_capsfilter, jpegdec)) = &jpeg_head {
+        pipeline.add_many([jpeg_capsfilter, jpegdec])?;
+        gst::Element::link_many([&src, jpeg_capsfilter, jpegdec, &src_scale])?;
+    } else {
+        src.link(&src_scale)?;
+    }
     gst::Element::link_many([
-        &src,
         &src_scale,
         &src_convert,
         &src_capsfilter,
@@ -453,6 +522,23 @@ pub(crate) fn log_negotiated_input(appsink: &gst_app::AppSink) {
             info.format(),
         );
     }
+}
+
+/// Read the **native** capture dimensions from the `v4l2src` src pad of a
+/// source pipeline (the element is named `lb-source` in
+/// [`build_source_pipeline`]). Unlike [`log_negotiated_input`] — which reads
+/// the always-RGBA appsink — this reports what the camera actually delivers
+/// (e.g. 1280×720 for MJPEG). Reads width/height straight from the caps
+/// structure rather than [`gst_video::VideoInfo`], which rejects the
+/// non-raw `image/jpeg` caps the MJPEG path carries. Returns `None` if the
+/// element or caps are unavailable.
+pub(crate) fn capture_dims(source_pipeline: &gst::Pipeline) -> Option<(u32, u32)> {
+    let src = source_pipeline.by_name("lb-source")?;
+    let caps = src.static_pad("src")?.current_caps()?;
+    let s = caps.structure(0)?;
+    let w = s.get::<i32>("width").ok()?;
+    let h = s.get::<i32>("height").ok()?;
+    Some((w as u32, h as u32))
 }
 
 fn install_bus_logger(pipeline: &gst::Pipeline, tag: &'static str) {

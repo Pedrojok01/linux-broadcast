@@ -18,7 +18,7 @@ use anyhow::Result;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use lb_pipeline::pipeline::{SinkBuilder, SourceBuilder};
+use lb_pipeline::pipeline::{SinkBuilder, SourceBuilder, SourceCodec};
 use lb_pipeline::{Background, Command, Pipeline, PipelineConfig, PipelineState};
 
 // Real model bytes — these tests only run with `Background::None`, so
@@ -44,9 +44,10 @@ fn cfg() -> PipelineConfig {
 }
 
 /// `videotestsrc → videoconvert → capsfilter(RGBA, WxH) → appsink`.
+/// The codec arg is ignored — `videotestsrc` always produces raw frames.
 fn synthetic_source() -> SourceBuilder {
     Arc::new(
-        |cfg: &PipelineConfig| -> Result<(gst::Pipeline, gst_app::AppSink)> {
+        |cfg: &PipelineConfig, _codec: SourceCodec| -> Result<(gst::Pipeline, gst_app::AppSink)> {
             let pipeline = gst::Pipeline::new();
             let src = gst::ElementFactory::make("videotestsrc")
                 .property_from_str("pattern", "ball")
@@ -123,13 +124,32 @@ fn synthetic_sink(captured_sink: Arc<Mutex<Option<gst_app::AppSink>>>) -> SinkBu
     )
 }
 
+/// Like [`synthetic_source`] but fails when asked for MJPEG — emulates a
+/// raw-only camera so the feeder's codec policy must fall back to raw.
+fn raw_only_source() -> SourceBuilder {
+    let inner = synthetic_source();
+    Arc::new(move |cfg: &PipelineConfig, codec: SourceCodec| {
+        if codec == SourceCodec::Mjpeg {
+            anyhow::bail!("synthetic camera does not support MJPEG");
+        }
+        inner(cfg, codec)
+    })
+}
+
 fn start_pipeline(cfg: PipelineConfig) -> (Pipeline, Arc<Mutex<Option<gst_app::AppSink>>>) {
+    start_pipeline_with_source(cfg, synthetic_source())
+}
+
+fn start_pipeline_with_source(
+    cfg: PipelineConfig,
+    source: SourceBuilder,
+) -> (Pipeline, Arc<Mutex<Option<gst_app::AppSink>>>) {
     let captured = Arc::new(Mutex::new(None));
     let p = Pipeline::start_with_builders(
         cfg,
         MODEL_MULTICLASS_ONNX,
         MODEL_RVM_ONNX,
-        synthetic_source(),
+        source,
         synthetic_sink(captured.clone()),
     )
     .expect("start_with_builders");
@@ -296,6 +316,34 @@ fn set_background_no_frame_gap() {
             "expected ≥3 frames during 1200ms in mode swap, got {n}",
         );
     }
+
+    p.stop();
+}
+
+/// When the camera can't negotiate MJPEG, the feeder's codec policy must
+/// fall back to raw and still reach Live. Uses a source builder that
+/// errors on `SourceCodec::Mjpeg` and succeeds on `Raw`.
+#[test]
+fn source_codec_falls_back_to_raw_when_mjpeg_unavailable() {
+    let c = cfg();
+    let (p, captured) = start_pipeline_with_source(c, raw_only_source());
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let sink = captured.lock().unwrap().clone().unwrap();
+
+    // Through the activation debounce, then assert Live was reached via
+    // the raw fallback and frames actually flow.
+    let _ = pull_frames_for(&sink, Duration::from_millis(2200));
+    assert!(
+        matches!(p.state(), PipelineState::Live { .. }),
+        "expected Live via raw fallback after MJPEG failed",
+    );
+    let live_count = pull_frames_for(&sink, Duration::from_millis(2000));
+    assert!(
+        live_count >= 12,
+        "expected ≥12 Live frames in 2s via raw fallback, got {live_count}",
+    );
 
     p.stop();
 }

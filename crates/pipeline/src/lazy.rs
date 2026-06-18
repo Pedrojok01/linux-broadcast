@@ -38,8 +38,8 @@ use crate::consumer_watch::Consumer;
 use crate::framing::{AnchorLock, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
 use crate::idle_loader::IdleLoader;
 use crate::pipeline::{
-    Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
-    log_negotiated_input,
+    CaptureInfo, Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
+    SourceCodec, capture_dims, log_negotiated_input,
 };
 use crate::profile::Profiler;
 use crate::segmenter::{Backend, Mask, ModelKind, Segmenter};
@@ -181,6 +181,12 @@ pub(crate) fn spawn_feeder(
                 sink_appsrc,
                 source: None,
                 source_builder,
+                resolved_codec: std::env::var_os("LB_FORCE_RAW").map(|_| SourceCodec::Raw),
+                live_fps: None,
+                capture_info: None,
+                fps_win_start: Instant::now(),
+                fps_win_frames: 0,
+                telemetry_dirty: false,
                 consumers: Vec::new(),
                 preview_enabled: true,
                 gui_preview_active: false,
@@ -227,8 +233,26 @@ struct Feeder {
     /// `pipeline::build_source_pipeline`; tests substitute a synthetic
     /// builder. Called on every Live engagement.
     source_builder: SourceBuilder,
+    /// Capture codec resolved by the first successful `start_source`.
+    /// `None` until then; afterwards every Live engagement reuses it, so
+    /// a raw-only camera pays the failed-MJPEG probe only once per
+    /// process. Forced to `Raw` up-front when `LB_FORCE_RAW` is set.
+    resolved_codec: Option<SourceCodec>,
     /// Source GST graph + its appsink; only `Some` while Live.
     source: Option<(gst::Pipeline, gst_app::AppSink)>,
+    /// Measured output framerate (rolling ~1 s window), published to the
+    /// GUI. `None` until the first window completes; cleared on Live exit.
+    live_fps: Option<f32>,
+    /// Native camera capture format, read from the `v4l2src` src pad once
+    /// per Live engagement. Cleared on Live exit.
+    capture_info: Option<CaptureInfo>,
+    /// Rolling fps-window start and frame count. Always-on (independent of
+    /// `LB_PROFILE`); cheap (one increment + one `Instant` compare/frame).
+    fps_win_start: Instant,
+    fps_win_frames: u32,
+    /// Set when `live_fps`/`capture_info` change so `publish_state` knows to
+    /// re-publish despite no state/consumer change. Cleared after publish.
+    telemetry_dirty: bool,
     consumers: Vec<Consumer>,
     /// Mirrors the GUI's "Show preview" toggle. When false, frames are
     /// not forwarded to `preview_tx` (skips a 1280×720 RGBA clone per
@@ -449,17 +473,81 @@ impl Feeder {
     }
 
     fn start_source(&mut self) -> Result<()> {
-        let (pipeline, appsink) = (self.source_builder)(&self.cfg)?;
+        // Codec policy: reuse the codec resolved by a previous engagement
+        // (also the path when `LB_FORCE_RAW` pinned `Raw` up-front);
+        // otherwise try MJPEG first, then raw. MJPEG is dramatically
+        // faster on bandwidth-limited USB cameras (e.g. C920 720p: 30 fps
+        // MJPEG vs 10 fps raw), so we prefer it whenever the camera can
+        // negotiate it.
+        let attempts: &[SourceCodec] = match self.resolved_codec {
+            Some(SourceCodec::Mjpeg) => &[SourceCodec::Mjpeg],
+            Some(SourceCodec::Raw) => &[SourceCodec::Raw],
+            None => &[SourceCodec::Mjpeg, SourceCodec::Raw],
+        };
+
+        let mut last_err = None;
+        for &codec in attempts {
+            match self.try_start_source(codec) {
+                Ok((pipeline, appsink)) => {
+                    self.resolved_codec = Some(codec);
+                    log::info!(
+                        "source camera engaged via {} ({} → composite → /dev/video10)",
+                        codec.label(),
+                        self.cfg.source_device
+                    );
+                    log_negotiated_input(&appsink);
+                    // Capture the camera's native format for the GUI footer.
+                    self.capture_info =
+                        capture_dims(&pipeline).map(|(width, height)| CaptureInfo {
+                            width,
+                            height,
+                            codec,
+                        });
+                    // Restart the fps window so the first measurement reflects
+                    // this engagement, not the gap since the last one.
+                    self.fps_win_start = Instant::now();
+                    self.fps_win_frames = 0;
+                    self.telemetry_dirty = true;
+                    self.source = Some((pipeline, appsink));
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempts.len() > 1 {
+                        log::warn!(
+                            "source camera could not engage via {} ({e:#}); trying next codec",
+                            codec.label(),
+                        );
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no source codec attempted")))
+    }
+
+    /// Build the source graph for `codec`, drive it to PLAYING, and block
+    /// until the state change completes so a negotiation failure (e.g. a
+    /// camera without MJPEG) surfaces synchronously as an `Err` we can
+    /// fall back from. On failure the half-built graph is torn down to
+    /// PLAYING so it releases `/dev/video0` before the next attempt.
+    fn try_start_source(&self, codec: SourceCodec) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+        let (pipeline, appsink) = (self.source_builder)(&self.cfg, codec)?;
         pipeline
             .set_state(gst::State::Playing)
             .context("source pipeline → Playing")?;
-        log::info!(
-            "source camera engaged ({} → composite → /dev/video10)",
-            self.cfg.source_device
-        );
-        log_negotiated_input(&appsink);
-        self.source = Some((pipeline, appsink));
-        Ok(())
+        // Wait for the PLAYING transition to resolve. A live v4l2src that
+        // can't satisfy the requested caps fails here rather than on the
+        // bus, letting us fall back to the next codec deterministically.
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(2));
+        if let Err(e) = res {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = pipeline.state(gst::ClockTime::from_seconds(1));
+            return Err(anyhow::Error::new(e).context(format!(
+                "source pipeline did not reach Playing ({})",
+                codec.label()
+            )));
+        }
+        Ok((pipeline, appsink))
     }
 
     fn stop_source(&mut self) {
@@ -475,6 +563,12 @@ impl Feeder {
             let _ = pipeline.state(gst::ClockTime::from_seconds(1));
             log::info!("source camera released ({})", self.cfg.source_device);
         }
+        // Drop telemetry so the GUI doesn't show stale fps/capture once the
+        // camera is released.
+        self.live_fps = None;
+        self.capture_info = None;
+        self.fps_win_frames = 0;
+        self.telemetry_dirty = true;
     }
 
     fn shutdown(&mut self) {
@@ -491,7 +585,9 @@ impl Feeder {
         let state_changed = std::mem::discriminant(&prev) != std::mem::discriminant(&self.state);
         let pids_now: HashSet<u32> = self.consumers.iter().map(|c| c.pid).collect();
         let consumers_changed = pids_now != self.last_published_pids;
-        if !state_changed && !consumers_changed {
+        // `telemetry_dirty` lets ~1×/s fps updates (and the one-shot capture
+        // read) through; without it the dedup below would suppress them.
+        if !state_changed && !consumers_changed && !self.telemetry_dirty {
             return;
         }
 
@@ -517,6 +613,8 @@ impl Feeder {
         let public = match self.state {
             State::Live => PipelineState::Live {
                 consumers: self.consumers.clone(),
+                fps: self.live_fps,
+                capture: self.capture_info.clone(),
             },
             // Activating/Deactivating both look "Idle-ish" to the GUI; we
             // only flip the public state when frames are actually flowing.
@@ -526,6 +624,7 @@ impl Feeder {
             *slot = public;
         }
         self.last_published_pids = pids_now;
+        self.telemetry_dirty = false;
     }
 
     /// Compute the auto-frame transform from a freshly segmented mask.
@@ -710,10 +809,25 @@ impl Feeder {
         // on the consumer side.
         if pushed {
             self.last_idle_push = None;
+            self.tick_fps_meter();
         }
 
         self.profiler
             .record(t_pull, segment_dur, t_composite, t_push, t_start.elapsed());
+    }
+
+    /// Count one output frame and, once per ~1 s window, recompute the
+    /// measured output framerate published to the GUI. Always-on and cheap;
+    /// independent of the `LB_PROFILE`-gated `Profiler`.
+    fn tick_fps_meter(&mut self) {
+        self.fps_win_frames += 1;
+        let elapsed = self.fps_win_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.live_fps = Some(self.fps_win_frames as f32 / elapsed.as_secs_f32());
+            self.fps_win_start = Instant::now();
+            self.fps_win_frames = 0;
+            self.telemetry_dirty = true;
+        }
     }
 
     /// Render the next loader frame (dark bg + logo + rotating spinner)
