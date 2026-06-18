@@ -1,8 +1,7 @@
-//! Bilinear samplers + the auto-frame crop-and-rescale used by both
-//! `Background::Blur` (post-composite) and `Background::None` (raw frame)
-//! when framing is on.
-
-use super::Framing;
+//! Bilinear samplers used by the `Background::Image` asymmetric framing
+//! blend. The Blur/None auto-frame crop now goes through the SIMD resizer
+//! (`Compositor::crop_and_rescale`); only the per-pixel decontaminating
+//! Image remap still samples by hand.
 
 /// Minimum α at which alpha decontamination is applied. Below this the
 /// `1/α` division amplifies bilinear noise badly without changing the
@@ -95,37 +94,6 @@ pub(super) fn sample_fg_bilinear(
         rgb[c] = top * (1.0 - fy) + bot * fy;
     }
     (m, rgb)
-}
-
-/// Crop a window of `scratch` and bilinearly rescale it into `frame`.
-/// Both buffers are RGBA8 of dimensions `w × h`. Used by the
-/// `Background::Blur` and `Background::None` framing paths to apply the
-/// auto-frame transform after (Blur) or instead of (None) compositing.
-/// Sampling indices are edge-clamped, but the caller's anchor math
-/// (`lazy.rs` `min_dst_y` clamp + horizontal `min_src_x..max_src_x`
-/// clamp) keeps the window strictly inside the source in normal
-/// operation.
-pub(super) fn crop_and_rescale_in_place(
-    frame: &mut [u8],
-    scratch: &[u8],
-    w: usize,
-    h: usize,
-    f: Framing,
-) {
-    debug_assert_eq!(scratch.len(), frame.len());
-    let inv_zoom = 1.0 / f.zoom.max(1e-4);
-    for y in 0..h {
-        let src_yf = f.src_anchor_y + (y as f32 + 0.5 - f.dst_anchor_y) * inv_zoom - 0.5;
-        for x in 0..w {
-            let src_xf = f.src_anchor_x + (x as f32 + 0.5 - f.dst_anchor_x) * inv_zoom - 0.5;
-            let rgb = sample_rgb_bilinear(scratch, w, h, src_xf, src_yf);
-            let pi = (y * w + x) * 4;
-            frame[pi] = rgb[0] as u8;
-            frame[pi + 1] = rgb[1] as u8;
-            frame[pi + 2] = rgb[2] as u8;
-            frame[pi + 3] = 255;
-        }
-    }
 }
 
 /// Resolve a fractional 1D coordinate into the (lo, hi, frac) triple a

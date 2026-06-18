@@ -75,7 +75,6 @@ use crate::Mask;
 use blend::{asymmetric_blend, blend, decontaminated_blend};
 use blur::box_blur_rgba;
 use plate::{BgPlate, PLATE_CONF_THRESHOLD, compute_bg_mean};
-use sample::crop_and_rescale_in_place;
 
 /// Minimum kernel radius (px) at `strength = 0.0`. Anything weaker than
 /// this looked muddy rather than blurred — segmentation imperfections at
@@ -307,7 +306,7 @@ impl Compositor {
         if let (Background::None, Some(f)) = (background, framing) {
             self.ensure_composite_scratch(frame.len());
             self.composite_scratch.copy_from_slice(frame);
-            crop_and_rescale_in_place(frame, &self.composite_scratch, w, h, f);
+            self.crop_and_rescale(frame, width, height, f)?;
             return Ok(());
         }
 
@@ -341,7 +340,7 @@ impl Compositor {
                 if let Some(f) = framing {
                     self.ensure_composite_scratch(frame.len());
                     self.composite_scratch.copy_from_slice(frame);
-                    crop_and_rescale_in_place(frame, &self.composite_scratch, w, h, f);
+                    self.crop_and_rescale(frame, width, height, f)?;
                 }
             }
             Background::Image {
@@ -394,6 +393,50 @@ impl Compositor {
         if self.composite_scratch.len() != n {
             self.composite_scratch.resize(n, 0);
         }
+    }
+
+    /// Apply the auto-frame transform (recenter + uniform zoom) by
+    /// resampling `composite_scratch` into `frame` with the SIMD resizer.
+    /// The transform is a pure axis-aligned crop + uniform scale, so it
+    /// maps directly to a `fast_image_resize` crop box — ~10× faster than a
+    /// hand-rolled scalar bilinear loop at frame resolution, which is the
+    /// single most expensive composite stage when auto-frame is on.
+    ///
+    /// The crop box reproduces the previous sampler's mapping: output pixel
+    /// `x` sampled source `src_anchor_x + (x + 0.5 − dst_anchor_x)/zoom −
+    /// 0.5`, which is a `[left, left + w/zoom)` window with
+    /// `left = src_anchor_x − dst_anchor_x/zoom` (fr's pixel-centre
+    /// convention cancels the ±0.5 terms). `zoom ≥ 1` ⇒ the window never
+    /// exceeds the source; the clamp only guards float edge cases and the
+    /// rare anchor pushed past the frame border (previously edge-clamped).
+    /// Caller must have copied the source into `composite_scratch` first.
+    fn crop_and_rescale(
+        &mut self,
+        frame: &mut [u8],
+        width: u32,
+        height: u32,
+        f: Framing,
+    ) -> Result<()> {
+        let inv = 1.0_f64 / (f.zoom.max(1e-4) as f64);
+        let (wf, hf) = (width as f64, height as f64);
+        let cw = (wf * inv).min(wf);
+        let ch = (hf * inv).min(hf);
+        let left = ((f.src_anchor_x as f64) - (f.dst_anchor_x as f64) * inv).clamp(0.0, wf - cw);
+        let top = ((f.src_anchor_y as f64) - (f.dst_anchor_y as f64) * inv).clamp(0.0, hf - ch);
+
+        let src = ImageRef::new(
+            width,
+            height,
+            self.composite_scratch.as_slice(),
+            fr::PixelType::U8x4,
+        )
+        .map_err(|e| anyhow!("crop src: {e}"))?;
+        let mut dst = Image::from_slice_u8(width, height, frame, fr::PixelType::U8x4)
+            .map_err(|e| anyhow!("crop dst: {e}"))?;
+        let opts = Self::resize_opts().crop(left, top, cw, ch);
+        self.resizer
+            .resize(&src, &mut dst, &opts)
+            .map_err(|e| anyhow!("crop resize: {e}"))
     }
 
     /// Fill `self.plate_materialized` with the bg plate at frame

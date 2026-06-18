@@ -603,12 +603,19 @@ fn blur_framing_crops_whole_composite() {
         width: w,
         height: h,
     };
+    // A realistic auto-frame transform: zoom 1.5 anchored on the
+    // silhouette centre (src x = 6). Production framing is always a
+    // zoom ≥ FG_ZOOM (> 1) with the anchor clamped to keep the crop
+    // window inside the source — a pure zoom-1 translation (which a
+    // crop box can't express) never occurs. The whole composite (sharp
+    // blue silhouette + blurred red plate) must zoom together: the
+    // stripe lands around out x ∈ [3, 9), red elsewhere.
     let framing = Framing {
         src_anchor_x: 6.0,
         src_anchor_y: h as f32 * 0.5,
-        dst_anchor_x: 14.0,
+        dst_anchor_x: 6.0,
         dst_anchor_y: h as f32 * 0.5,
-        zoom: 1.0,
+        zoom: 1.5,
     };
     let mut c = Compositor::new();
     c.composite(
@@ -621,19 +628,19 @@ fn blur_framing_crops_whole_composite() {
     )
     .unwrap();
 
-    // Spot-check the centre of the shifted silhouette is dominantly
+    // Spot-check the centre of the zoomed silhouette is dominantly
     // blue, and a far-away bg pixel is dominantly red. The blur
     // softens the transition, so we accept any pixel whose blue >
     // red as "fg-dominant" and vice versa.
-    let center_pi = (4 * w as usize + 13) * 4; // shifted silhouette centre
+    let center_pi = (4 * w as usize + 6) * 4; // zoomed silhouette centre
     assert!(
         frame[center_pi + 2] > frame[center_pi],
-        "shifted silhouette centre at out x=13 should be blue-dominant; got rgb=({}, {}, {})",
+        "zoomed silhouette centre at out x=6 should be blue-dominant; got rgb=({}, {}, {})",
         frame[center_pi],
         frame[center_pi + 1],
         frame[center_pi + 2],
     );
-    let far_pi = (4 * w as usize + 28) * 4; // well outside the shift
+    let far_pi = (4 * w as usize + 28) * 4; // well outside the silhouette
     assert!(
         frame[far_pi] > frame[far_pi + 2],
         "far bg pixel at out x=28 should be red-dominant; got rgb=({}, {}, {})",
@@ -641,6 +648,37 @@ fn blur_framing_crops_whole_composite() {
         frame[far_pi + 1],
         frame[far_pi + 2],
     );
+}
+
+#[test]
+fn framing_window_out_of_bounds_clamps_without_panic() {
+    // A framing whose crop window extends past the source bounds (anchor
+    // at the top-left source corner placed at the bottom-right output
+    // corner, with a real zoom) drives `left`/`top` strongly negative.
+    // The SIMD crop path must clamp the crop box back inside the source
+    // — `fast_image_resize`'s `CropBox` validation is strict and would
+    // error on an out-of-bounds box — so this must composite cleanly
+    // (no panic) with a fully-written opaque frame. Exercises both the
+    // Blur and None `crop_and_rescale` callers.
+    let (w, h) = (48u32, 32u32);
+    let mask = mask_const(w, h, 0.5);
+    let framing = Framing {
+        src_anchor_x: 0.0,
+        src_anchor_y: 0.0,
+        dst_anchor_x: w as f32,
+        dst_anchor_y: h as f32,
+        zoom: 1.05,
+    };
+    for bg in [Background::Blur { strength: 0.3 }, Background::None] {
+        let mut frame = solid_frame(w, h, [40, 80, 120, 255]);
+        let mut c = Compositor::new();
+        c.composite(&mut frame, w, h, &mask, &bg, Some(framing))
+            .expect("out-of-bounds framing must clamp, not error");
+        assert_eq!(frame.len(), (w * h * 4) as usize);
+        for px in frame.chunks_exact(4) {
+            assert_eq!(px[3], 255, "every pixel must be written opaque");
+        }
+    }
 }
 
 proptest! {
