@@ -43,8 +43,14 @@ cargo deb -p linux-broadcast
 cargo run --release -p linux-broadcast --features cuda
 packaging/build-cuda-addon.sh   # builds the linux-broadcast-cuda add-on .deb
 
-# Cut a release. Bumps Cargo.toml + path-dep + Cargo.lock, runs CI
-# checks, commits, tags. --push to send to origin and let CI ship.
+# Cut a release. Precondition: your changes are already committed AND
+# pushed to origin/main — the script refuses a dirty tree or an
+# unpushed-ahead main (it only adds the version bump + tag on top).
+# Bumps Cargo.toml + path-dep + Cargo.lock, runs the CI gates, commits
+# "Release X.Y.Z", tags vX.Y.Z. --push sends the commit + tag; the tag
+# triggers release.yml, which validates tag==version (else fails), then
+# builds the .deb + GPU add-on, publishes the GitHub Release, and pushes
+# to AUR. So the bump is mandatory — a bare tag would fail CI.
 scripts/release.sh 0.1.3 --push
 
 # Verify the virtual cam from another terminal (only works while the
