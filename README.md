@@ -143,16 +143,106 @@ Verify it engaged: `RUST_LOG=info linux-broadcast` logs
 `ONNX Runtime: CUDA execution provider registered`. A working NVIDIA driver
 (`nvidia-smi`) supporting CUDA 13 is required.
 
-### RTX 50 / Blackwell
+### New NVIDIA architectures: build a custom CUDA provider
 
-The CUDA provider bundled with this release does not contain kernels for
-Blackwell consumer GPUs (RTX 50 series, SM 120). On those GPUs LinuxBroadcast
-will log the failed GPU inference, show **GPU unavailable · CPU** in the
-footer, and continue on CPU rather than dropping every frame. To use GPU
-acceleration, build an ONNX Runtime CUDA provider from source with
-`CMAKE_CUDA_ARCHITECTURES=120` (or `native`) and package it with the matching
-LinuxBroadcast / ONNX Runtime build. Installing a newer NVIDIA driver or CUDA
-runtime alone cannot add a missing kernel image to the shipped provider.
+The prebuilt ONNX Runtime CUDA provider is compiled only for a fixed set of
+GPU architectures. If your GPU is newer than that set, session creation can
+succeed but the first inference can fail with
+`cudaErrorNoKernelImageForDevice`. LinuxBroadcast then shows **GPU unavailable
+· CPU** and continues on CPU. Updating only the NVIDIA driver or CUDA runtime
+cannot add a kernel image that was omitted from the provider.
+
+This happened, for example, with Blackwell consumer GPUs (RTX 50 series,
+compute capability / SM 120). The following procedure makes a local package
+for a newer architecture. It is intentionally an advanced build: the custom
+ONNX Runtime static library, its CUDA provider libraries, and the
+LinuxBroadcast binary must all come from the same ONNX Runtime version and
+build configuration.
+
+1. Identify the required CUDA architecture. Check the GPU name with
+   `nvidia-smi`, then look up its compute capability in NVIDIA's CUDA GPU table.
+   For an RTX 50 card use `120`. If one package must support several GPU
+   generations, provide a semicolon-separated list such as `89;120`; a build
+   for only `120` is not a universal replacement for older GPUs.
+
+2. Find the ONNX Runtime version used by this checkout. Build it once normally,
+   then inspect `ort-sys`'s build output:
+
+   ```bash
+   cargo build --release -p linux-broadcast --features cuda
+   find target -path '*/build/ort-sys-*/output' -type f \
+     -exec grep -H 'downloading from' {} \;
+   ```
+
+   The URL includes the ONNX Runtime version and CUDA major version. Use an
+   `ort-artifacts` revision that supports that exact ONNX Runtime release; do
+   not assume the newest artifact-builder revision is compatible with an older
+   release.
+
+3. Build ONNX Runtime from that release with the same CUDA major version and
+   cuDNN major version as the prebuilt provider, but add your architecture.
+   The `pykeio/ort-artifacts` static-build wrapper is a convenient way to
+   produce the layout required by the Rust `ort` crate. Its essential CMake
+   option is:
+
+   ```bash
+   -Donnxruntime_USE_CUDA=ON \
+   -DCMAKE_CUDA_ARCHITECTURES=120
+   ```
+
+   Start from the wrapper's normal CUDA build options for that release and
+   change only `CMAKE_CUDA_ARCHITECTURES`. Use an explicit value rather than
+   `native`, especially in a container: a build container usually cannot query
+   the host GPU. The resulting install directory must contain all three files:
+
+   ```text
+   libonnxruntime.a
+   libonnxruntime_providers_cuda.so
+   libonnxruntime_providers_shared.so
+   ```
+
+4. Point `ort-sys` at that directory and rebuild LinuxBroadcast. Cleaning
+   `ort-sys` matters because Cargo otherwise reuses the downloaded prebuilt
+   ONNX Runtime library:
+
+   ```bash
+   export ORT_LIB_PATH=/absolute/path/to/onnxruntime/lib
+   export ORT_SKIP_DOWNLOAD=1
+   cargo clean -p ort-sys
+   cargo build --release -p linux-broadcast --features cuda
+   ```
+
+5. Package the matching provider libraries. `ORT_PROVIDER_DIR` makes the
+   helper use the custom directory rather than its normal download cache:
+
+   ```bash
+   cargo install cargo-deb
+   cargo deb --no-build -p linux-broadcast
+   ORT_PROVIDER_DIR="$ORT_LIB_PATH" packaging/build-cuda-addon.sh
+   ```
+
+   Install both generated packages together (replace the filenames when the
+   version changes):
+
+   ```bash
+   sudo apt install --reinstall \
+     ./target/debian/linux-broadcast_<version>-1_amd64.deb \
+     ./target/debian/linux-broadcast-cuda_<version>-1_amd64.deb
+   ```
+
+6. Verify the provider contains the requested image (requires the CUDA
+   toolkit's `cuobjdump`) and start the app with logs enabled:
+
+   ```bash
+   cuobjdump --list-elf "$ORT_LIB_PATH/libonnxruntime_providers_cuda.so" | grep sm_120
+   RUST_LOG=info linux-broadcast
+   ```
+
+   A successful run logs `ONNX Runtime: CUDA execution provider registered`,
+   retains the normal **GPU** footer state, and does not emit the CPU-fallback
+   warning. If it still falls back, preserve the complete ONNX Runtime error;
+   it usually identifies either a missing runtime dependency or an architecture
+   mismatch.
 
 ### Option C — Build from source
 
