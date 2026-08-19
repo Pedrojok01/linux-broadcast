@@ -143,6 +143,17 @@ Verify it engaged: `RUST_LOG=info linux-broadcast` logs
 `ONNX Runtime: CUDA execution provider registered`. A working NVIDIA driver
 (`nvidia-smi`) supporting CUDA 13 is required.
 
+### RTX 50 / Blackwell
+
+The CUDA provider bundled with this release does not contain kernels for
+Blackwell consumer GPUs (RTX 50 series, SM 120). On those GPUs LinuxBroadcast
+will log the failed GPU inference, show **GPU unavailable · CPU** in the
+footer, and continue on CPU rather than dropping every frame. To use GPU
+acceleration, build an ONNX Runtime CUDA provider from source with
+`CMAKE_CUDA_ARCHITECTURES=120` (or `native`) and package it with the matching
+LinuxBroadcast / ONNX Runtime build. Installing a newer NVIDIA driver or CUDA
+runtime alone cannot add a missing kernel image to the shipped provider.
+
 ### Option C — Build from source
 
 Use this when hacking on the code; the `.deb` is the right choice for everyday use.

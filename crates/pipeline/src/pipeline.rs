@@ -199,7 +199,8 @@ pub struct Pipeline {
     state: Arc<Mutex<PipelineState>>,
     feeder: Option<std::thread::JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
-    backend: Backend,
+    backend: Arc<Mutex<Backend>>,
+    gpu_fallback: Arc<Mutex<Option<String>>>,
 }
 
 impl Pipeline {
@@ -266,7 +267,7 @@ impl Pipeline {
         let watcher_rx = watcher.events().clone();
 
         // 4. Feeder thread.
-        let (feeder, backend) = spawn_feeder(
+        let (feeder, backend, gpu_fallback) = spawn_feeder(
             cfg,
             multiclass_onnx,
             rvm_onnx,
@@ -286,6 +287,7 @@ impl Pipeline {
             stop_flag,
             _watcher: watcher,
             backend,
+            gpu_fallback,
         })
     }
 
@@ -293,10 +295,22 @@ impl Pipeline {
         self.cmd_tx.clone()
     }
 
-    /// Execution backend the segmenter ended up using (CPU or GPU).
-    /// Fixed for the lifetime of the pipeline — model/EP are chosen at start.
+    /// Execution backend the segmenter is currently using (CPU or GPU).
+    /// A GPU session may fail only on its first kernel launch, in which case
+    /// the feeder switches it to CPU and this value changes accordingly.
     pub fn backend(&self) -> Backend {
         self.backend
+            .lock()
+            .map(|backend| *backend)
+            .unwrap_or_default()
+    }
+
+    /// Explains a one-way GPU-to-CPU recovery, if one occurred.
+    pub fn gpu_fallback_reason(&self) -> Option<String> {
+        self.gpu_fallback
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
     }
 
     /// Snapshot the current public state. Cheap; backed by an

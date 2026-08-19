@@ -109,11 +109,34 @@ impl Segmenter {
             Segmenter::Rvm(inner) => inner.backend,
         }
     }
+
+    /// Replace a failed GPU session with a fresh CPU-only session.
+    ///
+    /// CUDA can accept a session at construction and only reject it when a
+    /// kernel runs (for example, when the provider binary has no kernel image
+    /// for a newer GPU architecture). Rebuilding here lets the caller recover
+    /// from that delayed failure without stopping the virtual camera.
+    pub fn fall_back_to_cpu(&mut self, onnx: &[u8]) -> Result<()> {
+        let replacement = match self {
+            Segmenter::Multiclass(_) => Segmenter::Multiclass(Box::new(MpInner::new_cpu(onnx)?)),
+            Segmenter::Rvm(_) => Segmenter::Rvm(Box::new(RvmInner::new_cpu(onnx)?)),
+        };
+        *self = replacement;
+        Ok(())
+    }
 }
 
 impl MpInner {
     fn new(onnx: &[u8]) -> Result<Self> {
         let (session, backend) = build_session(onnx)?;
+        Self::with_session(session, backend)
+    }
+
+    fn new_cpu(onnx: &[u8]) -> Result<Self> {
+        Self::with_session(build_cpu_session(onnx)?, Backend::Cpu)
+    }
+
+    fn with_session(session: Session, backend: Backend) -> Result<Self> {
         let input_name = session
             .inputs()
             .first()
@@ -322,7 +345,15 @@ pub struct RvmInner {
 impl RvmInner {
     fn new(onnx: &[u8]) -> Result<Self> {
         let (session, backend) = build_session(onnx)?;
-        Ok(RvmInner {
+        Ok(Self::with_session(session, backend))
+    }
+
+    fn new_cpu(onnx: &[u8]) -> Result<Self> {
+        Ok(Self::with_session(build_cpu_session(onnx)?, Backend::Cpu))
+    }
+
+    fn with_session(session: Session, backend: Backend) -> Self {
+        RvmInner {
             session,
             backend,
             initial_states: [
@@ -334,7 +365,7 @@ impl RvmInner {
             prev_states: None,
             input_buf: Vec::new(),
             last_dims: (0, 0),
-        })
+        }
     }
 
     fn reset(&mut self) {

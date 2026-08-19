@@ -24,6 +24,9 @@ impl App {
                     if self.backend == Backend::Gpu {
                         ui.add_space(space::SM);
                         gpu_badge(ui);
+                    } else if let Some(reason) = &self.gpu_fallback_reason {
+                        ui.add_space(space::SM);
+                        gpu_fallback_badge(ui, reason);
                     }
                     ui.add_space(space::MD);
                     sep(ui);
@@ -128,6 +131,27 @@ fn gpu_badge(ui: &mut egui::Ui) {
                     .strong()
                     .color(color::ACCENT),
             );
+        });
+}
+
+/// Persistent, visible notice that CUDA started but failed on a real model
+/// kernel and the pipeline recovered on CPU. The technical error stays in the
+/// hover text so the compact footer remains readable.
+fn gpu_fallback_badge(ui: &mut egui::Ui, reason: &str) {
+    egui::Frame::none()
+        .fill(color::DANGER_SOFT)
+        .stroke(Stroke::new(1.0, color::DANGER))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("GPU unavailable · CPU")
+                    .monospace()
+                    .small()
+                    .strong()
+                    .color(color::DANGER),
+            )
+            .on_hover_text(reason);
         });
 }
 

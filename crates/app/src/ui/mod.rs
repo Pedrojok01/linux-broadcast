@@ -223,6 +223,9 @@ pub(super) struct App {
     /// Execution backend the running pipeline's segmenter uses. Drives the
     /// footer's "GPU" badge; defaults to `Cpu` (no badge) when not running.
     backend: Backend,
+    /// Set only when a CUDA session accepted at startup later fails during
+    /// inference and the pipeline transparently continues on CPU.
+    gpu_fallback_reason: Option<String>,
     error: Option<String>,
     /// System tray handle. Held for the whole process lifetime. `None`
     /// only if the OS has no working tray host (logged at install time);
@@ -320,6 +323,7 @@ impl App {
             last_preview_size: None,
             pipeline_state: PipelineState::default(),
             backend: Backend::default(),
+            gpu_fallback_reason: None,
             error: initial_error,
             tray,
             quit_requested: false,
@@ -390,6 +394,7 @@ impl App {
             Ok(p) => {
                 let cmd_tx = p.cmd_sender();
                 self.backend = p.backend();
+                self.gpu_fallback_reason = p.gpu_fallback_reason();
                 // Push the saved toggle states to the freshly started
                 // pipeline so they survive Stop+Start cycles (model
                 // swaps, camera swaps).
@@ -423,6 +428,7 @@ impl App {
         self.last_preview_size = None;
         self.pipeline_state = PipelineState::default();
         self.backend = Backend::default();
+        self.gpu_fallback_reason = None;
         // The next pipeline starts at gui_preview_active = false; clear
         // the cache so the next heartbeat re-sends.
         self.last_gui_preview_active = None;
@@ -698,6 +704,8 @@ impl eframe::App for App {
         // ticks.
         if let Some(p) = &self.pipeline {
             self.pipeline_state = p.state();
+            self.backend = p.backend();
+            self.gpu_fallback_reason = p.gpu_fallback_reason();
         }
 
         self.drain_preview(ctx);

@@ -137,16 +137,22 @@ pub(crate) fn spawn_feeder(
     state_pub: Arc<Mutex<PipelineState>>,
     stop_flag: Arc<AtomicBool>,
     source_builder: SourceBuilder,
-) -> Result<(std::thread::JoinHandle<()>, Backend)> {
-    let segmenter = Segmenter::from_bytes(
-        cfg.model,
-        match cfg.model {
-            ModelKind::SelfieMulticlass => multiclass_onnx,
-            ModelKind::Rvm => rvm_onnx,
-        },
-    )
-    .context("load segmentation model")?;
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    Arc<Mutex<Backend>>,
+    Arc<Mutex<Option<String>>>,
+)> {
+    let model_onnx = match cfg.model {
+        ModelKind::SelfieMulticlass => multiclass_onnx,
+        ModelKind::Rvm => rvm_onnx,
+    };
+    let segmenter =
+        Segmenter::from_bytes(cfg.model, model_onnx).context("load segmentation model")?;
     let backend = segmenter.backend();
+    let backend_pub = Arc::new(Mutex::new(backend));
+    let gpu_fallback_pub = Arc::new(Mutex::new(None));
+    let backend_pub_for_thread = Arc::clone(&backend_pub);
+    let gpu_fallback_pub_for_thread = Arc::clone(&gpu_fallback_pub);
 
     let idle_loader = IdleLoader::new(cfg.width, cfg.height);
 
@@ -169,6 +175,9 @@ pub(crate) fn spawn_feeder(
             let mut feeder = Feeder {
                 cfg: cfg_for_thread,
                 segmenter,
+                model_onnx,
+                backend_pub: backend_pub_for_thread,
+                gpu_fallback_pub: gpu_fallback_pub_for_thread,
                 compositor: Compositor::new(),
                 smoother: MaskSmoother::new(match cfg.model {
                     ModelKind::Rvm => RVM_ALPHA,
@@ -209,12 +218,21 @@ pub(crate) fn spawn_feeder(
             feeder.run(cmd_rx, watcher_rx, stop_flag);
         })
         .context("spawn lb-feeder")?;
-    Ok((handle, backend))
+    Ok((handle, backend_pub, gpu_fallback_pub))
 }
 
 struct Feeder {
     cfg: PipelineConfig,
     segmenter: Segmenter,
+    /// Bytes of the selected model, retained so a delayed CUDA failure can
+    /// rebuild the same model with the CPU execution provider.
+    model_onnx: &'static [u8],
+    /// Live backend status published to the GUI. Unlike session creation,
+    /// CUDA compatibility is only proven after the first inference.
+    backend_pub: Arc<Mutex<Backend>>,
+    /// One-shot user-facing explanation emitted when GPU inference fails and
+    /// the feeder continues on CPU.
+    gpu_fallback_pub: Arc<Mutex<Option<String>>>,
     compositor: Compositor,
     smoother: MaskSmoother,
     /// Smoothed virtual-PTZ crop driver. Held even when `framing_enabled`
@@ -735,15 +753,59 @@ impl Feeder {
 
             if do_infer {
                 let t_seg = Instant::now();
-                match self
-                    .segmenter
-                    .segment(&frame_rgba, frame_w as usize, frame_h as usize)
-                {
+                let segment =
+                    self.segmenter
+                        .segment(&frame_rgba, frame_w as usize, frame_h as usize);
+                match segment {
                     Ok(mut mask) => {
                         self.smoother.smooth(&mut mask.data);
                         segment_dur = Some(t_seg.elapsed());
                         self.cached_framing = self.compute_framing(&mask);
                         self.cached_mask = Some(mask);
+                    }
+                    Err(gpu_error) if self.segmenter.backend() == Backend::Gpu => {
+                        let technical_reason = format!("{gpu_error:#}");
+                        let user_reason = format!(
+                            "GPU acceleration was disabled after an inference error; LinuxBroadcast is now using CPU. {technical_reason}"
+                        );
+                        log::warn!(
+                            "{user_reason} To restore GPU acceleration, install an ONNX Runtime CUDA provider built for this GPU."
+                        );
+
+                        if let Err(cpu_error) = self.segmenter.fall_back_to_cpu(self.model_onnx) {
+                            log::error!(
+                                "GPU inference failed ({technical_reason}); CPU fallback could not start: {cpu_error:#}"
+                            );
+                            return;
+                        }
+                        if let Ok(mut backend) = self.backend_pub.lock() {
+                            *backend = Backend::Cpu;
+                        }
+                        if let Ok(mut reason) = self.gpu_fallback_pub.lock() {
+                            *reason = Some(user_reason);
+                        }
+
+                        // The GPU error left the recurrent state unusable, so
+                        // run this very frame again against the clean CPU
+                        // session. From here on every inference stays on CPU.
+                        match self.segmenter.segment(
+                            &frame_rgba,
+                            frame_w as usize,
+                            frame_h as usize,
+                        ) {
+                            Ok(mut mask) => {
+                                self.smoother.smooth(&mut mask.data);
+                                segment_dur = Some(t_seg.elapsed());
+                                self.cached_framing = self.compute_framing(&mask);
+                                self.cached_mask = Some(mask);
+                            }
+                            Err(cpu_error) => {
+                                log::error!(
+                                    "GPU inference failed ({technical_reason}); CPU retry also failed: {cpu_error:#}"
+                                );
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("segment: {e:#}");
