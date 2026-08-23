@@ -10,18 +10,27 @@ VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 ARCH=amd64
 OUT="target/debian"
 
-# 1. Ensure the CUDA 13 provider libs exist in the ort cache.
-ORT_CUDA_VERSION=13 cargo build --release -p linux-broadcast --features cuda
+# 1. Find the CUDA 13 provider libs. Set ORT_PROVIDER_DIR to package a custom
+# ONNX Runtime build (for example, one compiled for a newer GPU architecture).
+# Without it, build normally and take the newest CUDA 13 provider from ort's
+# cache. The cache can contain cuda-12 and older cuda-13 builds, hence the
+# ABI check below.
+if [ -n "${ORT_PROVIDER_DIR:-}" ]; then
+  DIR="$ORT_PROVIDER_DIR"
+else
+  ORT_CUDA_VERSION=13 cargo build --release -p linux-broadcast --features cuda
+  DIR=$(find "$HOME/.cache/ort.pyke.io" -name 'libonnxruntime_providers_cuda.so' \
+    -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -q libcublasLt.so.13 \
+      && printf "%s %s\n" "$(stat -c %Y "$1")" "$(dirname "$1")"' _ {} \; \
+    | sort -rn | head -1 | cut -d' ' -f2-)
+fi
 
-# 2. Locate the CUDA-13 provider libs. The cache can hold several build-hash
-# dirs (cuda-12 and older cuda-13 builds), so filter to cuda-13 (NEEDED
-# libcublasLt.so.13) and take the NEWEST by mtime — the build just produced
-# above — to avoid shipping an ABI-mismatched .so.
-DIR=$(find "$HOME/.cache/ort.pyke.io" -name 'libonnxruntime_providers_cuda.so' \
-  -exec sh -c 'readelf -d "$1" 2>/dev/null | grep -q libcublasLt.so.13 \
-    && printf "%s %s\n" "$(stat -c %Y "$1")" "$(dirname "$1")"' _ {} \; \
-  | sort -rn | head -1 | cut -d' ' -f2-)
-[ -n "$DIR" ] || { echo "error: CUDA 13 provider libs not found in ort cache" >&2; exit 1; }
+[ -n "${DIR:-}" ] && [ -f "$DIR/libonnxruntime_providers_cuda.so" ] \
+  && [ -f "$DIR/libonnxruntime_providers_shared.so" ] \
+  || { echo "error: CUDA 13 provider libraries were not found" >&2; exit 1; }
+readelf -d "$DIR/libonnxruntime_providers_cuda.so" 2>/dev/null \
+  | grep -q 'libcublasLt.so.13' \
+  || { echo "error: provider is not built for CUDA 13" >&2; exit 1; }
 
 # 3. Assemble the .deb tree.
 PKG="linux-broadcast-cuda"
