@@ -122,6 +122,14 @@ pub(crate) fn next_state(state: State, demand: Demand, now: Instant) -> State {
     }
 }
 
+/// What `spawn_feeder` hands back: the feeder thread, the live execution
+/// backend, and the reason for a GPU-to-CPU recovery once one has happened.
+type FeederHandles = (
+    std::thread::JoinHandle<()>,
+    Arc<Mutex<Backend>>,
+    Arc<Mutex<Option<String>>>,
+);
+
 /// Spawn the feeder thread. Returns the join handle plus a stop-flag the
 /// caller (Pipeline) can flip to ask the thread to wind down promptly;
 /// the thread also exits naturally on `Command::Stop` and on cmd-channel
@@ -137,11 +145,7 @@ pub(crate) fn spawn_feeder(
     state_pub: Arc<Mutex<PipelineState>>,
     stop_flag: Arc<AtomicBool>,
     source_builder: SourceBuilder,
-) -> Result<(
-    std::thread::JoinHandle<()>,
-    Arc<Mutex<Backend>>,
-    Arc<Mutex<Option<String>>>,
-)> {
+) -> Result<FeederHandles> {
     let model_onnx = match cfg.model {
         ModelKind::SelfieMulticlass => multiclass_onnx,
         ModelKind::Rvm => rvm_onnx,
