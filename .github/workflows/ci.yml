@@ -42,14 +42,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `chunks_exact_to_as_chunks` is allowed: converting the RGBA blend
-      # loops to `as_chunks` changes their iteration types across the
-      # compositor hot path. Tracked separately; drop the flag once done.
       - name: Clippy (deny warnings)
-        run: |
-          cargo clippy --workspace --all-targets --release -- \
-            -D warnings \
-            -A clippy::chunks_exact_to_as_chunks
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
 
       - name: Build (release)
         run: cargo build --workspace --release
