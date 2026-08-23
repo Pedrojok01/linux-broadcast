@@ -76,6 +76,11 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # cargo-audit is installed from within the checkout, so rust-toolchain.toml
+    # would pin its build too and the current release needs a newer compiler.
+    # This job never builds our own code, so it opts out of the pin.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     permissions:
       contents: read
       checks: write
