@@ -1,3 +1,5 @@
+# Pinned so CI, releases and local builds all see the same diagnostics.
+# Bump deliberately: a new stable adds lints that fail the -D warnings gate.
 [toolchain]
-channel = "stable"
+channel = "1.94.1"
 components = ["rustfmt", "clippy"]
