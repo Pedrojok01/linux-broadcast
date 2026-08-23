@@ -1,0 +1,14 @@
+# `cargo audit` (the rustsec/audit-check CI job) keeps its own ignore list;
+# it does not read deny.toml. Keep these two lists in sync.
+[advisories]
+ignore = [
+    # Reached only through build-time or bundled-asset paths, never from
+    # untrusted input. See deny.toml for the full rationale.
+    "RUSTSEC-2026-0194", # quick-xml, via the wayland-scanner proc-macro
+    "RUSTSEC-2026-0195", # quick-xml, via the wayland-scanner proc-macro
+    "RUSTSEC-2026-0192", # ttf-parser, egui font parsing; unmaintained
+    # Transitive gtk-rs 0.18 stack pulled in by tray-icon.
+    "RUSTSEC-2024-0370", "RUSTSEC-2024-0412", "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0415", "RUSTSEC-2024-0416", "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419", "RUSTSEC-2024-0420", "RUSTSEC-2024-0436",
+]

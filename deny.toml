@@ -20,6 +20,21 @@ ignore = [
     "RUSTSEC-2024-0419", # gtk3-macros
     "RUSTSEC-2024-0420", # gtk-sys
     "RUSTSEC-2024-0436", # paste
+
+    # Reached only through build-time or bundled-asset paths, never from
+    # untrusted input.
+    #
+    # quick-xml is pulled in by the `wayland-scanner` proc-macro, which parses
+    # the Wayland protocol XML shipped inside that crate at build time. It is
+    # held below the fixed 0.41 by wayland-scanner's own requirement and is not
+    # present at runtime.
+    "RUSTSEC-2026-0194", # quick-xml
+    "RUSTSEC-2026-0195", # quick-xml
+
+    # ttf-parser is egui's font parser (via ab_glyph/epaint), reading the fonts
+    # bundled with the binary. Flagged unmaintained rather than vulnerable; no
+    # upgrade exists.
+    "RUSTSEC-2026-0192", # ttf-parser
 ]
 
 [licenses]
