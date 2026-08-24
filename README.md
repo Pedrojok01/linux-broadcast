@@ -408,4 +408,6 @@ This project bundles [Robust Video Matting](https://github.com/PeterL1n/RobustVi
 
 If LinuxBroadcast saves you a Zoom-call embarrassment or two:
 
-<a href="https://www.buymeacoffee.com/Pedrojok01" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48" width="173" ></a>
+<p align="center">
+  <a href="https://www.buymeacoffee.com/Pedrojok01" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48" width="173"></a>
+</p>
