@@ -402,3 +402,10 @@ For substantive changes:
 GPL-3.0-or-later. See [`LICENSE`](LICENSE) for the full text.
 
 This project bundles [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) (`models/rvm.onnx`), released under GPL-3.0, which is what makes the entire binary GPL-3.0. The MediaPipe ONNX file in `models/` is Apache-2.0; the bundled fonts in `assets/fonts/` are SIL Open Font License 1.1. See [`models/README.md`](models/README.md) and [`assets/fonts/`](assets/fonts/) for per-asset attribution.
+
+
+## Support
+
+If LinuxBroadcast saves you a Zoom-call embarrassment or two:
+
+<a href="https://www.buymeacoffee.com/Pedrojok01" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48" width="173" ></a>
