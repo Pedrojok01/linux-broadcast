@@ -551,9 +551,8 @@ impl App {
         ui.add_space(space::SM);
 
         // Show-preview toggle. Off → the preview pane shows a static
-        // placeholder and the pipeline stops forwarding frames to the
-        // GUI (saves a per-frame RGBA clone). The broadcast itself is
-        // unaffected: consumers of /dev/video10 see the same picture.
+        // placeholder; the next heartbeat (`handle_lifecycle`) stops the
+        // pipeline forwarding frames. /dev/video10 is unaffected.
         if toggle_row(
             ui,
             self.cfg.show_preview,
@@ -562,9 +561,6 @@ impl App {
         ) {
             self.cfg.show_preview = !self.cfg.show_preview;
             self.save_settings();
-            if let Some(tx) = &self.cmd_tx {
-                let _ = tx.send(Command::SetPreviewEnabled(self.cfg.show_preview));
-            }
             // Drop the cached texture so the placeholder renders cleanly
             // (otherwise the last-painted frame would linger until the
             // next pane resize).

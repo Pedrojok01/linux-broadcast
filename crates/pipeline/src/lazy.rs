@@ -211,7 +211,6 @@ pub(crate) fn spawn_feeder(
                 fps_win_frames: 0,
                 telemetry_dirty: false,
                 consumers: Vec::new(),
-                preview_enabled: true,
                 gui_preview_active: false,
                 state: State::Idle,
                 state_pub,
@@ -288,15 +287,11 @@ struct Feeder {
     /// re-publish despite no state/consumer change. Cleared after publish.
     telemetry_dirty: bool,
     consumers: Vec<Consumer>,
-    /// Mirrors the GUI's "Show preview" toggle. When false, frames are
-    /// not forwarded to `preview_tx` (skips a 1280×720 RGBA clone per
-    /// frame). Defaults to true so any standalone consumer of the
-    /// pipeline (tests, future headless tooling) gets frames by default.
-    preview_enabled: bool,
     /// True while the GUI's preview pane is visible (window visible AND
     /// `show_preview` toggle on). Acts as a synthetic consumer in the
-    /// lazy state machine. Defaults to false so headless launches and
-    /// any non-GUI caller don't keep the camera lit by accident.
+    /// lazy state machine and gates forwarding frames to `preview_tx`.
+    /// Defaults to false so headless launches and any non-GUI caller
+    /// don't keep the camera lit by accident.
     gui_preview_active: bool,
     state: State,
     state_pub: Arc<Mutex<PipelineState>>,
@@ -417,7 +412,6 @@ impl Feeder {
     fn handle_command(&mut self, cmd: Command) -> ControlFlow<()> {
         match cmd {
             Command::SetBackground(bg) => self.background = bg,
-            Command::SetPreviewEnabled(v) => self.preview_enabled = v,
             Command::SetGuiPreviewActive(v) => self.gui_preview_active = v,
             Command::SetFraming(v) => {
                 self.framing_enabled = v;
@@ -895,10 +889,7 @@ impl Feeder {
         let t_composite = t_comp_start.elapsed();
 
         let t_push_start = Instant::now();
-        if self.preview_enabled
-            && let Some(tx) = &self.preview_tx
-        {
-            // try_send so we silently drop when the GUI lags.
+        if let Some(tx) = self.preview_sender() {
             let _ = tx.try_send(PreviewFrame {
                 width: frame_w,
                 height: frame_h,
@@ -965,9 +956,7 @@ impl Feeder {
         let mut frame = self.idle_frame.take().unwrap_or_default();
         self.idle_loader.render(&mut frame);
 
-        if self.preview_enabled
-            && let Some(tx) = &self.preview_tx
-        {
+        if let Some(tx) = self.preview_sender() {
             let _ = tx.try_send(PreviewFrame {
                 width: self.cfg.width,
                 height: self.cfg.height,
@@ -978,6 +967,14 @@ impl Feeder {
         let _ = self.push_to_sink(&frame);
         self.idle_frame = Some(frame);
         self.last_idle_push = Some(now);
+    }
+
+    /// The preview channel, if the GUI is showing frames and has room for
+    /// one. Checked before cloning so a hidden or lagging GUI costs no copy.
+    fn preview_sender(&self) -> Option<&Sender<PreviewFrame>> {
+        self.preview_tx
+            .as_ref()
+            .filter(|tx| self.gui_preview_active && !tx.is_full())
     }
 
     /// Wrap an RGBA frame in a fresh GStreamer buffer with the next PTS,

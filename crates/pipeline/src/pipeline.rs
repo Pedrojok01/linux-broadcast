@@ -139,16 +139,13 @@ pub struct PreviewFrame {
 #[derive(Debug, Clone)]
 pub enum Command {
     SetBackground(Background),
-    /// While false, the feeder skips forwarding frames to the GUI's
-    /// preview channel, avoiding the per-frame RGBA clone. The
-    /// downstream broadcast (`/dev/video10`) is unaffected.
-    SetPreviewEnabled(bool),
     /// Edge-triggered "GUI preview pane is currently visible" heartbeat.
     /// Acts as a synthetic consumer in the lazy state machine: while
     /// true, the camera stays lit even with no real consumer attached
     /// to `/dev/video10`. The GUI sets it true when the window is
     /// visible AND the user has the preview toggle on; false otherwise
-    /// (window hidden in tray, preview toggle off, app exiting).
+    /// (window hidden in tray, preview toggle off, app exiting). Frames
+    /// are forwarded to `preview_tx` only while it is true.
     SetGuiPreviewActive(bool),
     /// Toggle the auto-frame (smoothed horizontal foreground recenter)
     /// stage. When turned off, the feeder also resets the smoother so

@@ -13,7 +13,8 @@
 //!   `Command::SetGuiPreviewActive(true)` (edge-triggered) so the lazy
 //!   feeder treats the GUI as a consumer and keeps the camera lit. The
 //!   signal is explicitly cleared the moment the window goes to the
-//!   tray, so a tray-only instance lets the camera drop to Idle.
+//!   tray, so a tray-only instance lets the camera drop to Idle. It also
+//!   gates the feeder's preview frames, so a hidden window costs nothing.
 //! - **Close-button intercept.** `ViewportCommand::CancelClose` +
 //!   `Visible(false)` turns the window's X into "hide to tray". Only the
 //!   tray's `Quit` menu sets `quit_requested` and lets the close go
@@ -392,16 +393,9 @@ impl App {
         let pcfg = pipeline_config_from(&self.cfg, Some(tx));
         match Pipeline::start(pcfg, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX) {
             Ok(p) => {
-                let cmd_tx = p.cmd_sender();
                 self.backend = p.backend();
                 self.gpu_fallback_reason = p.gpu_fallback_reason();
-                // Push the saved toggle states to the freshly started
-                // pipeline so they survive Stop+Start cycles (model
-                // swaps, camera swaps).
-                if !self.cfg.show_preview {
-                    let _ = cmd_tx.send(Command::SetPreviewEnabled(false));
-                }
-                self.cmd_tx = Some(cmd_tx);
+                self.cmd_tx = Some(p.cmd_sender());
                 self.pipeline = Some(p);
                 self.preview_rx = Some(rx);
                 self.preview_tex = None;
@@ -460,9 +454,8 @@ impl App {
                 }
             }
         }
-        // Belt-and-braces: even if a frame slipped through the channel
-        // before the pipeline received SetPreviewEnabled(false), don't
-        // paint it.
+        // A frame queued before the pipeline saw the toggle go off must
+        // not be painted.
         if !self.cfg.show_preview {
             return;
         }

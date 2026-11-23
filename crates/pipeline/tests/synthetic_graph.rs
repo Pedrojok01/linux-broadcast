@@ -431,3 +431,34 @@ fn recovers_when_source_stalls_while_live() {
         Duration::from_secs(5),
     );
 }
+
+/// Preview frames are forwarded only while the GUI preview is active
+/// (window visible AND toggle on). A hidden window must not cost a
+/// full-frame clone per pushed frame.
+#[test]
+fn preview_frames_follow_gui_preview_signal() {
+    let (tx, rx) = crossbeam_channel::bounded(2);
+    let mut c = cfg();
+    c.preview_tx = Some(tx);
+    let (p, _captured) = start_pipeline(c);
+    let drain = || std::iter::from_fn(|| rx.try_recv().ok()).count();
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(drain(), 0, "no preview frames while the GUI is inactive");
+
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(drain() > 0, "preview frames flow while the GUI is active");
+
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(false))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    drain();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(drain(), 0, "preview frames stop once the GUI is inactive");
+
+    p.stop();
+}
