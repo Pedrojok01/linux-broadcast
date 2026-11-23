@@ -28,3 +28,6 @@ __pycache__/
 .agents/
 .codex/
 docs/**/*
+
+# Local scratch (reviews, notes)
+.tmp/

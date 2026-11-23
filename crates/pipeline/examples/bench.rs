@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Background::Image {
-                rgba,
+                rgba: rgba.into(),
                 width,
                 height,
             }

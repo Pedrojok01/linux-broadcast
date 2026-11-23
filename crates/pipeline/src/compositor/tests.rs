@@ -20,7 +20,7 @@ fn mask_const(w: u32, h: u32, v: f32) -> Mask {
 
 fn red_image_bg(w: u32, h: u32) -> Background {
     Background::Image {
-        rgba: solid_frame(w, h, [255, 0, 0, 255]),
+        rgba: solid_frame(w, h, [255, 0, 0, 255]).into(),
         width: w,
         height: h,
     }
@@ -329,7 +329,7 @@ fn column_index_image_bg(w: u32, h: u32) -> Background {
         }
     }
     Background::Image {
-        rgba,
+        rgba: rgba.into(),
         width: w,
         height: h,
     }
@@ -697,7 +697,7 @@ proptest! {
         let (w, h) = (8u32, 8u32);
         let frame_init = solid_frame(w, h, [fg, fg, fg, 255]);
         let bg_image = Background::Image {
-            rgba: solid_frame(w, h, [bg, bg, bg, 255]),
+            rgba: solid_frame(w, h, [bg, bg, bg, 255]).into(),
             width: w,
             height: h,
         };
@@ -719,6 +719,104 @@ proptest! {
             } else if toward_fg < 0 {
                 prop_assert!(delta <= 1, "expected non-increasing, got {:?}", v);
             }
+        }
+    }
+}
+
+/// On a static scene the Blur bg plane must show the true wall colour on
+/// every frame, including the cold-start→plate switch: the old `u8` EMA from
+/// 0 switched in at ~26% brightness and stalled ~20 levels too dark.
+#[test]
+fn plate_matches_static_background_from_first_frame() {
+    let (w, h) = (8, 8);
+    let wall = [200, 37, 251, 255];
+    let mask = mask_const(w, h, 0.0);
+    let bg = Background::Blur { strength: 0.5 };
+    let mut c = Compositor::new();
+    for n in 0..300 {
+        let mut frame = solid_frame(w, h, wall);
+        c.composite(&mut frame, w, h, &mask, &bg, None).unwrap();
+        for px in c.plate_materialized.chunks_exact(4) {
+            assert_eq!(px[..3], wall[..3], "frame {n}");
+        }
+    }
+}
+
+/// A lighting change smaller than the old truncation dead band (~20 levels)
+/// must still be tracked.
+#[test]
+fn plate_tracks_small_lighting_change() {
+    let (w, h) = (2, 2);
+    let mask = vec![0.0; 4];
+    let mut plate = BgPlate::new();
+    for _ in 0..100 {
+        plate.update(&solid_frame(w, h, [180, 180, 180, 255]), &mask, w, h);
+    }
+    for _ in 0..100 {
+        plate.update(&solid_frame(w, h, [190, 190, 190, 255]), &mask, w, h);
+    }
+    for &v in &plate.rgb {
+        assert!((v - 190.0).abs() < 0.5, "plate at {v}, expected 190");
+    }
+}
+
+/// Swapping to a different library image of the same size must invalidate
+/// the scaled-bg cache, which is keyed on the shared buffer's identity.
+#[test]
+fn image_swap_same_size_rescales() {
+    let (w, h) = (8, 8);
+    let mask = mask_const(w, h, 0.0);
+    let mut c = Compositor::new();
+    for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+        let bg = Background::Image {
+            rgba: solid_frame(w, h, color).into(),
+            width: w,
+            height: h,
+        };
+        let mut frame = solid_frame(w, h, [0, 0, 255, 255]);
+        c.composite(&mut frame, w, h, &mask, &bg, None).unwrap();
+        assert_eq!(frame[..4], color, "bg must show the current image");
+    }
+}
+
+/// A non-16:9 image must be centre-cropped to the output aspect, not
+/// stretched. Square image with blue / red / green horizontal bands onto a
+/// 2:1 output: cover keeps only the red middle band. A stretch would paint
+/// the top and bottom quarters blue and green.
+#[test]
+fn image_bg_covers_without_stretching() {
+    let (iw, ih) = (16, 16);
+    let mut img = Vec::with_capacity((iw * ih * 4) as usize);
+    for y in 0..ih {
+        let band = match y {
+            0..4 => [0, 0, 255, 255],
+            4..12 => [255, 0, 0, 255],
+            _ => [0, 255, 0, 255],
+        };
+        for _ in 0..iw {
+            img.extend_from_slice(&band);
+        }
+    }
+    let bg = Background::Image {
+        rgba: img.into(),
+        width: iw,
+        height: ih,
+    };
+    let (w, h) = (32, 16);
+    let mut frame = solid_frame(w, h, [0, 0, 0, 255]);
+    Compositor::new()
+        .composite(&mut frame, w, h, &mask_const(w, h, 0.0), &bg, None)
+        .unwrap();
+    for (i, px) in frame.chunks_exact(4).enumerate() {
+        let row = i / w as usize;
+        if row == 0 || row == h as usize - 1 {
+            // The bilinear filter reaches one source pixel past the crop box.
+            assert!(
+                px[0] > 128 && px[1] < 128 && px[2] < 128,
+                "row {row}: {px:?}"
+            );
+        } else {
+            assert_eq!(px[..3], [255, 0, 0], "row {row}");
         }
     }
 }

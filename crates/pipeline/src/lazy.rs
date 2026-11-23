@@ -67,6 +67,15 @@ const IDLE_TICK: Duration = Duration::from_millis(100);
 /// any WebRTC consumer's "no frames" timeout (typically 1–3 s).
 const IDLE_PUSH_INTERVAL: Duration = Duration::from_millis(90);
 
+/// A Live source that delivers no frame for this long has failed silently
+/// (some UVC firmware stalls without an error or EOS). Also bounds the wait
+/// for the first frame, which MJPEG cameras take up to ~1 s to deliver.
+const SOURCE_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Frames must flow this long before the failure backoff resets, so a camera
+/// that keeps dropping out shortly after engaging keeps backing off.
+const HEALTHY_STREAM: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
     Idle,
@@ -207,8 +216,10 @@ pub(crate) fn spawn_feeder(
                 state_pub,
                 frame_idx: 0,
                 last_state_log: None,
-                start_failure_count: 0,
-                start_failure_backoff_until: None,
+                source_failure_count: 0,
+                source_backoff_until: None,
+                live_since: Instant::now(),
+                last_frame_at: Instant::now(),
                 last_published_pids: HashSet::new(),
                 idle_loader,
                 idle_frame: None,
@@ -290,14 +301,18 @@ struct Feeder {
     state_pub: Arc<Mutex<PipelineState>>,
     frame_idx: u64,
     last_state_log: Option<&'static str>,
-    /// Number of consecutive `start_source` failures. Drives an
-    /// exponential backoff so a wedged camera doesn't produce a 10 Hz
-    /// log flood. Reset to 0 on success.
-    start_failure_count: u32,
+    /// Consecutive source failures (failed start, or EOS/stall while Live).
+    /// Drives the exponential backoff in `back_off`. Reset only after
+    /// `HEALTHY_STREAM` of frames, since a successful start proves nothing.
+    source_failure_count: u32,
     /// While `Some(t)` and `now < t`, the state machine refuses to leave
-    /// Idle even if demand is asserted. Cleared on natural expiry or on
-    /// a successful `start_source`.
-    start_failure_backoff_until: Option<Instant>,
+    /// Idle even if demand is asserted. Cleared on natural expiry.
+    source_backoff_until: Option<Instant>,
+    /// When the current source graph engaged. Valid only while Live.
+    live_since: Instant,
+    /// When the last frame was pulled (or the source engaged), for the
+    /// stall watchdog. Valid only while Live.
+    last_frame_at: Instant,
     /// PIDs included in the most recent `state_pub` write. Used to skip
     /// redundant publishes when nothing the GUI cares about has changed.
     last_published_pids: HashSet<u32>,
@@ -421,14 +436,14 @@ impl Feeder {
         // until the timer expires, regardless of demand. Without this,
         // a wedged camera produced a Deactivating ↔ Live retry loop at
         // tick rate.
-        if let Some(t) = self.start_failure_backoff_until {
+        if let Some(t) = self.source_backoff_until {
             if now < t {
                 let prev = self.state;
                 self.state = State::Idle;
                 self.publish_state(prev);
                 return;
             }
-            self.start_failure_backoff_until = None;
+            self.source_backoff_until = None;
         }
 
         let demand = Demand {
@@ -443,55 +458,73 @@ impl Feeder {
         let entered_live = matches!(next, State::Live) && !matches!(self.state, State::Live);
         let exited_live = !matches!(next, State::Live) && matches!(self.state, State::Live);
 
-        if entered_live {
-            match self.start_source() {
-                Ok(()) => {
-                    self.start_failure_count = 0;
-                    self.start_failure_backoff_until = None;
-                }
-                Err(e) => {
-                    log::error!("could not start source pipeline: {e:#}");
-                    // Exponential backoff: 2, 4, 8, 16, 32 s capped.
-                    self.start_failure_count = self.start_failure_count.saturating_add(1).min(5);
-                    let delay = Duration::from_secs(2u64.pow(self.start_failure_count));
-                    self.start_failure_backoff_until = Some(now + delay);
-                    log::warn!(
-                        "source-pipeline retry suppressed for {:?} (failure #{})",
-                        delay,
-                        self.start_failure_count,
-                    );
-                    let prev = self.state;
-                    self.state = State::Idle;
-                    self.publish_state(prev);
-                    return;
-                }
-            }
+        if entered_live && let Err(e) = self.start_source() {
+            log::error!("could not start source pipeline: {e:#}");
+            self.back_off(now);
+            return;
         }
         if exited_live {
-            self.stop_source();
-            // RVM / smoother carry inter-frame state; reset so the next
-            // engagement starts clean instead of with stale gradients.
-            // The bg plate is dropped too — lighting and camera
-            // position may have changed during the idle window, and
-            // the EMA reconverges within ~1 s of being live again.
-            self.segmenter.reset();
-            self.smoother.reset();
-            self.anchor_lock.reset();
-            self.compositor.reset_bg_plate();
-            // Drop the inference cache so the next engagement re-infers on
-            // its first frame instead of compositing a mask from the last
-            // call against a fresh, unrelated scene.
-            self.cached_mask = None;
-            self.cached_framing = None;
-            self.infer_tick = 0;
-            // The next pump_idle_frame tick will overwrite idle_frame
-            // with a fresh loader render, wiping the last-call image.
-            self.last_idle_push = None;
+            self.leave_live();
         }
 
         let prev = self.state;
         self.state = next;
         self.publish_state(prev);
+    }
+
+    /// Release the camera and drop all per-engagement state. The caller
+    /// sets the new state.
+    fn leave_live(&mut self) {
+        self.stop_source();
+        // RVM / smoother carry inter-frame state; reset so the next
+        // engagement starts clean instead of with stale gradients.
+        // The bg plate is dropped too — lighting and camera
+        // position may have changed during the idle window, and
+        // the EMA reconverges within ~1 s of being live again.
+        self.segmenter.reset();
+        self.smoother.reset();
+        self.anchor_lock.reset();
+        self.compositor.reset_bg_plate();
+        // Drop the inference cache so the next engagement re-infers on
+        // its first frame instead of compositing a mask from the last
+        // call against a fresh, unrelated scene.
+        self.cached_mask = None;
+        self.cached_framing = None;
+        self.infer_tick = 0;
+        // The next pump_idle_frame tick will overwrite idle_frame
+        // with a fresh loader render, wiping the last-call image.
+        self.last_idle_push = None;
+    }
+
+    /// Pin the state machine in Idle for an exponentially growing delay
+    /// (2, 4, 8, 16, 32 s) so a wedged or unplugged camera neither retries
+    /// at tick rate nor floods the log.
+    fn back_off(&mut self, now: Instant) {
+        self.source_failure_count = self.source_failure_count.saturating_add(1).min(5);
+        let delay = Duration::from_secs(2u64.pow(self.source_failure_count));
+        self.source_backoff_until = Some(now + delay);
+        log::warn!(
+            "source-pipeline retry suppressed for {delay:?} (failure #{})",
+            self.source_failure_count,
+        );
+        let prev = self.state;
+        self.state = State::Idle;
+        self.publish_state(prev);
+    }
+
+    /// Called when a Live pull returns nothing. An EOS'd appsink returns at
+    /// once (camera unplugged, USB reset, driver error), so without this the
+    /// Live loop spins on one core; the watchdog catches a silent stall.
+    fn check_source_health(&mut self, appsink: &gst_app::AppSink) {
+        if appsink.is_eos() {
+            log::error!("source camera hit end of stream while live");
+        } else if self.last_frame_at.elapsed() >= SOURCE_STALL_TIMEOUT {
+            log::error!("source camera delivered no frame for {SOURCE_STALL_TIMEOUT:?}");
+        } else {
+            return;
+        }
+        self.leave_live();
+        self.back_off(Instant::now());
     }
 
     fn start_source(&mut self) -> Result<()> {
@@ -529,6 +562,8 @@ impl Feeder {
                     // this engagement, not the gap since the last one.
                     self.fps_win_start = Instant::now();
                     self.fps_win_frames = 0;
+                    self.live_since = Instant::now();
+                    self.last_frame_at = self.live_since;
                     self.telemetry_dirty = true;
                     self.source = Some((pipeline, appsink));
                     return Ok(());
@@ -711,8 +746,8 @@ impl Feeder {
 
     /// Pull one sample from the source appsink (with a short timeout),
     /// produce a mask (segment or reuse the cache per `infer_interval`),
-    /// composite, and push the result into the sink appsrc. No-op if the
-    /// pull times out (camera lag).
+    /// composite, and push the result into the sink appsrc. An empty pull
+    /// is camera lag unless `check_source_health` finds the source dead.
     fn pump_one_frame(&mut self) {
         let t_start = Instant::now();
         let appsink = match self.source.as_ref() {
@@ -720,10 +755,14 @@ impl Feeder {
             None => return,
         };
 
-        let sample = match appsink.try_pull_sample(gst::ClockTime::from_mseconds(33)) {
-            Some(s) => s,
-            None => return,
+        let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(33)) else {
+            self.check_source_health(&appsink);
+            return;
         };
+        self.last_frame_at = Instant::now();
+        if self.last_frame_at.duration_since(self.live_since) >= HEALTHY_STREAM {
+            self.source_failure_count = 0;
+        }
         let buffer = match sample.buffer() {
             Some(b) => b,
             None => return,
@@ -737,7 +776,6 @@ impl Feeder {
         drop(map);
         let frame_w = self.cfg.width;
         let frame_h = self.cfg.height;
-        let bg = self.background.clone();
         let t_pull = t_start.elapsed();
 
         let mut segment_dur: Option<Duration> = None;
@@ -748,7 +786,7 @@ impl Feeder {
         // `Background::None + framing` the compositor crops the raw camera
         // frame around the locked centroid — the mask is only there so
         // `AnchorLock` has something to lock onto.
-        if !matches!(bg, Background::None) || self.framing_enabled {
+        if !matches!(self.background, Background::None) || self.framing_enabled {
             // Infer on a 1-in-N cadence; the first frame of an engagement
             // (cache empty) always infers regardless of the interval.
             let do_infer =
@@ -825,10 +863,14 @@ impl Feeder {
             t_comp_start = Instant::now();
             if let Some(mask) = self.cached_mask.as_ref() {
                 let framing = self.cached_framing;
-                if let Err(e) =
-                    self.compositor
-                        .composite(&mut frame_rgba, frame_w, frame_h, mask, &bg, framing)
-                {
+                if let Err(e) = self.compositor.composite(
+                    &mut frame_rgba,
+                    frame_w,
+                    frame_h,
+                    mask,
+                    &self.background,
+                    framing,
+                ) {
                     log::error!("composite: {e:#}");
                     return;
                 }

@@ -11,7 +11,10 @@
 //! Requires `libgstreamer1.0-dev` + `gstreamer1.0-plugins-good` for
 //! `videotestsrc`. No v4l2loopback needed.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -46,43 +49,51 @@ fn cfg() -> PipelineConfig {
 /// `videotestsrc → videoconvert → capsfilter(RGBA, WxH) → appsink`.
 /// The codec arg is ignored — `videotestsrc` always produces raw frames.
 fn synthetic_source() -> SourceBuilder {
-    Arc::new(
-        |cfg: &PipelineConfig, _codec: SourceCodec| -> Result<(gst::Pipeline, gst_app::AppSink)> {
-            let pipeline = gst::Pipeline::new();
-            let src = gst::ElementFactory::make("videotestsrc")
-                .property_from_str("pattern", "ball")
-                .property("is-live", true)
-                .build()?;
-            let convert = gst::ElementFactory::make("videoconvert").build()?;
-            let caps = gst::Caps::builder("video/x-raw")
-                .field("format", "RGBA")
-                .field("width", cfg.width as i32)
-                .field("height", cfg.height as i32)
-                .build();
-            let capsfilter = gst::ElementFactory::make("capsfilter")
-                .property("caps", &caps)
-                .build()?;
-            let appsink = gst_app::AppSink::builder()
-                .caps(&caps)
-                .max_buffers(2)
-                .drop(true)
-                .sync(false)
-                .build();
-            pipeline.add_many([
-                &src,
-                &convert,
-                &capsfilter,
-                appsink.upcast_ref::<gst::Element>(),
-            ])?;
-            gst::Element::link_many([
-                &src,
-                &convert,
-                &capsfilter,
-                appsink.upcast_ref::<gst::Element>(),
-            ])?;
-            Ok((pipeline, appsink))
-        },
-    )
+    Arc::new(|cfg: &PipelineConfig, _codec: SourceCodec| source_graph(cfg, -1, None))
+}
+
+/// The synthetic source graph. `num_buffers` > 0 makes it EOS after that
+/// many frames; `framerate` pins the source rate (default 30 fps).
+fn source_graph(
+    cfg: &PipelineConfig,
+    num_buffers: i32,
+    framerate: Option<gst::Fraction>,
+) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+    let pipeline = gst::Pipeline::new();
+    let src = gst::ElementFactory::make("videotestsrc")
+        .property_from_str("pattern", "ball")
+        .property("is-live", true)
+        .property("num-buffers", num_buffers)
+        .build()?;
+    let convert = gst::ElementFactory::make("videoconvert").build()?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGBA")
+        .field("width", cfg.width as i32)
+        .field("height", cfg.height as i32)
+        .field_if_some("framerate", framerate)
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()?;
+    let appsink = gst_app::AppSink::builder()
+        .caps(&caps)
+        .max_buffers(2)
+        .drop(true)
+        .sync(false)
+        .build();
+    pipeline.add_many([
+        &src,
+        &convert,
+        &capsfilter,
+        appsink.upcast_ref::<gst::Element>(),
+    ])?;
+    gst::Element::link_many([
+        &src,
+        &convert,
+        &capsfilter,
+        appsink.upcast_ref::<gst::Element>(),
+    ])?;
+    Ok((pipeline, appsink))
 }
 
 /// `appsrc → capsfilter(RGBA, WxH, fps) → appsink`. The terminal appsink
@@ -133,6 +144,21 @@ fn raw_only_source() -> SourceBuilder {
             anyhow::bail!("synthetic camera does not support MJPEG");
         }
         inner(cfg, codec)
+    })
+}
+
+/// Emulates a camera that fails once while Live: the first graph comes from
+/// `faulty`, every later one is healthy, so the feeder can recover.
+fn failing_once_source(
+    faulty: fn(&PipelineConfig) -> Result<(gst::Pipeline, gst_app::AppSink)>,
+) -> SourceBuilder {
+    let built = AtomicBool::new(false);
+    Arc::new(move |cfg: &PipelineConfig, _codec: SourceCodec| {
+        if built.swap(true, Ordering::SeqCst) {
+            source_graph(cfg, -1, None)
+        } else {
+            faulty(cfg)
+        }
     })
 }
 
@@ -346,4 +372,62 @@ fn source_codec_falls_back_to_raw_when_mjpeg_unavailable() {
     );
 
     p.stop();
+}
+
+fn wait_for(p: &Pipeline, timeout: Duration, pred: impl Fn(&PipelineState) -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pred(&p.state()) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// A source that fails while Live must drop the feeder to Idle (no spin on
+/// a dead appsink), then rebuild once the 2 s backoff and the 2 s activation
+/// debounce pass, with frames flowing again.
+fn assert_recovers_from_source_failure(source: SourceBuilder, failure_within: Duration) {
+    let (p, _captured) = start_pipeline_with_source(cfg(), source);
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+
+    let live = |s: &PipelineState| matches!(s, PipelineState::Live { .. });
+    assert!(wait_for(&p, Duration::from_secs(4), live), "expected Live");
+    assert!(
+        wait_for(&p, failure_within, |s| matches!(s, PipelineState::Idle)),
+        "expected Idle after the source failed",
+    );
+    // The fps meter restarts per engagement, so a measured rate proves the
+    // rebuilt graph delivers frames.
+    assert!(
+        wait_for(&p, Duration::from_secs(7), |s| matches!(
+            s,
+            PipelineState::Live { fps: Some(f), .. } if *f > 5.0
+        )),
+        "expected Live with frames flowing after the backoff",
+    );
+
+    p.stop();
+}
+
+#[test]
+fn recovers_when_source_hits_eos_while_live() {
+    // EOS after ~1 s of frames, as on an unplug or USB reset.
+    assert_recovers_from_source_failure(
+        failing_once_source(|cfg| source_graph(cfg, 30, None)),
+        Duration::from_secs(3),
+    );
+}
+
+#[test]
+fn recovers_when_source_stalls_while_live() {
+    // One frame, then nothing for 10 s with no error or EOS: only the
+    // stall watchdog can catch this.
+    assert_recovers_from_source_failure(
+        failing_once_source(|cfg| source_graph(cfg, -1, Some(gst::Fraction::new(1, 10)))),
+        Duration::from_secs(5),
+    );
 }

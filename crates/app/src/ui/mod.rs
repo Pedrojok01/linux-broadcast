@@ -200,7 +200,7 @@ fn load_background_rgba(path: &Path) -> Result<Background> {
     let img = image::open(path)?.to_rgba8();
     let (w, h) = (img.width(), img.height());
     Ok(Background::Image {
-        rgba: img.into_raw(),
+        rgba: img.into_raw().into(),
         width: w,
         height: h,
     })

@@ -17,9 +17,10 @@ const PLATE_BG_THRESHOLD: f32 = 0.9;
 
 /// Cumulative-weight threshold above which the plate is trusted at a
 /// pixel. Below this, the bg materializer falls back to the global
-/// `bg_mean` colour. ~6-12 confident updates' worth, so cold start
-/// transitions to "real plate" within roughly half a second per pixel
-/// once exposed.
+/// `bg_mean` colour. ~6-7 confident updates' worth, so cold start
+/// transitions to "real plate" within roughly a quarter second per pixel
+/// once exposed. The plate is already unbiased by then (see `update`), so
+/// the switch doesn't change brightness.
 pub(super) const PLATE_CONF_THRESHOLD: f32 = 0.3;
 
 /// Long-running per-pixel estimate of the room behind the user.
@@ -36,13 +37,15 @@ pub(super) const PLATE_CONF_THRESHOLD: f32 = 0.3;
 /// live silhouette.
 ///
 /// Per-pixel `conf` accumulates the weights ever applied at that
-/// pixel, capped at 1.0. `conf < PLATE_CONF_THRESHOLD` marks
+/// pixel, capped at 1.0. Colours are kept in `f32`: a `u8` EMA at this
+/// learning rate truncates every step and stalls ~20 levels too dark. `conf < PLATE_CONF_THRESHOLD` marks
 /// "haven't seen real bg here yet" and the materializer fills with
 /// `bg_mean` instead. `reset()` zeros both buffers — the feeder calls
 /// it on Live exit so the next engagement starts learning fresh in
 /// case the camera or lighting changed during the idle window.
 pub(super) struct BgPlate {
-    pub(super) rgba: Vec<u8>,
+    /// RGB per pixel (3 floats, no alpha), in 0..=255.
+    pub(super) rgb: Vec<f32>,
     pub(super) conf: Vec<f32>,
     pub(super) width: u32,
     pub(super) height: u32,
@@ -51,7 +54,7 @@ pub(super) struct BgPlate {
 impl BgPlate {
     pub(super) fn new() -> Self {
         Self {
-            rgba: Vec::new(),
+            rgb: Vec::new(),
             conf: Vec::new(),
             width: 0,
             height: 0,
@@ -62,7 +65,7 @@ impl BgPlate {
     /// from a cold plate; the `bg_mean` cold-start fallback in the
     /// materializer covers the visual gap until the EMA re-converges.
     pub(super) fn reset(&mut self) {
-        self.rgba.clear();
+        self.rgb.clear();
         self.conf.clear();
         self.width = 0;
         self.height = 0;
@@ -72,11 +75,16 @@ impl BgPlate {
     /// foreground probability at frame resolution. Pixels with
     /// `mask >= PLATE_BG_THRESHOLD` are skipped entirely; the rest are
     /// EMA'd at a rate proportional to their bg-certainty.
+    ///
+    /// The step is `alpha / conf` (bias-corrected EMA): the first sample
+    /// seeds the pixel, the next ones form a running mean, and once `conf`
+    /// saturates at 1.0 it is the plain EMA. A plain EMA from 0 would read
+    /// far too dark until it converged.
     pub(super) fn update(&mut self, frame: &[u8], mask: &[f32], width: u32, height: u32) {
         let n_px = (width as usize) * (height as usize);
         if self.width != width || self.height != height {
-            self.rgba.clear();
-            self.rgba.resize(n_px * 4, 0);
+            self.rgb.clear();
+            self.rgb.resize(n_px * 3, 0.0);
             self.conf.clear();
             self.conf.resize(n_px, 0.0);
             self.width = width;
@@ -88,15 +96,13 @@ impl BgPlate {
                 continue;
             }
             let alpha = PLATE_LEARN_RATE * bg_certainty;
-            let inv = 1.0 - alpha;
-            let pi = i * 4;
-            self.rgba[pi] = (self.rgba[pi] as f32 * inv + frame[pi] as f32 * alpha) as u8;
-            self.rgba[pi + 1] =
-                (self.rgba[pi + 1] as f32 * inv + frame[pi + 1] as f32 * alpha) as u8;
-            self.rgba[pi + 2] =
-                (self.rgba[pi + 2] as f32 * inv + frame[pi + 2] as f32 * alpha) as u8;
-            self.rgba[pi + 3] = 255;
-            self.conf[i] = (self.conf[i] + alpha).min(1.0);
+            let conf = (self.conf[i] + alpha).min(1.0);
+            let rate = alpha / conf;
+            let px = &mut self.rgb[i * 3..i * 3 + 3];
+            for (p, &v) in px.iter_mut().zip(&frame[i * 4..i * 4 + 3]) {
+                *p += (v as f32 - *p) * rate;
+            }
+            self.conf[i] = conf;
         }
     }
 }

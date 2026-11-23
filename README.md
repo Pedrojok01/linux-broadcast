@@ -62,7 +62,7 @@ flowchart LR
 - **Two switchable models** (chosen live in the GUI):
   - **RVM** (Robust Video Matting) — recurrent video matting, best edges, no flicker (~15 MB). Default.
   - **Selfie multiclass** — per-frame, fixed 256×256 (~16 MB). Low-CPU fallback.
-- **Three background modes** — passthrough, blur (intensity slider, 4–32 px radius), replace with a saved image.
+- **Three background modes** — passthrough, blur (intensity slider, 4–32 px radius), replace with a saved image (centre-cropped to fill the frame, never stretched).
 - **Saved background library** — imports are copied to `~/.local/share/linux-broadcast/backgrounds/` so they survive across launches.
 - **Auto-frame** — a smoothed horizontal recenter plus a light foreground zoom that keeps the silhouette centered as you move. Off by default; toggle in the sidebar's *Settings*. Skipped when the background mode is *None* (no plane to paint over).
 - **Full-resolution capture** — automatically negotiates **MJPEG** so USB webcams deliver native HD at 30 fps; raw YUYV is bandwidth-capped to ~10 fps at 720p on USB 2.0. Falls back to raw automatically if the camera can't do MJPEG (`LB_FORCE_RAW=1` forces it). The capture is always **aspect-preserved** — cropped to your output ratio, never stretched.

@@ -65,6 +65,8 @@ mod sample;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use fast_image_resize::{
     self as fr, FilterType, ResizeAlg, ResizeOptions,
@@ -150,8 +152,9 @@ pub enum Background {
     /// user — never the user themselves.
     Blur { strength: f32 },
     /// Composite over a static RGBA image, scaled to cover the frame.
+    /// Shared so the feeder and compositor never copy the pixels.
     Image {
-        rgba: Vec<u8>,
+        rgba: Arc<[u8]>,
         width: u32,
         height: u32,
     },
@@ -172,11 +175,10 @@ pub struct Compositor {
     bg_scaled: Vec<u8>,
     bg_w: u32,
     bg_h: u32,
-    /// Fingerprint of the source image last scaled into `bg_scaled`. The
-    /// cache is keyed on this in addition to the frame size so picking a
-    /// different library image (same frame size, different pixels) actually
-    /// invalidates the rescaled buffer.
-    bg_fingerprint: Option<u64>,
+    /// Source image last scaled into `bg_scaled`, compared by pointer so a
+    /// different library image invalidates the cache. Held (not a raw
+    /// pointer) so a freed image's address can't be reused by the next one.
+    bg_source: Option<Arc<[u8]>>,
     /// Unframed copy of the input frame, kept across calls so the
     /// `Background::Image` asymmetric blend can sample foreground RGBA
     /// from a remapped source position while writing to the in-place
@@ -218,7 +220,7 @@ impl Compositor {
             bg_scaled: Vec::new(),
             bg_w: 0,
             bg_h: 0,
-            bg_fingerprint: None,
+            bg_source: None,
             fg_scratch: Vec::new(),
             composite_scratch: Vec::new(),
             plate_materialized: Vec::new(),
@@ -457,18 +459,19 @@ impl Compositor {
 
         let bg_mean = compute_bg_mean(frame, &self.upsampled_mask, w * h);
 
-        let plate_rgba = &self.plate.rgba;
+        let plate_rgb = &self.plate.rgb;
         let plate_conf = &self.plate.conf;
         let plate_ready =
-            self.plate.width == width && self.plate.height == height && !plate_rgba.is_empty();
+            self.plate.width == width && self.plate.height == height && !plate_rgb.is_empty();
         let out = &mut self.plate_materialized;
         for (i, &conf) in plate_conf.iter().take(w * h).enumerate() {
             let pi = i * 4;
             let use_plate = plate_ready && conf > PLATE_CONF_THRESHOLD;
             if use_plate {
-                out[pi] = plate_rgba[pi];
-                out[pi + 1] = plate_rgba[pi + 1];
-                out[pi + 2] = plate_rgba[pi + 2];
+                let ci = i * 3;
+                out[pi] = (plate_rgb[ci] + 0.5) as u8;
+                out[pi + 1] = (plate_rgb[ci + 1] + 0.5) as u8;
+                out[pi + 2] = (plate_rgb[ci + 2] + 0.5) as u8;
             } else {
                 out[pi] = bg_mean[0];
                 out[pi + 1] = bg_mean[1];
@@ -588,13 +591,16 @@ impl Compositor {
         Ok(())
     }
 
-    fn ensure_bg_scaled(&mut self, bg: &[u8], bw: u32, bh: u32, fw: u32, fh: u32) -> Result<()> {
-        let fp = bg_fingerprint(bg, bw, bh);
-        if self.bg_w == fw
-            && self.bg_h == fh
-            && self.bg_fingerprint == Some(fp)
-            && !self.bg_scaled.is_empty()
-        {
+    fn ensure_bg_scaled(
+        &mut self,
+        bg: &Arc<[u8]>,
+        bw: u32,
+        bh: u32,
+        fw: u32,
+        fh: u32,
+    ) -> Result<()> {
+        let same_source = self.bg_source.as_ref().is_some_and(|s| Arc::ptr_eq(s, bg));
+        if same_source && self.bg_w == fw && self.bg_h == fh {
             return Ok(());
         }
         self.bg_scaled.resize((fw as usize) * (fh as usize) * 4, 0);
@@ -602,12 +608,14 @@ impl Compositor {
             ImageRef::new(bw, bh, bg, fr::PixelType::U8x4).map_err(|e| anyhow!("bg src: {e}"))?;
         let mut dst = Image::from_slice_u8(fw, fh, &mut self.bg_scaled, fr::PixelType::U8x4)
             .map_err(|e| anyhow!("bg dst: {e}"))?;
+        // Centre-crop to the output aspect first: cover, never stretch.
+        let opts = Self::resize_opts().fit_into_destination(None);
         self.resizer
-            .resize(&src, &mut dst, &Self::resize_opts())
+            .resize(&src, &mut dst, &opts)
             .map_err(|e| anyhow!("bg resize: {e}"))?;
         self.bg_w = fw;
         self.bg_h = fh;
-        self.bg_fingerprint = Some(fp);
+        self.bg_source = Some(Arc::clone(bg));
         Ok(())
     }
 }
@@ -635,26 +643,4 @@ fn resize_rgba(
     resizer
         .resize(&s, &mut d, &Compositor::resize_opts())
         .map_err(|e| anyhow!("resize: {e}"))
-}
-
-/// Cheap content fingerprint for an RGBA buffer. We hash the source
-/// dimensions plus a sparse byte sample so two same-size library images
-/// with different pixels disambiguate without re-hashing the whole buffer.
-/// 1280×720 RGBA is ~3.7 MB — touching every byte each call would dwarf
-/// the actual rescale.
-fn bg_fingerprint(bg: &[u8], bw: u32, bh: u32) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bw.hash(&mut h);
-    bh.hash(&mut h);
-    bg.len().hash(&mut h);
-    let n = bg.len();
-    if n >= 64 {
-        bg[..32].hash(&mut h);
-        bg[n - 32..].hash(&mut h);
-        bg[n / 2..(n / 2 + 32).min(n)].hash(&mut h);
-    } else {
-        bg.hash(&mut h);
-    }
-    h.finish()
 }

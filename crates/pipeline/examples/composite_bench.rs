@@ -98,7 +98,7 @@ fn main() {
     // Source image larger than frame to exercise scale-to-cover (cached).
     let img = synth_frame(1920, 1080);
     let image_bg = Background::Image {
-        rgba: img,
+        rgba: img.into(),
         width: 1920,
         height: 1080,
     };
