@@ -29,7 +29,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, select};
+use crossbeam_channel::{Receiver, Sender, never, select};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -351,7 +351,7 @@ impl Feeder {
     fn run(
         &mut self,
         cmd_rx: Receiver<Command>,
-        watcher_rx: Receiver<Vec<Consumer>>,
+        mut watcher_rx: Receiver<Vec<Consumer>>,
         stop_flag: Arc<AtomicBool>,
     ) {
         while !stop_flag.load(Ordering::Relaxed) {
@@ -382,10 +382,11 @@ impl Feeder {
                 recv(watcher_rx) -> msg => match msg {
                     Ok(c) => self.consumers = c,
                     Err(_) => {
-                        // Watcher exited unexpectedly — keep the pipeline
-                        // running but we won't transition out of Idle
-                        // without force-on / preview signals.
+                        // Watcher died: keep running on the last known
+                        // consumers. A disconnected receiver is always
+                        // ready, so park on `never()` instead of spinning.
                         log::warn!("consumer watcher disconnected");
+                        watcher_rx = never();
                     }
                 },
                 default(park) => {}
