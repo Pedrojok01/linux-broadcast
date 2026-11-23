@@ -102,7 +102,10 @@ priority = "optional"
 # linux-broadcast-cuda provider libs / NVIDIA runtime are absent, and
 # auto-engages the GPU when they are present.
 features = ["cuda"]
-depends = "$auto, v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libayatana-appindicator3-1"
+# Recent Ubuntu kernels ship a signed module that Provides (unversioned)
+# v4l2loopback-modules; a versioned dkms-only dep would force the DKMS build,
+# which then fails on top of it. Elsewhere apt falls back to DKMS.
+depends = "$auto, v4l2loopback-modules | v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libayatana-appindicator3-1"
 recommends = "v4l-utils"
 assets = [
     ["target/release/linux-broadcast", "usr/lib/linux-broadcast/", "755"],

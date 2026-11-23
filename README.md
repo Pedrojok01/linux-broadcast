@@ -77,7 +77,7 @@ Out of scope: audio / microphone effects.
 
 ### Option A — `.deb` (Debian / Ubuntu / Mint)
 
-Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The package depends on `v4l2loopback-dkms (≥ 0.12.8)` and the GStreamer plugin set; everything else is statically baked into the binary.
+Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The package depends on the v4l2loopback kernel module (the kernel's own `linux-main-modules-v4l2loopback-*` package on recent Ubuntu, otherwise `v4l2loopback-dkms ≥ 0.12.8`) and the GStreamer plugin set; everything else is statically baked into the binary.
 
 ```bash
 sudo apt install ./linux-broadcast_<version>_amd64.deb
@@ -85,7 +85,7 @@ sudo apt install ./linux-broadcast_<version>_amd64.deb
 
 That's it. Behind the scenes the package:
 
-- Installs the kernel module via DKMS and loads it now (`postinst` runs `modprobe v4l2loopback`), so `/dev/video10` is available immediately.
+- Uses the kernel's v4l2loopback module if your kernel ships one, installs it via DKMS otherwise, and loads it now (`postinst` runs `modprobe v4l2loopback`), so `/dev/video10` is available immediately.
 - Drops `/etc/modprobe.d/linux-broadcast.conf` with the right options (`devices=1 video_nr=10 card_label="LinuxBroadcast" exclusive_caps=1 max_buffers=2`) and `/etc/modules-load.d/linux-broadcast.conf` so the module reloads on every boot — no manual `modprobe` ever required.
 - Registers the app menu entry and icon under `/usr/share/applications/` and `/usr/share/icons/hicolor/64x64/apps/`.
 
@@ -261,6 +261,8 @@ sudo apt install -y \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
+Drop `v4l2loopback-dkms` if `modinfo v4l2loopback` already finds a module (recent Ubuntu kernels ship it as `linux-main-modules-v4l2loopback-*`): installing DKMS on top of it fails on every kernel update.
+
 The `libgtk-3-dev` / `libayatana-appindicator3-dev` pair is pulled in by the `tray-icon` crate at build time; at runtime only `libayatana-appindicator3-1` is required (already declared in the `.deb`'s `Depends`).
 
 #### 2. Create the virtual camera device (development only)
@@ -351,6 +353,7 @@ Composite is CPU-side either way: ~2 ms for a virtual background, ~10 ms for blu
 - **`/dev/video10` doesn't appear.** With the `.deb` or AUR package, this is handled automatically: the install hook does `modprobe -r` first to drop any stale module, then reloads it with the right params. For source builds, run those two commands by hand (see [step 2 above](#2-create-the-virtual-camera-device-development-only)).
 - **`/dev/video10` is "busy" or "not a video capture device".** That's `exclusive_caps=1` doing its job: the device only exposes CAPTURE while LinuxBroadcast is producing frames. Real apps see it; raw `ffplay` may not until the producer is running.
 - **`apt install v4l2loopback-dkms` fails on kernel 6.8+.** You have the broken 0.12.7 — install ≥ 0.12.8 from upstream or your distro backports.
+- **Kernel updates fail with `Autoinstall … failed for module(s) v4l2loopback`.** Your kernel already ships the module (`linux-main-modules-v4l2loopback-*`) and `v4l2loopback-dkms` collides with it. Releases after 0.4.0 accept the kernel's module: `sudo apt remove v4l2loopback-dkms`, then reinstall LinuxBroadcast. With 0.4.0 itself, removing DKMS also removes the app.
 - **The window icon shows in the title bar but the taskbar entry stays generic on Wayland.** First launch installs `~/.local/share/icons/.../LinuxBroadcast.png` and a matching `.desktop` file; KDE may need `kbuildsycoca6 --noincremental` once or a re-login to refresh its sycoca cache.
 - **The image looks soft / low frame rate.** LinuxBroadcast auto-selects MJPEG for full-resolution 30 fps. A few cheap webcams ship a buggy hardware JPEG encoder; if the picture looks blocky, run with `LB_FORCE_RAW=1` to force uncompressed capture (lower max framerate, but no JPEG artefacts).
 - **The image looks stretched / proportions are wrong.** Fixed in 0.3.0: the pipeline now crops to your output aspect ratio instead of stretching the camera into it. A non-16:9 resolution saved by an older version self-corrects (with a slightly narrower field of view); set width/height to a 16:9 pair like `1280×720` for the full view.

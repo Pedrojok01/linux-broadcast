@@ -75,7 +75,7 @@ LB_PROFILE=1 LB_INFER_INTERVAL=2 cargo run --release -p linux-broadcast
 LB_FORCE_RAW=1 cargo run --release -p linux-broadcast
 ```
 
-System dev packages are listed in [README §Build from source](README.md#option-b--build-from-source). Pin `v4l2loopback-dkms ≥ 0.12.8` — 0.12.7 fails to build on kernel 6.8+.
+System dev packages are listed in [README §Build from source](README.md#option-b--build-from-source). Pin `v4l2loopback-dkms ≥ 0.12.8` — 0.12.7 fails to build on kernel 6.8+. The `.deb` depends on `v4l2loopback-modules | v4l2loopback-dkms (>= 0.12.8)`: recent Ubuntu kernels ship a signed module (`linux-main-modules-v4l2loopback-*`) that provides those names unversioned, so a versioned dkms-only dep forces a DKMS build that then fails on every kernel update.
 
 ## Architecture
 
