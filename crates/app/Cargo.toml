@@ -31,7 +31,6 @@ toml.workspace = true
 glob.workspace = true
 rfd.workspace = true
 image.workspace = true
-fs2 = "0.4"
 
 # System tray icon. On Linux this needs a GTK thread (spawned in tray.rs)
 # because egui/winit don't host GTK natively. Build deps: libgtk-3-dev,

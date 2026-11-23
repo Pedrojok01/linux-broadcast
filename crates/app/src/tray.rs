@@ -15,10 +15,9 @@
 //!
 //! Install can fail on minimal sessions without an appindicator host
 //! (some headless WMs, container-only desktops). When it does the error
-//! is logged and the GUI keeps working without a tray entry — the close
-//! button intercept in `ui.rs` still keeps the process alive on the
-//! "headless autostart, no GUI visible" path because `--headless` skips
-//! tray creation by design.
+//! is logged and the GUI keeps working without a tray entry. `--headless`
+//! installs the tray too; if that fails, `App::new` un-hides the window
+//! on the first frame so the user isn't left with no way to reach it.
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};

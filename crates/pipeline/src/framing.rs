@@ -34,9 +34,8 @@
 use crate::Mask;
 
 /// Mask probability above which a pixel counts as foreground for the
-/// centroid computation. Conservative — well below the 0.5 threshold
-/// used for compositing — so faint silhouette edges still influence the
-/// recentering.
+/// centroid and top-edge search. Pixels at or below it are ignored so
+/// low-confidence background noise doesn't pull the anchor.
 const FG_THRESHOLD: f32 = 0.5;
 
 /// Per-row mask-mass threshold (as a fraction of row width) above which

@@ -16,8 +16,8 @@
 //! That's what keeps CPU usage low at 720p/1080p.
 //!
 //! All resizes use `fast_image_resize`; both `MpInner` and `RvmInner`
-//! keep their input/output buffers in `self` so steady-state segmentation
-//! does no heap allocation.
+//! keep their resize and input-tensor buffers in `self`. Each call still
+//! allocates the returned mask (and RVM its recurrent-state `Vec`).
 
 use anyhow::{Result, anyhow};
 use fast_image_resize::{

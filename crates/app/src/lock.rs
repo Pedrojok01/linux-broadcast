@@ -14,9 +14,7 @@
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
-use fs2::FileExt;
-use std::fs::{File, OpenOptions};
-use std::io;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
 fn lock_path() -> Result<PathBuf> {
@@ -52,10 +50,12 @@ impl InstanceLock {
             .truncate(false)
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        match FileExt::try_lock_exclusive(&file) {
+        match file.try_lock() {
             Ok(()) => Ok(Some(Self { _file: file })),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("flock {}", path.display())),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("flock {}", path.display()))
+            }
         }
     }
 }

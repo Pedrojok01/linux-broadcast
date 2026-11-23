@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Pedrojok01/linux-broadcast"
 authors = ["Pedrojok01"]
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"

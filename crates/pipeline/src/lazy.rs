@@ -21,6 +21,7 @@
 //!   prevents the pipeline from thrashing.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -371,8 +372,11 @@ impl Feeder {
             };
             select! {
                 recv(cmd_rx) -> msg => match msg {
-                    Ok(Command::Stop) => return self.shutdown(),
-                    Ok(cmd) => self.handle_command(cmd),
+                    Ok(cmd) => {
+                        if self.handle_command(cmd).is_break() {
+                            return self.shutdown();
+                        }
+                    }
                     Err(_) => return self.shutdown(),
                 },
                 recv(watcher_rx) -> msg => match msg {
@@ -394,7 +398,7 @@ impl Feeder {
 
             // 3. Frame pumping. Live: pull a real frame from the source
             //    appsink, segment + composite, push to the sink. Otherwise:
-            //    re-push the last live frame (or black) at a low rate so
+            //    push the idle-loader frame at `IDLE_PUSH_INTERVAL` so
             //    `/dev/video10` always has output for any consumer that
             //    opens it — the lazy state still controls whether
             //    `/dev/video0` is held, but virtual-cam visibility is no
@@ -408,7 +412,8 @@ impl Feeder {
         self.shutdown();
     }
 
-    fn handle_command(&mut self, cmd: Command) {
+    /// `Break` means `Command::Stop`: the caller shuts the feeder down.
+    fn handle_command(&mut self, cmd: Command) -> ControlFlow<()> {
         match cmd {
             Command::SetBackground(bg) => self.background = bg,
             Command::SetPreviewEnabled(v) => self.preview_enabled = v,
@@ -424,8 +429,9 @@ impl Feeder {
                 // ticks don't keep applying a stale crop after the toggle.
                 self.cached_framing = None;
             }
-            Command::Stop => unreachable!("handled in run()"),
+            Command::Stop => return ControlFlow::Break(()),
         }
+        ControlFlow::Continue(())
     }
 
     /// Step the debounced state machine and execute side effects

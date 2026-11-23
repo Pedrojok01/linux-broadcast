@@ -94,29 +94,18 @@ fn uninstall_at(path: &Path) -> Result<()> {
     }
 }
 
-pub fn is_installed() -> bool {
-    autostart_path().map(|p| p.exists()).unwrap_or(false)
-}
-
 /// Bring the on-disk state in line with `desired`. Used at startup so the
 /// toggle stays truthful even if the user wiped `~/.config/autostart/` by
 /// hand or copied a config from another machine.
 pub fn reconcile(desired: bool, exec_path: &Path) -> Result<()> {
-    let on_disk = is_installed();
-    match (desired, on_disk) {
-        (true, _) => install(exec_path),
-        (false, true) => uninstall(),
-        (false, false) => Ok(()),
-    }
+    reconcile_at(&autostart_path()?, desired, exec_path)
 }
 
-#[cfg(test)]
 fn reconcile_at(path: &Path, desired: bool, exec_path: &Path) -> Result<()> {
-    let on_disk = path.exists();
-    match (desired, on_disk) {
-        (true, false) | (true, true) => install_at(path, exec_path),
-        (false, true) => uninstall_at(path),
-        (false, false) => Ok(()),
+    if desired {
+        install_at(path, exec_path)
+    } else {
+        uninstall_at(path)
     }
 }
 
