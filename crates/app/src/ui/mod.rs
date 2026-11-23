@@ -35,6 +35,7 @@
 
 mod footer;
 mod header;
+mod presence;
 mod preview_pane;
 mod sidebar;
 mod widgets;
@@ -58,6 +59,7 @@ use crate::theme::{self, color};
 use crate::tray::{Tray, TrayEvent};
 use crate::wayland_activation::{self, WaylandHandleSlot, WaylandHandles};
 use crate::{MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX};
+use presence::Presence;
 
 const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 850.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [820.0, 560.0];
@@ -91,10 +93,8 @@ fn wait_for_device(path: &str, timeout: Duration) -> bool {
 /// Read the compositor-reported minimized state. `unwrap_or(false)` is
 /// intentional: pre-first-frame and on platforms that don't supply the
 /// field, treat as "not minimized" so a fresh window paints rather than
-/// silently going blank. egui has no `viewport.visible` analogue —
-/// `Visible(false)` is a no-op on Wayland and on other platforms eframe
-/// pauses redraws anyway, so minimized is the only meaningful "is the
-/// surface on the user's screen" signal we get from the toolkit.
+/// silently going blank. Only X11 reports it (winit returns `None` on
+/// Wayland), so the preview heartbeat relies on `Presence` instead.
 fn is_minimized(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().minimized).unwrap_or(false)
 }
@@ -247,6 +247,10 @@ pub(super) struct App {
     /// sure the surface is actually off-screen. Mutually exclusive with
     /// `force_unhide_on_first_frame` (only one can be true).
     headless_minimize_pending: bool,
+    /// Whether the window is on screen, from our own show/hide requests.
+    /// Drives the preview heartbeat; see `presence.rs` for why the
+    /// toolkit's minimized readback can't.
+    presence: Presence,
     /// Last value sent to the pipeline via `Command::SetGuiPreviewActive`.
     /// `None` before the first send. Used to edge-trigger so we don't
     /// flood the command channel every frame.
@@ -330,6 +334,7 @@ impl App {
             quit_requested: false,
             force_unhide_on_first_frame,
             headless_minimize_pending,
+            presence: Presence::new(headless_minimize_pending),
             last_gui_preview_active: None,
             activation_rx,
             wayland_handles,
@@ -551,20 +556,20 @@ impl App {
             self.set_visible(ctx, false);
         }
 
-        // 3. Read the *compositor-reported* minimized state. Egui has
-        //    no `viewport.visible` analogue — `Visible(false)` on Wayland
-        //    is a no-op and on other platforms eframe pauses redraws
-        //    anyway, so minimized is the only meaningful signal.
+        // 3. Read the compositor-reported minimized state (X11 only; a
+        //    WM-minimized window there should also drop the heartbeat).
         let minimized = is_minimized(ctx) || starting_headless_hidden;
 
         // GUI preview heartbeat: the pipeline treats this as a synthetic
         // consumer in its lazy state machine (so opening the preview
         // pane lights `/dev/video0` even with no real client attached,
         // and hiding to tray releases it after the deactivation
-        // debounce). True only when the window is visible AND the user
+        // debounce). True only when the window is shown AND the user
         // has the preview toggle on. Edge-triggered to avoid flooding
         // the command channel every frame.
-        let preview_active = !minimized && self.cfg.show_preview;
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        let shown = self.presence.observe(focused);
+        let preview_active = shown && !minimized && self.cfg.show_preview;
         self.send_gui_preview_active(preview_active);
 
         minimized
@@ -632,14 +637,13 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// Idempotent visibility request. Doesn't track local state — every
-    /// call just emits the appropriate viewport commands and lets the
-    /// compositor be the source of truth (read back via
-    /// `is_minimized(ctx)` in `update()`). Sending `Visible(true)` to
-    /// an already-visible window is a harmless re-assert; same for the
-    /// other direction.
+    /// Idempotent visibility request: records the intent in `presence`
+    /// (which drives the preview heartbeat) and emits the viewport
+    /// commands. Sending `Visible(true)` to an already-visible window is a
+    /// harmless re-assert; same for the other direction.
     fn set_visible(&mut self, ctx: &egui::Context, visible: bool) {
         if visible {
+            self.presence.show();
             // Un-minimize first so the compositor remaps the surface,
             // then ask for visibility (X11/Win/macOS), then take focus.
             // Order matters on KDE Plasma: focus on a still-minimized
@@ -660,6 +664,7 @@ impl App {
             //   compromise is unavoidable without compositor-specific
             //   protocol extensions, and it's the same UX every other
             //   "minimize to tray" Wayland app ships with today.
+            self.presence.hide();
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
