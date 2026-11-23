@@ -28,6 +28,8 @@ eframe = { version = "0.29", default-features = false, features = ["default_font
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["image"] }
 crossbeam-channel = "0.5"
+# inotify + poll + eventfd for the consumer watcher (already in the tree via wayland).
+rustix = { version = "1", default-features = false, features = ["std", "fs", "event"] }
 directories = "5"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

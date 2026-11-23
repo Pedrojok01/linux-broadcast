@@ -21,7 +21,7 @@
 //!   shipped binary is self-contained — no separate model files, no first-run
 //!   download.
 //! - Acquire the per-user single-instance lock before doing anything else
-//!   that could race a sibling instance (consumer poller, sink graph,
+//!   that could race a sibling instance (consumer watcher, sink graph,
 //!   autostart reconciliation). The lock is held for the lifetime of the
 //!   process.
 //! - Decide whether to run the icon-dump tool (`LB_DUMP_ICON=1`, used by
@@ -93,7 +93,7 @@ fn main() -> Result<()> {
     // Process-level single-instance lock. With lazy mode, the pipeline
     // can sit idle (no v4l2sink contention) for arbitrarily long, so we
     // need a real lock that covers the whole LB process — otherwise two
-    // LB instances would both poll for consumers and race when one
+    // LB instances would both watch for consumers and race when one
     // arrives. Held until `main` returns. Also the fallback "another
     // instance is running" gate when D-Bus is unavailable (sandbox,
     // container, broken session bus).

@@ -24,6 +24,7 @@ ort.workspace = true
 fast_image_resize.workspace = true
 
 crossbeam-channel.workspace = true
+rustix.workspace = true
 
 [features]
 # Optional NVIDIA GPU acceleration via ort's CUDA execution provider.

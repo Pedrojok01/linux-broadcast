@@ -75,11 +75,6 @@ pub type SinkBuilder =
 
 pub(crate) const NS_PER_SEC: u64 = 1_000_000_000;
 
-/// How often the consumer watcher polls `/proc/*/fd`. Tuned against the
-/// activation debounce: we want at least one poll cycle inside the
-/// debounce window so a real consumer is observed before the timeout.
-const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(800);
-
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Source v4l2 device, e.g. `/dev/video0`.
@@ -256,11 +251,8 @@ impl Pipeline {
         //    ourselves as a consumer (the v4l2sink holds /dev/video10
         //    open as the *producer*, but `/proc/<our pid>/fd` lists it
         //    too).
-        let watcher = Watcher::start(
-            cfg.sink_device.clone(),
-            std::process::id(),
-            WATCH_POLL_INTERVAL,
-        );
+        let watcher = Watcher::start(cfg.sink_device.clone(), std::process::id())
+            .context("start consumer watcher")?;
         let watcher_rx = watcher.events().clone();
 
         // 4. Feeder thread.

@@ -2336,6 +2336,7 @@ dependencies = [
  "log",
  "ort",
  "proptest",
+ "rustix 1.1.4",
  "tempfile",
  "thiserror 2.0.18",
 ]

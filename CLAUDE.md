@@ -90,7 +90,7 @@ Cargo workspace, two crates:
 
 ```
                           ┌──────────────────────┐
-                          │ consumer_watch       │  /proc/*/fd poll @ ~1.25 Hz
+                          │ consumer_watch       │  /proc/*/fd walk on inotify open/close
                           │ thread               │  → Vec<Consumer> on changes
                           └──────────┬───────────┘
                                      │
@@ -145,9 +145,9 @@ The reverse direction (feeder → GUI) is `PipelineState`, an `Arc<Mutex<…>>` 
 
 - **Activation debounce: 2 s** (`lazy::ACTIVATION_DEBOUNCE`). Sized to reject browser capability-probes (Chrome / Firefox open `/dev/video10` briefly for `ENUM_FMT` without intending to stream — typically <500 ms).
 - **Deactivation debounce: 3 s** (`lazy::DEACTIVATION_DEBOUNCE`). Absorbs in-call camera-switcher flicker (the user toggles cameras in Meet's picker).
-- **Watcher poll interval: 800 ms** (`pipeline::WATCH_POLL_INTERVAL`). Fast enough that a real consumer is observed inside the activation window.
+- **Watcher wake-ups: inotify, not a timer.** The watcher sleeps on `IN_OPEN`/`IN_CLOSE` events on the sink device node and walks `/proc` only when one fires, so a consumer is seen within one walk, well inside the activation window. A 30 s rescan (`consumer_watch::RESCAN_INTERVAL`) catches opens inotify can't see (another inode of the device, e.g. a container's own `/dev`). Without inotify (watch limit, missing node) it polls every 800 ms (`POLL_INTERVAL`), sleeping the full interval after each walk.
 - **Source failure while Live → Idle + backoff.** `lazy::Feeder::check_source_health` runs on every empty pull: an EOS'd appsink (unplug, USB reset, driver error) returns instantly, so without it the Live loop would spin a core. A source with no frame for `SOURCE_STALL_TIMEOUT` (3 s) counts as failed too. Either way the feeder tears down (`leave_live`), drops to Idle and arms the same exponential backoff as a failed start (2→32 s); demand then rebuilds the graph, which is also how hot-replug recovers. The failure counter resets only after `HEALTHY_STREAM` (10 s) of frames, so a camera that keeps dropping out keeps backing off.
-- **Detection mechanism: walk `/proc/*/fd/*`** in `consumer_watch::current_consumers`. v4l2loopback exposes no sysfs consumer-count and the kernel doesn't fire fsnotify on character-device opens, so userspace polling is the only portable signal. ~1–3 ms per poll.
+- **Detection mechanism: walk `/proc/*/fd/*`** in `consumer_watch::current_consumers`. v4l2loopback exposes no sysfs consumer-count, so this is the only way to name the readers. inotify says *that* the device was opened or closed (it does fire on character devices), not *who*. A walk costs one `readlink` per open fd on the system: ~1–3 ms on a typical desktop, but ~0.5 s with Docker Desktop's `virtiofsd` (~180k fds), which is why it must never run on a short timer.
 - The GUI preview pane is a **synthetic consumer**: while the window is visible AND the *Show preview* toggle is on, the camera stays lit. Hiding the window or turning off the toggle drops the signal. The same signal gates forwarding frames to the preview channel, so a hidden window costs no per-frame RGBA clone. There's intentionally no "GUI window open ⇒ camera on" coupling beyond this — anything stronger defeats the lazy-mode promise.
 
 ### Cross-cutting conventions
