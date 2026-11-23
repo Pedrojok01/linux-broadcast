@@ -26,7 +26,7 @@ cargo run --release -p linux-broadcast
 cargo run --release -p linux-broadcast -- --headless
 LB_HEADLESS=1 cargo run --release -p linux-broadcast
 
-# Dump the bundled window icon to /tmp/lb-icon.png. Same code path that
+# Dump the bundled window icon to ./lb-icon.png. Same code path that
 # regenerates packaging/LinuxBroadcast.png when the logo changes.
 LB_DUMP_ICON=1 cargo run --release -p linux-broadcast
 
@@ -226,12 +226,13 @@ The `linux-broadcast-bin` AUR package repackages the GitHub Release `.deb` so Ar
 Two workflows automate the loop:
 
 - **`.github/workflows/aur-lint.yml`** (PR-time gate on `packaging/aur/**` and `packaging/aur-cuda/**`): runs `makepkg --printsrcinfo` inside `archlinux:base-devel` for each package, diffs against the committed `.SRCINFO`, runs `namcap` on each PKGBUILD and fails on `E:` lines (advisory `W:`/`I:` are surfaced but non-fatal).
-- **`release.yml`'s `aur` job** (`needs: deb`, runs on every `v*` tag push): waits up to ~5 min for the just-uploaded `.deb` URL to be reachable, downloads it, computes sha256, sed-rewrites `pkgver` + `sha256sums` in PKGBUILD, regenerates `.SRCINFO`, and pushes to AUR using `ssh-keyscan` + `git push` directly (the `AUR_SSH_KEY` repo secret is the ed25519 private key registered on the AUR account).
+- **`release.yml`'s `aur` job** (`needs: deb`, runs on every `v*` tag push): waits up to ~5 min for the just-uploaded `.deb` URL to be reachable, downloads it, computes sha256, sed-rewrites `pkgver` + `sha256sums` in PKGBUILD, regenerates `.SRCINFO`, and pushes to AUR with `git push` over SSH (the `AUR_SSH_KEY` repo secret is the ed25519 private key registered on the AUR account). AUR's host keys are pinned in `.github/aur_known_hosts`, not keyscanned; if AUR rotates them, re-verify against the fingerprints on aur.archlinux.org.
 - **`release.yml`'s `aur-cuda` job** does the same for the `linux-broadcast-cuda` add-on (`packaging/aur-cuda/`, repackages the add-on `.deb`'s provider libs, `depends=('linux-broadcast')`). It **skips gracefully** if the `linux-broadcast-cuda` AUR repo doesn't exist yet (one-time manual init required, as for the main package).
 - **`.github/workflows/aur.yml`** is a `workflow_dispatch`-only safety valve (`gh workflow run aur.yml -f tag=v0.1.2`) for re-publishing to AUR without re-tagging. Uses the same inline ssh + git push as the release job.
 
 Non-obvious bits:
 
+- **Workflow actions are pinned to commit SHAs** (tag in a trailing comment); `.github/dependabot.yml` bumps them monthly. Third-party actions run next to `AUR_SSH_KEY` and the release token, so never go back to a bare `@v2` tag.
 - **AUR publishing lives in `release.yml`, not its own workflow.** Tried that first; `release: published` events fired by `GITHUB_TOKEN` don't trigger downstream workflows. Putting both jobs in the same workflow with `needs: deb` sidesteps the cross-workflow trigger entirely.
 - **`sha256sums=('SKIP')` is committed.** Real sums only exist at release time — the `.deb` doesn't exist when the PKGBUILD is edited, and pinning a stale sum would block the workflow's substitution. The lint workflow is fine with `SKIP`; namcap warns about it advisorily.
 - **`v4l2loopback-dkms` is an AUR dep itself.** Helpers (`yay`, `paru`) handle the transitive AUR install. Do not change to a non-AUR alias.

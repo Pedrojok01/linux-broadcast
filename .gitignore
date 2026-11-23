@@ -31,3 +31,6 @@ docs/**/*
 
 # Local scratch (reviews, notes)
 .tmp/
+
+# LB_DUMP_ICON output
+/lb-icon.png

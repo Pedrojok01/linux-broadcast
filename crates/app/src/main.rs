@@ -76,8 +76,8 @@ fn main() -> Result<()> {
         let img: image::ImageBuffer<image::Rgba<u8>, _> =
             image::ImageBuffer::from_raw(icon.width, icon.height, icon.rgba.clone())
                 .expect("icon buffer");
-        img.save("/tmp/lb-icon.png")?;
-        println!("wrote /tmp/lb-icon.png ({}×{})", icon.width, icon.height);
+        img.save("lb-icon.png")?;
+        println!("wrote lb-icon.png ({}×{})", icon.width, icon.height);
         return Ok(());
     }
 

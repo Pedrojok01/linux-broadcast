@@ -23,7 +23,7 @@ jobs:
     name: Push linux-broadcast-bin to AUR
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Resolve tag
         id: tag
@@ -89,12 +89,13 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
           chmod 600 ~/.ssh/aur_key
-          ssh-keyscan -4 -t rsa,ed25519,ecdsa aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null
+          cp .github/aur_known_hosts ~/.ssh/known_hosts
           cat > ~/.ssh/config <<'EOF'
           Host aur.archlinux.org
               User aur
               IdentityFile ~/.ssh/aur_key
               IdentitiesOnly yes
+              StrictHostKeyChecking yes
               AddressFamily inet
           EOF
           chmod 600 ~/.ssh/config
