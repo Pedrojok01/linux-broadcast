@@ -18,8 +18,8 @@
 //! sprinkled through `ui.rs`); that's how palettes drift.
 
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Rounding, Stroke, Style,
-    TextStyle, Visuals,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
+    Style, TextStyle, Theme, Visuals,
 };
 
 const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Variable.ttf");
@@ -59,14 +59,14 @@ pub mod space {
 }
 
 pub mod radius {
-    pub const SM: f32 = 4.0;
-    pub const MD: f32 = 8.0;
-    pub const LG: f32 = 12.0;
+    pub const SM: u8 = 4;
+    pub const MD: u8 = 8;
+    pub const LG: u8 = 12;
 }
 
 pub mod control {
     pub const PRIMARY_HEIGHT: f32 = 40.0;
-    pub const THUMB_RADIUS: f32 = 6.0;
+    pub const THUMB_RADIUS: u8 = 6;
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -78,10 +78,11 @@ fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts
         .font_data
-        .insert("inter".into(), FontData::from_static(INTER));
-    fonts
-        .font_data
-        .insert("jbmono".into(), FontData::from_static(JETBRAINS_MONO));
+        .insert("inter".into(), FontData::from_static(INTER).into());
+    fonts.font_data.insert(
+        "jbmono".into(),
+        FontData::from_static(JETBRAINS_MONO).into(),
+    );
     fonts
         .families
         .get_mut(&FontFamily::Proportional)
@@ -96,7 +97,7 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 fn install_style(ctx: &egui::Context) {
-    let mut style: Style = (*ctx.style()).clone();
+    let mut style: Style = (*ctx.style_of(Theme::Dark)).clone();
 
     style.text_styles = [
         (
@@ -121,8 +122,8 @@ fn install_style(ctx: &egui::Context) {
 
     style.spacing.item_spacing = egui::vec2(space::SM, space::SM);
     style.spacing.button_padding = egui::vec2(space::MD, 8.0);
-    style.spacing.window_margin = Margin::symmetric(space::LG, space::PANEL_PAD_Y);
-    style.spacing.menu_margin = Margin::same(space::SM);
+    style.spacing.window_margin = Margin::symmetric(space::LG as i8, space::PANEL_PAD_Y as i8);
+    style.spacing.menu_margin = Margin::same(space::SM as i8);
     style.spacing.combo_height = 240.0;
     style.spacing.scroll.bar_width = 8.0;
     style.spacing.icon_width = 14.0;
@@ -137,8 +138,8 @@ fn install_style(ctx: &egui::Context) {
     v.code_bg_color = color::PANEL_INSET;
 
     v.window_stroke = Stroke::new(1.0, color::STROKE);
-    v.menu_rounding = Rounding::same(radius::MD);
-    v.window_rounding = Rounding::same(radius::LG);
+    v.menu_corner_radius = CornerRadius::same(radius::MD);
+    v.window_corner_radius = CornerRadius::same(radius::LG);
 
     v.override_text_color = Some(color::TEXT);
     v.hyperlink_color = color::ACCENT;
@@ -147,46 +148,48 @@ fn install_style(ctx: &egui::Context) {
     v.selection.stroke = Stroke::new(1.5, color::ACCENT);
 
     // Widget styles — keep all four states consistent.
-    let widget_round = Rounding::same(radius::MD);
+    let widget_round = CornerRadius::same(radius::MD);
 
     v.widgets.noninteractive.bg_fill = color::PANEL;
     v.widgets.noninteractive.weak_bg_fill = color::PANEL;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, color::STROKE);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, color::TEXT);
-    v.widgets.noninteractive.rounding = widget_round;
+    v.widgets.noninteractive.corner_radius = widget_round;
     v.widgets.noninteractive.expansion = 0.0;
 
     v.widgets.inactive.bg_fill = color::PANEL_INSET;
     v.widgets.inactive.weak_bg_fill = color::PANEL_INSET;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, color::STROKE);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, color::TEXT);
-    v.widgets.inactive.rounding = widget_round;
+    v.widgets.inactive.corner_radius = widget_round;
     v.widgets.inactive.expansion = 0.0;
 
     v.widgets.hovered.bg_fill = color::PANEL_ALT;
     v.widgets.hovered.weak_bg_fill = color::PANEL_ALT;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, color::STROKE_STRONG);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, color::TEXT);
-    v.widgets.hovered.rounding = widget_round;
+    v.widgets.hovered.corner_radius = widget_round;
     v.widgets.hovered.expansion = 0.0;
 
     v.widgets.active.bg_fill = color::PANEL_ALT;
     v.widgets.active.weak_bg_fill = color::PANEL_ALT;
     v.widgets.active.bg_stroke = Stroke::new(1.5, color::ACCENT);
     v.widgets.active.fg_stroke = Stroke::new(1.0, color::TEXT);
-    v.widgets.active.rounding = widget_round;
+    v.widgets.active.corner_radius = widget_round;
     v.widgets.active.expansion = 0.0;
 
     v.widgets.open.bg_fill = color::PANEL_ALT;
     v.widgets.open.weak_bg_fill = color::PANEL_ALT;
     v.widgets.open.bg_stroke = Stroke::new(1.0, color::STROKE_STRONG);
     v.widgets.open.fg_stroke = Stroke::new(1.0, color::TEXT);
-    v.widgets.open.rounding = widget_round;
+    v.widgets.open.corner_radius = widget_round;
 
     v.dark_mode = true;
 
     style.visuals = v;
-    ctx.set_style(style);
+    // The palette is dark-only: never follow a light system theme.
+    ctx.set_theme(Theme::Dark);
+    ctx.set_style_of(Theme::Dark, style);
 }
 
 /// A small uppercase section caption (Camera, Library, …).

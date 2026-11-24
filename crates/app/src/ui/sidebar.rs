@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use eframe::egui::{self, Color32, Margin, Rounding, Stroke};
+use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke, StrokeKind};
 use lb_pipeline::Command;
 use std::path::{Path, PathBuf};
 
@@ -12,17 +12,17 @@ use crate::config::{Mode, Model};
 use crate::theme::{self, color, control, radius, space};
 
 impl App {
-    pub(super) fn sidebar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("sidebar")
-            .exact_width(320.0)
+    pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("sidebar")
+            .exact_size(320.0)
             .resizable(false)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(color::PANEL)
                     .stroke(Stroke::new(1.0, color::STROKE))
-                    .inner_margin(Margin::symmetric(space::LG, space::PANEL_PAD_Y)),
+                    .inner_margin(Margin::symmetric(space::LG as i8, space::PANEL_PAD_Y as i8)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 // Reserve a fixed bottom strip for the primary action so it
                 // can never be pushed off-screen by tall sections (Library,
                 // Settings, …). The remaining top region holds the sections
@@ -38,7 +38,7 @@ impl App {
                     egui::pos2(panel_rect.max.x, action_rect.min.y - space::MD),
                 );
 
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
@@ -51,7 +51,7 @@ impl App {
                         });
                 });
 
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(action_rect), |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(action_rect), |ui| {
                     self.primary_action(ui);
                 });
             });
@@ -81,9 +81,10 @@ impl App {
         };
         p.rect(
             rect,
-            Rounding::same(radius::MD),
+            CornerRadius::same(radius::MD),
             color::PANEL_INSET,
             Stroke::new(1.0, stroke),
+            StrokeKind::Inside,
         );
         // status dot
         let dot = rect.left_center() + egui::vec2(12.0, 0.0);
@@ -129,20 +130,15 @@ impl App {
             );
         }
 
-        let popup_id = ui.make_persistent_id("camera_popup");
         if resp.clicked() {
             // Re-list on open so a camera plugged in after launch shows up.
             self.cameras = enumerate(&self.cfg.sink_device);
-            ui.memory_mut(|m| m.toggle_popup(popup_id));
         }
         let mut camera_changed = false;
-        egui::popup_below_widget(
-            ui,
-            popup_id,
-            &resp,
-            egui::PopupCloseBehavior::CloseOnClick,
-            |ui| {
-                ui.set_min_width(rect.width());
+        egui::Popup::from_toggle_button_response(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .width(rect.width())
+            .show(|ui| {
                 ui.set_max_height(280.0);
                 for cam in &self.cameras {
                     let selected = cam.path == self.cfg.source_device;
@@ -152,8 +148,7 @@ impl App {
                         camera_changed = true;
                     }
                 }
-            },
-        );
+            });
 
         if camera_changed {
             self.save_settings();
@@ -228,7 +223,13 @@ impl App {
                 } else {
                     Stroke::new(1.0, color::STROKE)
                 };
-                p.rect(rect, Rounding::same(radius::SM), bg, stroke);
+                p.rect(
+                    rect,
+                    CornerRadius::same(radius::SM),
+                    bg,
+                    stroke,
+                    StrokeKind::Inside,
+                );
                 let text_color = if active && mode == Mode::Blur {
                     color::ACCENT
                 } else if active {
@@ -286,9 +287,10 @@ impl App {
             );
             p.rect(
                 bar,
-                Rounding::same(2.0),
+                CornerRadius::same(2),
                 color::PANEL_INSET,
                 Stroke::new(1.0, color::STROKE),
+                StrokeKind::Inside,
             );
             // fill
             let fill_w = (track_r - track_l) * self.cfg.blur_strength;
@@ -296,7 +298,7 @@ impl App {
                 egui::pos2(track_l, track_y - 2.0),
                 egui::pos2(track_l + fill_w, track_y + 2.0),
             );
-            p.rect_filled(fill, Rounding::same(2.0), color::ACCENT);
+            p.rect_filled(fill, CornerRadius::same(2), color::ACCENT);
             // handle
             let handle_x = track_l + fill_w;
             p.circle_filled(egui::pos2(handle_x, track_y), 7.0, color::TEXT);
@@ -427,9 +429,10 @@ impl App {
                 };
                 p.rect(
                     rect,
-                    Rounding::same(control::THUMB_RADIUS),
+                    CornerRadius::same(control::THUMB_RADIUS),
                     color::PANEL_INSET,
                     Stroke::new(if is_active { 2.0 } else { 1.0 }, stroke_color),
+                    StrokeKind::Inside,
                 );
                 if let Some(t) = &tex {
                     let mut mesh = egui::Mesh::with_texture(t.id());
@@ -445,7 +448,7 @@ impl App {
                 );
                 p.rect_filled(
                     badge,
-                    Rounding::same(3.0),
+                    CornerRadius::same(3),
                     Color32::from_rgba_premultiplied(0x06, 0x09, 0x0D, 0xC8),
                 );
                 p.text(
@@ -474,7 +477,7 @@ impl App {
                 resp.context_menu(|ui| {
                     if ui.button("Remove from library").clicked() {
                         *to_remove = Some(entry.path.clone());
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             }
@@ -492,7 +495,7 @@ impl App {
                 // Dashed border drawn as short segments along each edge.
                 p.rect_filled(
                     rect,
-                    Rounding::same(control::THUMB_RADIUS),
+                    CornerRadius::same(control::THUMB_RADIUS),
                     color::PANEL_INSET,
                 );
                 draw_dashed_rect(p, rect, Stroke::new(1.0, stroke_color));
@@ -617,9 +620,10 @@ impl App {
         };
         p.rect(
             rect,
-            Rounding::same(radius::MD),
+            CornerRadius::same(radius::MD),
             bg,
             Stroke::new(1.0, stroke_color.linear_multiply(0.5)),
+            StrokeKind::Inside,
         );
         // tally / start dot
         let dot = rect.left_center() + egui::vec2(16.0, 0.0);

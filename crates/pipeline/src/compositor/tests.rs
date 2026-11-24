@@ -33,7 +33,7 @@ fn none_is_byte_identical_passthrough() {
     let (w, h) = (32, 32);
     let mut frame = solid_frame(w, h, [10, 20, 30, 255]);
     // Add a recognisable pattern so any modification is visible.
-    for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+    for (i, px) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         px[0] = (i % 251) as u8;
         px[1] = ((i * 3) % 251) as u8;
         px[2] = ((i * 7) % 251) as u8;
@@ -91,7 +91,7 @@ fn mask_full_background_replaces_frame() {
     let mut c = Compositor::new();
     c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h), None)
         .unwrap();
-    for px in frame.chunks_exact(4) {
+    for px in frame.as_chunks::<4>().0.iter() {
         assert_eq!(px, &[255, 0, 0, 255]);
     }
 }
@@ -107,7 +107,7 @@ fn mask_half_blends_refined_midpoint() {
     let mut c = Compositor::new();
     c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h), None)
         .unwrap();
-    for px in frame.chunks_exact(4) {
+    for px in frame.as_chunks::<4>().0.iter() {
         assert!((px[0] as i32 - 186).abs() <= 2, "R={}", px[0]);
         assert!((px[1] as i32 - 44).abs() <= 2, "G={}", px[1]);
         assert!((px[2] as i32 - 44).abs() <= 2, "B={}", px[2]);
@@ -258,7 +258,7 @@ fn none_without_framing_is_bytewise_passthrough() {
     // no segmentation, no plate update, no per-pixel rewrite.
     let (w, h) = (16, 4);
     let mut frame = vec![0u8; (w * h * 4) as usize];
-    for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+    for (i, px) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         px[0] = (i % 251) as u8;
         px[1] = ((i * 7) % 251) as u8;
         px[2] = ((i * 13) % 251) as u8;
@@ -442,7 +442,7 @@ fn image_no_framing_kills_low_alpha_halo() {
     let mut c = Compositor::new();
     c.composite(&mut frame, w, h, &mask, &red_image_bg(w, h), None)
         .unwrap();
-    for px in frame.chunks_exact(4) {
+    for px in frame.as_chunks::<4>().0.iter() {
         assert_eq!(&px[..3], &[255, 0, 0], "halo leaked: {px:?}");
     }
 }
@@ -534,7 +534,7 @@ fn blur_framing_does_not_alias() {
     // no-framing run.
     let (w, h) = (64, 64);
     let mut frame_a = vec![0u8; (w * h * 4) as usize];
-    for (i, px) in frame_a.chunks_exact_mut(4).enumerate() {
+    for (i, px) in frame_a.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         px[0] = (i % 251) as u8;
         px[1] = ((i * 5) % 251) as u8;
         px[2] = ((i * 11) % 251) as u8;
@@ -675,7 +675,7 @@ fn framing_window_out_of_bounds_clamps_without_panic() {
         c.composite(&mut frame, w, h, &mask, &bg, Some(framing))
             .expect("out-of-bounds framing must clamp, not error");
         assert_eq!(frame.len(), (w * h * 4) as usize);
-        for px in frame.chunks_exact(4) {
+        for px in frame.as_chunks::<4>().0.iter() {
             assert_eq!(px[3], 255, "every pixel must be written opaque");
         }
     }
@@ -736,7 +736,7 @@ fn plate_matches_static_background_from_first_frame() {
     for n in 0..300 {
         let mut frame = solid_frame(w, h, wall);
         c.composite(&mut frame, w, h, &mask, &bg, None).unwrap();
-        for px in c.plate_materialized.chunks_exact(4) {
+        for px in c.plate_materialized.as_chunks::<4>().0.iter() {
             assert_eq!(px[..3], wall[..3], "frame {n}");
         }
     }
@@ -807,7 +807,7 @@ fn image_bg_covers_without_stretching() {
     Compositor::new()
         .composite(&mut frame, w, h, &mask_const(w, h, 0.0), &bg, None)
         .unwrap();
-    for (i, px) in frame.chunks_exact(4).enumerate() {
+    for (i, px) in frame.as_chunks::<4>().0.iter().enumerate() {
         let row = i / w as usize;
         if row == 0 || row == h as usize - 1 {
             // The bilinear filter reaches one source pixel past the crop box.

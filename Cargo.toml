@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Pedrojok01/linux-broadcast"
 authors = ["Pedrojok01"]
-rust-version = "1.89"
+rust-version = "1.96"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -17,23 +17,22 @@ log = "0.4"
 env_logger = "0.11"
 
 # Pipeline
-gstreamer = "0.23"
-gstreamer-app = "0.23"
-gstreamer-video = "0.23"
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
-fast_image_resize = "5"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
+fast_image_resize = "6"
 
 # App / GUI
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.29"
-egui_extras = { version = "0.29", features = ["image"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.37"
 crossbeam-channel = "0.5"
 # inotify + poll + eventfd for the consumer watcher (already in the tree via wayland).
 rustix = { version = "1", default-features = false, features = ["std", "fs", "event"] }
-directories = "5"
+directories = "6"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+toml = "1"
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 # Zero-copy RGBA → egui Color32 for the preview (already in the tree via egui).
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }

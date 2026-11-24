@@ -11,8 +11,10 @@ use super::sample::{DECONTAM_MIN_ALPHA, refine_mask, sample_fg_bilinear, sample_
 pub(super) fn blend(frame: &mut [u8], bg: &[u8], mask: &[f32]) {
     debug_assert_eq!(bg.len(), frame.len());
     for ((px, bg_px), &m) in frame
-        .chunks_exact_mut(4)
-        .zip(bg.chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bg.as_chunks::<4>().0.iter())
         .zip(mask.iter())
     {
         let m = m.clamp(0.0, 1.0);
@@ -132,9 +134,11 @@ pub(super) fn decontaminated_blend(frame: &mut [u8], bg: &[u8], plate: &[u8], ma
     debug_assert_eq!(bg.len(), frame.len());
     debug_assert_eq!(plate.len(), frame.len());
     for (((px, bg_px), plate_px), &m_raw) in frame
-        .chunks_exact_mut(4)
-        .zip(bg.chunks_exact(4))
-        .zip(plate.chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(bg.as_chunks::<4>().0.iter())
+        .zip(plate.as_chunks::<4>().0.iter())
         .zip(mask.iter())
     {
         let m = refine_mask(m_raw);

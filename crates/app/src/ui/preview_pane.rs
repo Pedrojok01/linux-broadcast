@@ -1,18 +1,18 @@
-use eframe::egui::{self, Color32, Margin, Rounding, Stroke};
+use eframe::egui::{self, Color32, CornerRadius, Margin, Stroke, StrokeKind};
 
 use super::App;
 use super::widgets::{floating_pill, pill};
 use crate::theme::{color, radius};
 
 impl App {
-    pub(super) fn preview_pane(&mut self, ctx: &egui::Context) {
+    pub(super) fn preview_pane(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(color::BG)
-                    .inner_margin(Margin::symmetric(20.0, 18.0)),
+                    .inner_margin(Margin::symmetric(20, 18)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 14.0;
 
                 // Header row: "Preview" + status pills
@@ -53,13 +53,14 @@ impl App {
                 let p = ui.painter();
                 p.rect_filled(
                     rect,
-                    Rounding::same(radius::LG),
+                    CornerRadius::same(radius::LG),
                     color::PANEL_INSET, // letterbox
                 );
                 p.rect_stroke(
                     rect,
-                    Rounding::same(radius::LG),
+                    CornerRadius::same(radius::LG),
                     Stroke::new(1.0, color::STROKE),
+                    StrokeKind::Inside,
                 );
 
                 if !self.cfg.show_preview {
@@ -109,7 +110,7 @@ impl App {
                         rect.left_bottom() + egui::vec2(pad, -36.0),
                         rect.right_bottom() + egui::vec2(-pad, -pad),
                     );
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             floating_pill(
                                 ui,

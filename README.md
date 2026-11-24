@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/Pedrojok01/linux-broadcast/actions/workflows/ci.yml"><img src="https://github.com/Pedrojok01/linux-broadcast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0-or-later"></a>
-  <img src="https://img.shields.io/badge/MSRV-1.89-orange.svg" alt="MSRV 1.89">
+  <img src="https://img.shields.io/badge/MSRV-1.96-orange.svg" alt="MSRV 1.96">
   <img src="https://img.shields.io/badge/platform-linux--x86__64-lightgrey" alt="Platform: Linux x86_64">
 </p>
 
@@ -256,14 +256,11 @@ sudo apt install -y \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libxkbcommon-dev libwayland-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libgtk-3-dev libayatana-appindicator3-dev \
   v4l2loopback-dkms \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
 Drop `v4l2loopback-dkms` if `modinfo v4l2loopback` already finds a module (recent Ubuntu kernels ship it as `linux-main-modules-v4l2loopback-*`): installing DKMS on top of it fails on every kernel update.
-
-The `libgtk-3-dev` / `libayatana-appindicator3-dev` pair is pulled in by the `tray-icon` crate at build time; at runtime only `libayatana-appindicator3-1` is required (already declared in the `.deb`'s `Depends`).
 
 #### 2. Create the virtual camera device (development only)
 

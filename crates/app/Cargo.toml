@@ -3,6 +3,7 @@ name = "linux-broadcast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Background-replacement virtual webcam for Linux"
@@ -24,7 +25,6 @@ lb-pipeline = { path = "../pipeline", version = "0.4.0" }
 
 eframe.workspace = true
 egui.workspace = true
-egui_extras.workspace = true
 crossbeam-channel.workspace = true
 directories.workspace = true
 serde.workspace = true
@@ -32,21 +32,15 @@ toml.workspace = true
 rfd.workspace = true
 image.workspace = true
 
-# System tray icon. On Linux this needs a GTK thread (spawned in tray.rs)
-# because egui/winit don't host GTK natively. Build deps: libgtk-3-dev,
-# libayatana-appindicator3-dev (see README / Debian deps below).
-# default-features = false drops tray-icon's `libxdo` feature: it only
-# powers the predefined Copy/Cut/Paste/SelectAll menu items (which we
-# don't use) and links libxdo.so, whose soname differs across distros
-# (Debian .so.3 vs Arch .so.4), breaking the prebuilt binary on Arch.
-tray-icon = { version = "0.22", default-features = false }
-gtk = "0.18"
+# System tray icon over the StatusNotifierItem D-Bus protocol. Pure Rust:
+# no GTK, no libappindicator, no extra thread to host a GTK loop.
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 
 # D-Bus activation: the running instance owns a well-known name on the
 # session bus and serves the freedesktop `org.freedesktop.Application`
 # interface; a second launch sends `Activate` to raise the existing
-# window instead of silently exiting on the flock. Blocking API only —
-# zbus 5 hosts its own internal worker so we don't pull in tokio.
+# window instead of silently exiting on the flock. Blocking API, async-io
+# executor (no tokio). Held at 5, the version ksni uses, so one zbus ships.
 zbus = { version = "5", default-features = false, features = ["blocking-api"] }
 
 # Wayland xdg-activation-v1 client. Pinned to the same versions winit /
@@ -105,7 +99,7 @@ features = ["cuda"]
 # Recent Ubuntu kernels ship a signed module that Provides (unversioned)
 # v4l2loopback-modules; a versioned dkms-only dep would force the DKMS build,
 # which then fails on top of it. Elsewhere apt falls back to DKMS.
-depends = "$auto, v4l2loopback-modules | v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libayatana-appindicator3-1"
+depends = "$auto, v4l2loopback-modules | v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav"
 recommends = "v4l-utils"
 assets = [
     ["target/release/linux-broadcast", "usr/lib/linux-broadcast/", "755"],

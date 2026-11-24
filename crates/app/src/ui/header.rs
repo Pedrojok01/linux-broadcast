@@ -1,19 +1,19 @@
-use eframe::egui::{self, Rounding, Stroke, ViewportCommand};
+use eframe::egui::{self, CornerRadius, Stroke, StrokeKind, ViewportCommand};
 
 use super::App;
 use super::widgets::ghost_button;
 use crate::theme::{color, space};
 
 impl App {
-    pub(super) fn header(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("header")
-            .exact_height(56.0)
+    pub(super) fn header(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("header")
+            .exact_size(56.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(color::PANEL)
                     .stroke(Stroke::new(1.0, color::STROKE)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(space::LG);
                     // Brand mark — frame-within-a-frame logo
@@ -23,15 +23,17 @@ impl App {
                     // outer rounded square
                     p.rect(
                         rect.shrink(2.0),
-                        Rounding::same(7.0),
+                        CornerRadius::same(7),
                         color::PANEL_INSET,
                         Stroke::new(1.25, color::STROKE_STRONG),
+                        StrokeKind::Inside,
                     );
                     // inner square
                     p.rect_stroke(
                         egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0)),
-                        Rounding::same(3.5),
+                        CornerRadius::same(4),
                         Stroke::new(2.0, color::TEXT),
+                        StrokeKind::Inside,
                     );
                     // accent dot
                     p.circle_filled(rect.right_top() + egui::vec2(-7.0, 7.0), 2.4, color::ACCENT);
@@ -56,7 +58,7 @@ impl App {
                         // is never stranded.
                         if self.tray.is_none() && ghost_button(ui, "Quit").clicked() {
                             self.quit_requested = true;
-                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                         }
                         if let Some(err) = self.error.as_ref().or(self.bg_warning.as_ref()) {
                             let err = err.clone();

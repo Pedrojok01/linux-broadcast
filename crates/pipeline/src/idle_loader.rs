@@ -146,7 +146,7 @@ fn draw_logo(buf: &mut [u8], w: u32, h: u32) {
 // ----- primitives over a flat RGBA8 slice -----------------------------------
 
 fn fill_solid(buf: &mut [u8], _w: u32, c: [u8; 4]) {
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0.iter_mut() {
         px.copy_from_slice(&c);
     }
 }

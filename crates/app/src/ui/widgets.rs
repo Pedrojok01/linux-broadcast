@@ -1,12 +1,14 @@
 //! Stateless drawing primitives used by multiple sidebar/header sections.
 
-use eframe::egui::{self, Color32, Rounding, Stroke};
+use eframe::egui::{self, Color32, CornerRadius, Stroke, StrokeKind};
 
 use crate::theme::{color, radius};
 
 pub(super) fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg_override: Option<Color32>) {
     let font = egui::FontId::monospace(10.5);
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font.clone(), fg));
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), fg);
     let pad = egui::vec2(10.0, 6.0);
     let has_dot = bg_override == Some(color::DANGER);
     // 14 px = dot (6 dia) + 8 px gap before the glyphs.
@@ -17,9 +19,10 @@ pub(super) fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg_override: Opti
     let bg = bg_override.unwrap_or(color::PANEL_ALT);
     p.rect(
         rect,
-        Rounding::same(999.0),
+        CornerRadius::same(u8::MAX),
         bg,
         Stroke::new(1.0, color::STROKE),
+        StrokeKind::Inside,
     );
     if has_dot {
         let dot = rect.left_center() + egui::vec2(10.0, 0.0);
@@ -39,15 +42,18 @@ pub(super) fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg_override: Opti
 
 pub(super) fn floating_pill(ui: &mut egui::Ui, text: &str, accent: Color32) {
     let font = egui::FontId::monospace(10.5);
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font.clone(), color::TEXT));
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), color::TEXT);
     let pad = egui::vec2(10.0, 6.0);
     let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
     let p = ui.painter();
     p.rect(
         rect,
-        Rounding::same(999.0),
+        CornerRadius::same(u8::MAX),
         Color32::from_rgba_premultiplied(0x08, 0x0A, 0x0E, 0xC0),
         Stroke::new(1.0, color::STROKE_STRONG),
+        StrokeKind::Inside,
     );
     let dot = rect.left_center() + egui::vec2(10.0, 0.0);
     p.circle_filled(dot, 3.0, accent);
@@ -62,7 +68,9 @@ pub(super) fn floating_pill(ui: &mut egui::Ui, text: &str, accent: Color32) {
 
 pub(super) fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let font = egui::FontId::proportional(11.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font.clone(), color::TEXT_WEAK));
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), color::TEXT_WEAK);
     let pad = egui::vec2(10.0, 6.0);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
     let p = ui.painter();
@@ -73,9 +81,10 @@ pub(super) fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     };
     p.rect(
         rect,
-        Rounding::same(radius::SM),
+        CornerRadius::same(radius::SM),
         fill,
         Stroke::new(1.0, stroke_color),
+        StrokeKind::Inside,
     );
     p.text(
         rect.center(),
@@ -106,9 +115,10 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, active: bool, title: &str, subtitle:
     };
     p.rect(
         rect,
-        Rounding::same(radius::MD),
+        CornerRadius::same(radius::MD),
         color::PANEL_INSET,
         Stroke::new(1.0, stroke_color),
+        StrokeKind::Inside,
     );
     p.text(
         rect.left_center() + egui::vec2(12.0, -6.0),
@@ -135,7 +145,7 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, active: bool, title: &str, subtitle:
     } else {
         color::STROKE_STRONG
     };
-    p.rect_filled(switch_rect, Rounding::same(switch_h / 2.0), track_color);
+    p.rect_filled(switch_rect, switch_h / 2.0, track_color);
     let knob_x = if active {
         switch_rect.right() - switch_h / 2.0
     } else {

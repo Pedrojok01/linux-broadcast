@@ -9,7 +9,7 @@
 //! The egui app loop is also where high-level lifecycle decisions land:
 //!
 //! - **Synthetic-consumer heartbeat.** While the window is visible AND
-//!   the *Show preview* toggle is on, every `update()` tick pushes a
+//!   the *Show preview* toggle is on, every `logic()` tick pushes a
 //!   `Command::SetGuiPreviewActive(true)` (edge-triggered) so the lazy
 //!   feeder treats the GUI as a consumer and keeps the camera lit. The
 //!   signal is explicitly cleared the moment the window goes to the
@@ -55,7 +55,7 @@ use crate::autostart;
 use crate::backgrounds::{self, LibraryEntry};
 use crate::cameras::{CameraEntry, enumerate};
 use crate::config::{Config, Mode};
-use crate::theme::{self, color};
+use crate::theme;
 use crate::tray::{Tray, TrayEvent};
 use crate::wayland_activation::{self, WaylandHandleSlot, WaylandHandles};
 use crate::{MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX};
@@ -221,7 +221,7 @@ pub(super) struct App {
     preview_tex: Option<egui::TextureHandle>,
     last_preview_size: Option<[usize; 2]>,
     /// Cached snapshot of the pipeline's lazy-mode state (Idle / Live
-    /// with consumer list). Refreshed every `update()` call from
+    /// with consumer list). Refreshed every `logic()` call from
     /// `Pipeline::state()`. Used by the footer.
     pipeline_state: PipelineState,
     /// Execution backend the running pipeline's segmenter uses. Drives the
@@ -249,7 +249,7 @@ pub(super) struct App {
     /// One-shot belt-and-braces for headless cold-start on Wayland:
     /// `with_visible(false)` set on the ViewportBuilder is best-effort
     /// (xdg-shell has no formal "start hidden" verb), so we explicitly
-    /// send `Minimized(true)` from the first `update()` tick to make
+    /// send `Minimized(true)` from the first `logic()` tick to make
     /// sure the surface is actually off-screen. Mutually exclusive with
     /// `force_unhide_on_first_frame` (only one can be true).
     headless_minimize_pending: bool,
@@ -269,13 +269,15 @@ pub(super) struct App {
     activation_rx: Receiver<ActivationEvent>,
     /// Shared cache of winit's raw `wl_display` / `wl_surface` pointers
     /// for the D-Bus thread's direct xdg-activation path. Populated
-    /// from the first frame of `update()` once `eframe::Frame` is
+    /// from the first frame of `logic()` once `eframe::Frame` is
     /// available. `None` on X11.
     wayland_handles: WaylandHandleSlot,
     /// Cleared after the first frame populates the Wayland slot — keeps
-    /// `update()` from re-running the (cheap but pointless) capture
+    /// `logic()` from re-running the (cheap but pointless) capture
     /// every tick.
     wayland_capture_pending: bool,
+    /// Set by `logic()` each frame; `ui()` skips layout while true.
+    minimized: bool,
 }
 
 impl App {
@@ -346,6 +348,7 @@ impl App {
             activation_rx,
             wayland_handles,
             wayland_capture_pending: true,
+            minimized: false,
         };
 
         // Always start the pipeline at launch — both GUI and headless.
@@ -480,7 +483,7 @@ impl App {
             // bytes instead of converting pixel by pixel.
             let pixels = bytemuck::try_cast_vec(frame.rgba)
                 .unwrap_or_else(|(_, rgba)| bytemuck::cast_slice(&rgba).to_vec());
-            let color = egui::ColorImage { size, pixels };
+            let color = egui::ColorImage::new(size, pixels);
             match &mut self.preview_tex {
                 Some(tex) if self.last_preview_size == Some(size) => {
                     tex.set(color, egui::TextureOptions::LINEAR);
@@ -701,12 +704,14 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let minimized = self.handle_lifecycle(ctx, frame);
+    /// Runs before every `ui()`, and alone while the window is hidden, so
+    /// tray, activation and the heartbeat keep working off-screen.
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.minimized = self.handle_lifecycle(ctx, frame);
 
         // While minimized, skip layout entirely. eframe's repaint
         // request keeps the loop ticking so tray events still land.
-        if minimized {
+        if self.minimized {
             ctx.request_repaint_after(Duration::from_millis(150));
             return;
         }
@@ -726,23 +731,26 @@ impl eframe::App for App {
             }
         }
 
-        self.drain_preview(ctx);
-
-        // Whole window fill (otherwise the area outside panels uses defaults).
-        ctx.style_mut(|s| s.visuals.panel_fill = color::PANEL);
-
-        self.header(ctx);
-        self.footer(ctx);
-        self.sidebar(ctx);
-        self.preview_pane(ctx);
-
         if self.running() {
-            ctx.request_repaint_after(if self.cfg.show_preview {
+            let preview = self.last_gui_preview_active == Some(true);
+            ctx.request_repaint_after(if preview {
                 PREVIEW_REPAINT
             } else {
                 STATUS_REPAINT
             });
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.minimized {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        self.drain_preview(&ctx);
+        self.header(ui);
+        self.footer(ui);
+        self.sidebar(ui);
+        self.preview_pane(ui);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

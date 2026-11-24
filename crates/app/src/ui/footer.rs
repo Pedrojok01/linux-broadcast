@@ -5,15 +5,15 @@ use super::App;
 use crate::theme::{color, space};
 
 impl App {
-    pub(super) fn footer(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("footer")
-            .exact_height(32.0)
+    pub(super) fn footer(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("footer")
+            .exact_size(32.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(color::PANEL)
                     .stroke(Stroke::new(1.0, color::STROKE)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(space::LG);
                     let (dot_color, label, label_color) = footer_status(
@@ -128,11 +128,11 @@ fn footer_status(
 /// Small accent-colored chip shown in the footer when the segmenter runs
 /// on the GPU. Renders nothing on CPU (caller gates on `Backend::Gpu`).
 fn gpu_badge(ui: &mut egui::Ui) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(color::ACCENT_SOFT)
         .stroke(Stroke::new(1.0, color::ACCENT))
-        .rounding(4.0)
-        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new("GPU")
@@ -148,11 +148,11 @@ fn gpu_badge(ui: &mut egui::Ui) {
 /// kernel and the pipeline recovered on CPU. The technical error stays in the
 /// hover text so the compact footer remains readable.
 fn gpu_fallback_badge(ui: &mut egui::Ui, reason: &str) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(color::DANGER_SOFT)
         .stroke(Stroke::new(1.0, color::DANGER))
-        .rounding(4.0)
-        .inner_margin(egui::Margin::symmetric(6.0, 1.0))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new("GPU unavailable · CPU")

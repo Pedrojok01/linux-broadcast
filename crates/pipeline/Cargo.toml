@@ -3,6 +3,7 @@ name = "lb-pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Webcam → segmentation → composite → v4l2loopback pipeline for linux-broadcast"
@@ -29,7 +30,9 @@ rustix.workspace = true
 [features]
 # Optional NVIDIA GPU acceleration via ort's CUDA execution provider.
 # Off by default — default builds stay pure-CPU with no extra runtime deps.
-cuda = ["ort/cuda"]
+# copy-dylibs symlinks the CUDA provider libs next to target/ binaries (refreshed
+# each build), so `cargo run --features cuda` loads the matching ORT version.
+cuda = ["ort/cuda", "ort/copy-dylibs"]
 
 [dev-dependencies]
 proptest = "1"

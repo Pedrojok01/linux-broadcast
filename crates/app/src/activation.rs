@@ -36,7 +36,7 @@ use crate::wayland_activation::WaylandHandleSlot;
 /// D-Bus handler reads it to wake the egui loop the instant an
 /// `Activate` call arrives. Without this, the loop can sit idle while
 /// the window is hidden on Wayland — the channel would receive the
-/// event but `App::update()` wouldn't run to drain it.
+/// event but `App::logic()` wouldn't run to drain it.
 pub type EguiWaker = Arc<OnceLock<egui::Context>>;
 
 /// The single intent emitted by the D-Bus interface. Modeled as an enum
@@ -78,7 +78,7 @@ impl AppService {
     /// Why: on Wayland a hidden xdg-toplevel doesn't get compositor
     /// frame callbacks, so `Window::request_redraw()` (the path
     /// `Context::request_repaint()` ultimately uses) doesn't fire
-    /// `RedrawRequested`, and `App::update()` can take several
+    /// `RedrawRequested`, and `App::logic()` can take several
     /// seconds to wake. By that time the activation token has
     /// expired in the compositor (KWin/Mutter invalidate tokens
     /// after a couple of seconds). Going through libwayland on this

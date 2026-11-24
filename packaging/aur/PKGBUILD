@@ -18,8 +18,6 @@ depends=(
   'gst-plugins-good'
   'gst-plugins-bad'
   'gst-libav'
-  'gtk3'
-  'libayatana-appindicator'
   'v4l2loopback-dkms'
 )
 optdepends=(

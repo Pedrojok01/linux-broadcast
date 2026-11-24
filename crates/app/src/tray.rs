@@ -1,216 +1,173 @@
-//! System tray icon + menu bridge.
+//! System tray icon + menu, served over the StatusNotifierItem D-Bus
+//! protocol by `ksni` (pure Rust, no GTK). KDE, GNOME with the
+//! AppIndicator extension, XFCE, Cinnamon and waybar all host it.
 //!
-//! The `tray-icon` crate's Linux backend (libayatana-appindicator) needs
-//! a running GTK main loop on *some* thread, but eframe/winit don't host
-//! one and aren't going to. We solve that by spawning a dedicated
-//! `lb-tray-gtk` thread that calls `gtk::init()` + `gtk::main()` and
-//! constructs the tray icon there (GTK objects are thread-affine — they
-//! panic if poked from anywhere else). Menu events fire on that thread
-//! and are forwarded to the egui app loop through a crossbeam channel
-//! that `App::update()` drains every frame.
+//! ksni runs the D-Bus service on its own thread. Menu picks and a left
+//! click on the icon are forwarded to the egui loop through a crossbeam
+//! channel that `App::logic()` drains every frame, and the shared egui
+//! waker requests a repaint so they land at once even while the window
+//! is hidden.
 //!
 //! Keep the public surface coarse: this module exposes `TrayEvent`
-//! (`Show` / `Hide` / `Quit`) — never raw menu-item ids — so the rest of
-//! the app reasons about user intent, not GTK plumbing.
+//! (`Show` / `Hide` / `Quit`) — never raw menu items — so the rest of the
+//! app reasons about user intent, not D-Bus plumbing.
 //!
-//! Install can fail on minimal sessions without an appindicator host
-//! (some headless WMs, container-only desktops). When it does the error
-//! is logged and the GUI keeps working without a tray entry. `--headless`
-//! installs the tray too; if that fails, `App::new` un-hides the window
-//! on the first frame so the user isn't left with no way to reach it.
+//! Install fails when no tray host is running (some bare WMs, GNOME
+//! without the AppIndicator extension). The error is logged and the GUI
+//! keeps working without a tray entry. `--headless` installs the tray too;
+//! if that fails, `App::new` un-hides the window on the first frame so the
+//! user isn't left with no way to reach it.
 
-use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use std::sync::OnceLock;
-
-use tray_icon::{
-    Icon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-};
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use ksni::blocking::{Handle, TrayMethods};
+use std::time::Duration;
 
 use crate::activation::EguiWaker;
 use crate::icon;
 
+/// How long the graceful Quit path gets before the watchdog forces exit.
+const QUIT_GRACE: Duration = Duration::from_millis(500);
+
 /// Coarse events emitted by the tray, consumed by the GUI on each
-/// `egui::App::update()` tick. Granular menu-item identity stays inside
-/// this module — the rest of the app only sees user intent.
+/// `App::logic()` tick.
 #[derive(Debug, Clone, Copy)]
 pub enum TrayEvent {
-    /// Menu: Show. Also fired on a left-click of the icon (most desktops).
+    /// Menu: Show, or a left click on the icon.
     Show,
     /// Menu: Hide.
     Hide,
-    /// Menu: Quit. Triggers a real shutdown — only path that actually
-    /// terminates the process now that the close button hides instead.
+    /// Menu: Quit. The only path that terminates the process: the window's
+    /// close button hides instead.
     Quit,
 }
 
-/// Handle returned to the app. The tray icon itself lives on the GTK
-/// thread; this struct only owns the receiver-side of the event channel.
+/// Handle returned to the app: the event receiver, plus the service handle
+/// that keeps the icon registered for the life of the process.
 pub struct Tray {
     rx: Receiver<TrayEvent>,
+    _service: Handle<LbTray>,
 }
 
 impl Tray {
-    /// Spawn the GTK thread, build the tray icon + menu **on that thread**
-    /// (GTK objects are thread-affine and panic if touched from anywhere
-    /// else), and wire menu events into a crossbeam channel that the egui
-    /// loop polls.
-    ///
-    /// Must be called once per process. A second call returns an error
-    /// because tray-icon's static event handlers can only be registered
-    /// once. `waker` is the shared egui-context slot used to nudge the
-    /// egui loop out of an idle (hidden+minimized on Wayland) state the
-    /// instant a menu event fires — without it, picking *Quit* on a
-    /// hidden window can sit in the channel for ~a minute waiting for
-    /// the next natural redraw.
+    /// Register the tray icon with the session's StatusNotifierWatcher.
+    /// `waker` is the shared egui-context slot used to wake the egui loop
+    /// the instant a menu event fires.
     pub fn install(waker: EguiWaker) -> Result<Self> {
-        if INSTALLED.set(()).is_err() {
-            return Err(anyhow!("tray already installed"));
-        }
-
-        let (event_tx, event_rx) = unbounded::<TrayEvent>();
-        let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
-
-        std::thread::Builder::new()
-            .name("lb-tray-gtk".into())
-            .spawn(move || {
-                run_gtk_thread(event_tx, waker, ready_tx);
-            })
-            .context("spawn tray gtk thread")?;
-
-        ready_rx
-            .recv()
-            .context("tray gtk thread vanished before init")??;
-
-        Ok(Self { rx: event_rx })
+        let (tx, rx) = unbounded::<TrayEvent>();
+        let tray = LbTray {
+            tx,
+            waker,
+            icon: argb_icon(),
+        };
+        let service = tray.spawn().context("register tray icon")?;
+        Ok(Self {
+            rx,
+            _service: service,
+        })
     }
 
     /// Drains all pending tray events without blocking. Called every
-    /// frame from the egui update loop.
+    /// frame from the egui loop.
     pub fn drain(&self) -> impl Iterator<Item = TrayEvent> + '_ {
         self.rx.try_iter()
     }
 }
 
-static INSTALLED: OnceLock<()> = OnceLock::new();
+struct LbTray {
+    tx: Sender<TrayEvent>,
+    waker: EguiWaker,
+    icon: ksni::Icon,
+}
 
-/// Body of the dedicated `lb-tray-gtk` thread.
-///
-/// Everything tray-icon-related (menu, icon, builder) is constructed
-/// here because GTK objects are thread-affine: GLib panics with "GTK may
-/// only be used from the main thread" if a menu/widget is touched from
-/// a thread that didn't call `gtk::init()`. Confusingly, "the main
-/// thread" in GLib parlance is *the thread that called `gtk::init()`*,
-/// not the OS-process main thread, which is why running GTK off-main
-/// here is fine as long as we keep all of it on this one thread.
-///
-/// The thread blocks on `gtk::main()` for the life of the process so
-/// the tray icon stays alive. `_tray` is held in this scope to keep the
-/// `TrayIcon` from being dropped (which would remove the icon).
-fn run_gtk_thread(event_tx: Sender<TrayEvent>, waker: EguiWaker, ready_tx: Sender<Result<()>>) {
-    if let Err(e) = gtk::init() {
-        let _ = ready_tx.send(Err(anyhow!("gtk::init failed: {e}")));
-        return;
-    }
-
-    let menu = Menu::new();
-    let show = MenuItem::new("Show LinuxBroadcast", true, None);
-    let hide = MenuItem::new("Hide window", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let show_id = show.id().clone();
-    let hide_id = hide.id().clone();
-    let quit_id = quit.id().clone();
-
-    if let Err(e) = menu.append_items(&[&show, &hide, &PredefinedMenuItem::separator(), &quit]) {
-        let _ = ready_tx.send(Err(anyhow!("tray menu append: {e}")));
-        return;
-    }
-
-    let lb_icon = icon::build();
-    let icon_image = match Icon::from_rgba(lb_icon.rgba, lb_icon.width, lb_icon.height) {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = ready_tx.send(Err(anyhow!("tray icon from rgba: {e}")));
-            return;
-        }
-    };
-
-    let _tray = match TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_icon(icon_image)
-        .with_tooltip("LinuxBroadcast — virtual webcam")
-        .with_title("LinuxBroadcast")
-        .build()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = ready_tx.send(Err(anyhow!("tray icon build: {e}")));
-            return;
-        }
-    };
-
-    // Bridge tray-icon's static MenuEvent handler into our channel.
-    // The closure may fire on any thread, but `Sender` is Sync.
-    // Compares by `MenuId` (not label) so localization or label edits
-    // can't break the wiring. After pushing, request a repaint via the
-    // shared egui waker so the loop drains the event immediately.
-    //
-    // For *Quit* on Wayland we also arm a watchdog: the toolkit
-    // `ViewportCommand::Close` path ultimately needs winit's
-    // `Window::request_redraw()` to fire `RedrawRequested`, which the
-    // compositor refuses to do for a hidden xdg-toplevel. The egui
-    // graceful path may sit waiting indefinitely. After 500 ms we just
-    // `process::exit(0)` — pipeline shutdown is cosmetic (kernel
-    // releases the v4l2 fds on exit) and config is auto-saved on every
-    // change, so nothing is lost. If the graceful path wins first, it
-    // exits the process and the watchdog dies with it.
-    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-        let evt = if e.id == show_id {
-            TrayEvent::Show
-        } else if e.id == hide_id {
-            TrayEvent::Hide
-        } else if e.id == quit_id {
-            TrayEvent::Quit
-        } else {
-            return;
-        };
-        let _ = event_tx.send(evt);
-        if let Some(ctx) = waker.get() {
+impl LbTray {
+    fn emit(&self, evt: TrayEvent) {
+        let _ = self.tx.send(evt);
+        if let Some(ctx) = self.waker.get() {
             ctx.request_repaint();
         }
         if matches!(evt, TrayEvent::Quit) {
-            std::thread::Builder::new()
-                .name("lb-quit-watchdog".into())
-                .spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    log::info!("tray Quit: graceful path did not complete in 500ms, forcing exit");
-                    // Bypass `std::process::exit` / `libc::exit` because
-                    // gstreamer (and possibly glib) install atexit
-                    // handlers that block on pipeline drain. With the
-                    // egui loop stalled on hidden-Wayland-window
-                    // frame callbacks the drain never completes and
-                    // `exit()` hangs forever, leaving the process
-                    // alive even though we asked it to quit. `_exit`
-                    // is the POSIX immediate-termination syscall: no
-                    // atexit, no libc cleanup, kernel reaps the
-                    // process. File descriptors are released by the
-                    // kernel; config is already auto-saved.
-                    //
-                    // SAFETY: `_exit` is signal-safe and takes no Rust
-                    // state; calling it from any thread is well-defined.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        libc::_exit(0);
-                    }
-                })
-                .ok();
+            arm_quit_watchdog();
         }
-    }));
+    }
+}
 
-    let _ = ready_tx.send(Ok(()));
+impl ksni::Tray for LbTray {
+    fn id(&self) -> String {
+        "linux-broadcast".into()
+    }
 
-    // Blocks until gtk::main_quit() — which we never call, so this
-    // thread runs for the life of the process and `_tray` stays alive.
-    gtk::main();
+    fn title(&self) -> String {
+        "LinuxBroadcast".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![self.icon.clone()]
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: "LinuxBroadcast — virtual webcam".into(),
+            ..Default::default()
+        }
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.emit(TrayEvent::Show);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        let item = |label: &str, evt: TrayEvent| {
+            StandardItem {
+                label: label.into(),
+                activate: Box::new(move |this: &mut Self| this.emit(evt)),
+                ..Default::default()
+            }
+            .into()
+        };
+        vec![
+            item("Show LinuxBroadcast", TrayEvent::Show),
+            item("Hide window", TrayEvent::Hide),
+            ksni::MenuItem::Separator,
+            item("Quit", TrayEvent::Quit),
+        ]
+    }
+}
+
+/// The app icon as StatusNotifierItem wants it: ARGB32, network byte order.
+fn argb_icon() -> ksni::Icon {
+    let lb = icon::build();
+    let data = lb
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, a]| [a, r, g, b])
+        .collect();
+    ksni::Icon {
+        width: lb.width as i32,
+        height: lb.height as i32,
+        data,
+    }
+}
+
+/// Force the exit if the graceful Quit path stalls, as it can when the
+/// window is hidden on Wayland and the compositor sends no frame callbacks.
+fn arm_quit_watchdog() {
+    std::thread::Builder::new()
+        .name("lb-quit-watchdog".into())
+        .spawn(|| {
+            std::thread::sleep(QUIT_GRACE);
+            log::info!("tray Quit: graceful path did not complete in time, forcing exit");
+            // `_exit`, not `exit`: GStreamer/GLib atexit handlers block on a
+            // pipeline drain that never finishes here. Settings are saved and
+            // the kernel releases the v4l2 fds.
+            // SAFETY: `_exit` is async-signal-safe and touches no Rust state.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::_exit(0);
+            }
+        })
+        .ok();
 }
