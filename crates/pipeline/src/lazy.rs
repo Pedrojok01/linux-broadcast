@@ -20,7 +20,6 @@
 //!   the user toggles between cameras. A short deactivation debounce
 //!   prevents the pipeline from thrashing.
 
-use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::{
     Arc, Mutex,
@@ -218,7 +217,7 @@ pub(crate) fn spawn_feeder(
                 capture_info: None,
                 fps_win_start: Instant::now(),
                 fps_win_frames: 0,
-                telemetry_dirty: false,
+                publish_dirty: false,
                 consumers: Vec::new(),
                 gui_preview_active: false,
                 state: State::Idle,
@@ -229,7 +228,6 @@ pub(crate) fn spawn_feeder(
                 source_backoff_until: None,
                 live_since: Instant::now(),
                 last_frame_at: Instant::now(),
-                last_published_pids: HashSet::new(),
                 idle_loader,
                 idle_frame: None,
                 last_idle_push: None,
@@ -307,9 +305,9 @@ struct Feeder {
     /// `LB_PROFILE`); cheap (one increment + one `Instant` compare/frame).
     fps_win_start: Instant,
     fps_win_frames: u32,
-    /// Set when `live_fps`/`capture_info` change so `publish_state` knows to
-    /// re-publish despite no state/consumer change. Cleared after publish.
-    telemetry_dirty: bool,
+    /// Set when the consumers, `live_fps` or `capture_info` change, so
+    /// `publish_state` re-publishes without a state change. Cleared after.
+    publish_dirty: bool,
     consumers: Vec<Consumer>,
     /// True while the GUI's preview pane is visible (window visible AND
     /// `show_preview` toggle on). Acts as a synthetic consumer in the
@@ -333,9 +331,6 @@ struct Feeder {
     /// When the last frame was pulled (or the source engaged), for the
     /// stall watchdog. Valid only while Live.
     last_frame_at: Instant,
-    /// PIDs included in the most recent `state_pub` write. Used to skip
-    /// redundant publishes when nothing the GUI cares about has changed.
-    last_published_pids: HashSet<u32>,
     /// Procedural drawer for the Idle-state frame. Produces a dark
     /// background + LinuxBroadcast logo + rotating spinner directly
     /// into `idle_frame` on every tick — replaces the historical
@@ -400,7 +395,11 @@ impl Feeder {
                     Err(_) => return self.shutdown(),
                 },
                 recv(watcher_rx) -> msg => match msg {
-                    Ok(c) => self.consumers = c,
+                    Ok(c) => {
+                        // The watcher only sends when the PID set changed.
+                        self.consumers = c;
+                        self.publish_dirty = true;
+                    }
                     Err(_) => {
                         // Watcher died: keep running on the last known
                         // consumers. A disconnected receiver is always
@@ -590,7 +589,7 @@ impl Feeder {
                     self.fps_win_frames = 0;
                     self.live_since = Instant::now();
                     self.last_frame_at = self.live_since;
-                    self.telemetry_dirty = true;
+                    self.publish_dirty = true;
                     self.source = Some((pipeline, appsink));
                     return Ok(());
                 }
@@ -651,7 +650,7 @@ impl Feeder {
         self.live_fps = None;
         self.capture_info = None;
         self.fps_win_frames = 0;
-        self.telemetry_dirty = true;
+        self.publish_dirty = true;
     }
 
     fn shutdown(&mut self) {
@@ -661,16 +660,12 @@ impl Feeder {
     }
 
     /// Refresh the public `PipelineState` and log a transition line.
-    /// Skips the mutex write and clone when neither the state-machine
-    /// state nor the consumer set has changed since the last publish —
-    /// avoids ~30 redundant lock+clone ops/sec while Live.
+    /// Skips the mutex write and clone unless the state-machine state
+    /// changed or `publish_dirty` is set — avoids ~30 redundant
+    /// lock+clone ops/sec while Live.
     fn publish_state(&mut self, prev: State) {
         let state_changed = std::mem::discriminant(&prev) != std::mem::discriminant(&self.state);
-        let pids_now: HashSet<u32> = self.consumers.iter().map(|c| c.pid).collect();
-        let consumers_changed = pids_now != self.last_published_pids;
-        // `telemetry_dirty` lets ~1×/s fps updates (and the one-shot capture
-        // read) through; without it the dedup below would suppress them.
-        if !state_changed && !consumers_changed && !self.telemetry_dirty {
+        if !state_changed && !self.publish_dirty {
             return;
         }
 
@@ -707,8 +702,7 @@ impl Feeder {
         if let Ok(mut slot) = self.state_pub.lock() {
             *slot = public;
         }
-        self.last_published_pids = pids_now;
-        self.telemetry_dirty = false;
+        self.publish_dirty = false;
     }
 
     /// Compute the auto-frame transform from a freshly segmented mask.
@@ -790,17 +784,17 @@ impl Feeder {
         if self.last_frame_at.duration_since(self.live_since) >= HEALTHY_STREAM {
             self.source_failure_count = 0;
         }
-        let buffer = match sample.buffer() {
-            Some(b) => b,
-            None => return,
+        // Composite in the camera's own buffer and push that to the sink.
+        // With the sample dropped this is the only reference, so
+        // `make_mut` and the writable map don't copy the frame.
+        let Some(mut buffer) = sample.buffer_owned() else {
+            return;
         };
-        let map = match buffer.map_readable() {
-            Ok(m) => m,
-            Err(_) => return,
+        drop(sample);
+        let Ok(mut map) = buffer.make_mut().map_writable() else {
+            return;
         };
-
-        let mut frame_rgba = map.as_slice().to_vec();
-        drop(map);
+        let frame_rgba = map.as_mut_slice();
         let frame_w = self.cfg.width;
         let frame_h = self.cfg.height;
         let t_pull = t_start.elapsed();
@@ -824,7 +818,7 @@ impl Feeder {
                 let t_seg = Instant::now();
                 let segment =
                     self.segmenter
-                        .segment(&frame_rgba, frame_w as usize, frame_h as usize);
+                        .segment(frame_rgba, frame_w as usize, frame_h as usize);
                 match segment {
                     Ok(mut mask) => {
                         self.smoother.smooth(&mut mask.data);
@@ -857,11 +851,10 @@ impl Feeder {
                         // The GPU error left the recurrent state unusable, so
                         // run this very frame again against the clean CPU
                         // session. From here on every inference stays on CPU.
-                        match self.segmenter.segment(
-                            &frame_rgba,
-                            frame_w as usize,
-                            frame_h as usize,
-                        ) {
+                        match self
+                            .segmenter
+                            .segment(frame_rgba, frame_w as usize, frame_h as usize)
+                        {
                             Ok(mut mask) => {
                                 self.smoother.smooth(&mut mask.data);
                                 segment_dur = Some(t_seg.elapsed());
@@ -891,7 +884,7 @@ impl Feeder {
             if let Some(mask) = self.cached_mask.as_ref() {
                 let framing = self.cached_framing;
                 if let Err(e) = self.compositor.composite(
-                    &mut frame_rgba,
+                    frame_rgba,
                     frame_w,
                     frame_h,
                     mask,
@@ -919,11 +912,12 @@ impl Feeder {
             let _ = tx.try_send(PreviewFrame {
                 width: frame_w,
                 height: frame_h,
-                rgba: frame_rgba.clone(),
+                rgba: frame_rgba.to_vec(),
             });
         }
+        drop(map);
 
-        let pushed = self.push_to_sink(&frame_rgba);
+        let pushed = self.push_buffer(buffer);
         let t_push = t_push_start.elapsed();
         if pushed
             && (self.frame_idx == 1 || self.frame_idx.is_multiple_of(self.cfg.framerate as u64))
@@ -958,7 +952,7 @@ impl Feeder {
             self.live_fps = Some(self.fps_win_frames as f32 / elapsed.as_secs_f32());
             self.fps_win_start = Instant::now();
             self.fps_win_frames = 0;
-            self.telemetry_dirty = true;
+            self.publish_dirty = true;
         }
     }
 
@@ -1003,32 +997,34 @@ impl Feeder {
             .filter(|tx| self.gui_preview_active && !tx.is_full())
     }
 
-    /// Wrap an RGBA frame in a fresh GStreamer buffer with the next PTS,
-    /// push it to the sink appsrc, bump `frame_idx`. Returns false if
-    /// allocation, mapping, or the push itself failed — caller decides
-    /// whether to retry / log.
+    /// Copy an RGBA frame into a fresh GStreamer buffer and push it.
+    /// Returns false if allocation, mapping, or the push itself failed.
     fn push_to_sink(&mut self, rgba: &[u8]) -> bool {
-        let fps = self.cfg.framerate as u64;
-        let mut out = match gst::Buffer::with_size(rgba.len()) {
-            Ok(b) => b,
-            Err(_) => return false,
+        let Ok(mut out) = gst::Buffer::with_size(rgba.len()) else {
+            return false;
         };
-        {
-            let out_mut = match out.get_mut() {
-                Some(m) => m,
-                None => return false,
-            };
-            let pts = gst::ClockTime::from_nseconds(self.frame_idx * NS_PER_SEC / fps);
-            out_mut.set_pts(pts);
-            out_mut.set_duration(gst::ClockTime::from_nseconds(NS_PER_SEC / fps));
-            let mut wmap = match out_mut.map_writable() {
-                Ok(w) => w,
-                Err(_) => return false,
-            };
-            wmap.copy_from_slice(rgba);
-        }
+        let Ok(mut wmap) = out.make_mut().map_writable() else {
+            return false;
+        };
+        wmap.copy_from_slice(rgba);
+        drop(wmap);
+        self.push_buffer(out)
+    }
+
+    /// Stamp `buffer` with the next PTS, push it to the sink appsrc, bump
+    /// `frame_idx`. Returns false if the push failed.
+    fn push_buffer(&mut self, mut buffer: gst::Buffer) -> bool {
+        let fps = self.cfg.framerate as u64;
+        let b = buffer.make_mut();
+        // A camera buffer carries the source's flags (DISCONT, CORRUPTED, …); the sink gets none, as before.
+        b.unset_flags(b.flags());
+        b.set_pts(gst::ClockTime::from_nseconds(
+            self.frame_idx * NS_PER_SEC / fps,
+        ));
+        b.set_dts(gst::ClockTime::NONE);
+        b.set_duration(gst::ClockTime::from_nseconds(NS_PER_SEC / fps));
         self.frame_idx += 1;
-        if let Err(e) = self.sink_appsrc.push_buffer(out) {
+        if let Err(e) = self.sink_appsrc.push_buffer(buffer) {
             log::warn!("sink appsrc push_buffer: {e}");
             return false;
         }

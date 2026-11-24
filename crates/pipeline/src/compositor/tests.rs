@@ -820,3 +820,38 @@ fn image_bg_covers_without_stretching() {
         }
     }
 }
+
+/// The upsample hoists its per-column taps out of the row loop; the
+/// result must match the plain per-pixel bilinear formula exactly.
+#[test]
+fn mask_upsample_matches_per_pixel_bilinear() {
+    let (sw, sh, dw, dh) = (7usize, 5usize, 23u32, 17u32);
+    let data: Vec<f32> = (0..sw * sh)
+        .map(|i| (i * 37 % 101) as f32 / 100.0)
+        .collect();
+    let mask = Mask {
+        data: data.clone(),
+        width: sw as u32,
+        height: sh as u32,
+    };
+    let mut c = Compositor::new();
+    c.prepare_mask(&mask, dw, dh).unwrap();
+
+    let at = |x: usize, y: usize| data[y * sw + x];
+    for y in 0..dh as usize {
+        let sy = (y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5;
+        let y0 = sy.floor().clamp(0.0, sh as f32 - 1.0) as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..dw as usize {
+            let sx = (x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5;
+            let x0 = sx.floor().clamp(0.0, sw as f32 - 1.0) as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+            let bot = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+            let want = top * (1.0 - fy) + bot * fy;
+            assert_eq!(c.upsampled_mask[y * dw as usize + x], want, "({x},{y})");
+        }
+    }
+}

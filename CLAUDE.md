@@ -139,7 +139,7 @@ Non-obvious settings — these took a session each to nail:
 
 Live setting changes (background mode, blur strength, image swap, GUI preview toggle, auto-frame on/off) flow over a `crossbeam-channel` of `Command`s and apply on the next feeder tick — no graph rebuild. Camera, resolution, and **model** changes still require Stop+Start.
 
-The reverse direction (feeder → GUI) is `PipelineState`, an `Arc<Mutex<…>>` the GUI polls each frame. While Live it carries **measured output fps** (a cheap always-on ~1 s rolling meter on the feeder, independent of the `LB_PROFILE` profiler) and **`CaptureInfo`** — the camera's native capture `width×height` + codec read once per engagement from the named `lb-source` `v4l2src` src pad (read straight from the caps structure, since `image/jpeg` MJPEG caps don't parse as `VideoInfo`). These surface as the preview-pane fps pill and the footer's `in <dev> · MJPEG 1280×720` readout — real values, not the config target. `publish_state` dedups on state/consumer change to avoid ~30 lock+clone/s while Live; a `telemetry_dirty` flag lets the ~1 Hz fps/capture updates through.
+The reverse direction (feeder → GUI) is `PipelineState`, an `Arc<Mutex<…>>` the GUI polls each frame. While Live it carries **measured output fps** (a cheap always-on ~1 s rolling meter on the feeder, independent of the `LB_PROFILE` profiler) and **`CaptureInfo`** — the camera's native capture `width×height` + codec read once per engagement from the named `lb-source` `v4l2src` src pad (read straight from the caps structure, since `image/jpeg` MJPEG caps don't parse as `VideoInfo`). These surface as the preview-pane fps pill and the footer's `in <dev> · MJPEG 1280×720` readout — real values, not the config target. `publish_state` skips the lock+clone (~30/s while Live) unless the state changed or `publish_dirty` is set, which consumer changes and the ~1 Hz fps/capture updates do.
 
 #### Lazy mode constants and consumer detection
 
@@ -153,6 +153,7 @@ The reverse direction (feeder → GUI) is `PipelineState`, an `Arc<Mutex<…>>` 
 ### Cross-cutting conventions
 
 - **RGBA8 end-to-end.** YUYV/MJPEG↔RGBA and RGBA→YUY2 happen in GStreamer `videoconvert`; Rust never touches non-RGBA pixels.
+- **Live frames are composited in place.** `pump_one_frame` takes the camera sample's `gst::Buffer`, drops the sample so it holds the only reference (`make_mut` then doesn't copy), composites into its writable map and pushes that same buffer to the sink appsrc. Anything else that keeps a reference (an extra appsink ref, a tee) silently brings a full-frame copy back.
 - **Mask is `f32`** between segmentation and composite. `u8` round-trips cost quality without saving memory.
 - **Inference at native 256×256.** Only upsample + composite touch frame-resolution pixels — keeps CPU low at 720p/1080p.
 - **`Background::None` is true passthrough.** new_sample short-circuits *before* segmentation and resets the EMA smoother so the next non-None frame starts clean.

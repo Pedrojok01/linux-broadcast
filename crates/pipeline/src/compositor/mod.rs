@@ -170,6 +170,8 @@ pub struct Compositor {
     /// Mask upsampled to frame resolution, kept f32 across frames to avoid
     /// reallocating each callback.
     upsampled_mask: Vec<f32>,
+    /// Per-output-column `(x0, x1, fx)` bilinear taps for `prepare_mask`.
+    upsample_cols: Vec<(usize, usize, f32)>,
     /// Pre-scaled background image at frame resolution, regenerated when the
     /// background or frame size changes.
     bg_scaled: Vec<u8>,
@@ -217,6 +219,7 @@ impl Compositor {
         Self {
             resizer: fr::Resizer::new(),
             upsampled_mask: Vec::new(),
+            upsample_cols: Vec::new(),
             bg_scaled: Vec::new(),
             bg_w: 0,
             bg_h: 0,
@@ -566,26 +569,29 @@ impl Compositor {
         let src_h_f = src_h as f32;
         let dst_w = width as f32;
         let dst_h = height as f32;
-        for y in 0..height {
+        // Every row samples the same columns: compute them once per call.
+        self.upsample_cols.clear();
+        self.upsample_cols.extend((0..width).map(|x| {
+            let sx = (x as f32 + 0.5) * src_w_f / dst_w - 0.5;
+            let x0 = sx.floor().clamp(0.0, src_w_f - 1.0) as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            (x0, x1, (sx - x0 as f32).clamp(0.0, 1.0))
+        }));
+        for (y, out_row) in self
+            .upsampled_mask
+            .chunks_exact_mut(width as usize)
+            .enumerate()
+        {
             let sy = (y as f32 + 0.5) * src_h_f / dst_h - 0.5;
             let y0 = sy.floor().clamp(0.0, src_h_f - 1.0) as usize;
             let y1 = (y0 + 1).min(src_h - 1);
             let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-            let row_dst = (y as usize) * (width as usize);
-            let row0 = y0 * src_w;
-            let row1 = y1 * src_w;
-            for x in 0..width {
-                let sx = (x as f32 + 0.5) * src_w_f / dst_w - 0.5;
-                let x0 = sx.floor().clamp(0.0, src_w_f - 1.0) as usize;
-                let x1 = (x0 + 1).min(src_w - 1);
-                let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-                let a = mask.data[row0 + x0];
-                let b = mask.data[row0 + x1];
-                let c = mask.data[row1 + x0];
-                let d = mask.data[row1 + x1];
-                let top = a * (1.0 - fx) + b * fx;
-                let bot = c * (1.0 - fx) + d * fx;
-                self.upsampled_mask[row_dst + x as usize] = top * (1.0 - fy) + bot * fy;
+            let row0 = &mask.data[y0 * src_w..(y0 + 1) * src_w];
+            let row1 = &mask.data[y1 * src_w..(y1 + 1) * src_w];
+            for (out, &(x0, x1, fx)) in out_row.iter_mut().zip(&self.upsample_cols) {
+                let top = row0[x0] * (1.0 - fx) + row0[x1] * fx;
+                let bot = row1[x0] * (1.0 - fx) + row1[x1] * fx;
+                *out = top * (1.0 - fy) + bot * fy;
             }
         }
         Ok(())

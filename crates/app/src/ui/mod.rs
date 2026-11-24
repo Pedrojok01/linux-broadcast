@@ -66,9 +66,11 @@ const MIN_WINDOW_SIZE: [f32; 2] = [820.0, 560.0];
 /// Bounded preview channel capacity: drop old frames if the GUI lags so
 /// the segmentation thread never blocks.
 const PREVIEW_CHANNEL_CAP: usize = 2;
-/// Repaint roughly every 33 ms (~30 Hz) while running. Frame arrival
-/// already drives texture updates; this just guarantees overlay redraws.
-const PREVIEW_REPAINT_MS: u64 = 33;
+/// Repaint roughly every 33 ms (~30 Hz) while preview frames can arrive,
+/// so each one is painted soon after it lands.
+const PREVIEW_REPAINT: Duration = Duration::from_millis(33);
+/// With the preview off only the footer status changes; 2 Hz keeps it current.
+const STATUS_REPAINT: Duration = Duration::from_millis(500);
 const THUMBNAIL_PX: u32 = 160;
 
 /// Maximum time `run_headless` is willing to wait for the sink device to
@@ -474,7 +476,11 @@ impl App {
         }
         if let Some(frame) = latest {
             let size = [frame.width as usize, frame.height as usize];
-            let color = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+            // Frames are opaque RGBA, already `Color32`'s layout: reuse the
+            // bytes instead of converting pixel by pixel.
+            let pixels = bytemuck::try_cast_vec(frame.rgba)
+                .unwrap_or_else(|(_, rgba)| bytemuck::cast_slice(&rgba).to_vec());
+            let color = egui::ColorImage { size, pixels };
             match &mut self.preview_tex {
                 Some(tex) if self.last_preview_size == Some(size) => {
                     tex.set(color, egui::TextureOptions::LINEAR);
@@ -731,7 +737,11 @@ impl eframe::App for App {
         self.preview_pane(ctx);
 
         if self.running() {
-            ctx.request_repaint_after(Duration::from_millis(PREVIEW_REPAINT_MS));
+            ctx.request_repaint_after(if self.cfg.show_preview {
+                PREVIEW_REPAINT
+            } else {
+                STATUS_REPAINT
+            });
         }
     }
 
