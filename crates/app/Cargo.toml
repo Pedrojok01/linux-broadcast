@@ -99,15 +99,14 @@ features = ["cuda"]
 # Recent Ubuntu kernels ship a signed module that Provides (unversioned)
 # v4l2loopback-modules; a versioned dkms-only dep would force the DKMS build,
 # which then fails on top of it. Elsewhere apt falls back to DKMS.
-depends = "$auto, v4l2loopback-modules | v4l2loopback-dkms (>= 0.12.8), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav"
+depends = "$auto, v4l2loopback-modules | v4l2loopback-dkms (>= 0.12.8), v4l2loopback-utils, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav"
 recommends = "v4l-utils"
 assets = [
     ["target/release/linux-broadcast", "usr/lib/linux-broadcast/", "755"],
     ["../../packaging/linux-broadcast.wrapper", "usr/bin/linux-broadcast", "755"],
     ["../../packaging/LinuxBroadcast.desktop", "usr/share/applications/", "644"],
     ["../../packaging/LinuxBroadcast.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
-    ["../../packaging/linux-broadcast.modprobe.conf", "etc/modprobe.d/linux-broadcast.conf", "644"],
-    ["../../packaging/linux-broadcast.modules-load.conf", "etc/modules-load.d/linux-broadcast.conf", "644"],
+    ["../../packaging/linux-broadcast-loopback", "usr/lib/linux-broadcast/", "755"],
     ["../../README.md", "usr/share/doc/linux-broadcast/README.md", "644"],
     ["../../models/README.md", "usr/share/doc/linux-broadcast/models/README.md", "644"],
     ["../../models/Apache-2.0-LICENSE.txt", "usr/share/doc/linux-broadcast/models/Apache-2.0-LICENSE.txt", "644"],
@@ -117,7 +116,4 @@ assets = [
     ["../../THIRD_PARTY_LICENSES.md", "usr/share/doc/linux-broadcast/THIRD_PARTY_LICENSES.md", "644"],
 ]
 maintainer-scripts = "../../packaging/scripts"
-conf-files = [
-    "/etc/modprobe.d/linux-broadcast.conf",
-    "/etc/modules-load.d/linux-broadcast.conf",
-]
+systemd-units = { unit-scripts = "../../packaging/systemd", unit-name = "linux-broadcast-loopback" }

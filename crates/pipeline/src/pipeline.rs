@@ -79,10 +79,9 @@ pub(crate) const NS_PER_SEC: u64 = 1_000_000_000;
 pub struct PipelineConfig {
     /// Source v4l2 device, e.g. `/dev/video0`.
     pub source_device: String,
-    /// Sink v4l2loopback device, e.g. `/dev/video10`. The `.deb` ships
-    /// conffiles in `/etc/modprobe.d/` + `/etc/modules-load.d/` that
-    /// guarantee this exists at boot; source builds need a manual
-    /// `modprobe v4l2loopback`.
+    /// Sink v4l2loopback device, e.g. `/dev/video10`. The packages'
+    /// `linux-broadcast-loopback` service creates it at boot; source builds
+    /// run `sudo packaging/linux-broadcast-loopback add` once per boot.
     pub sink_device: String,
     pub width: u32,
     pub height: u32,

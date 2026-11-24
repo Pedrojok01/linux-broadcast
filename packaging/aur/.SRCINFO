@@ -13,6 +13,7 @@ pkgbase = linux-broadcast-bin
 	depends = gst-plugins-bad
 	depends = gst-libav
 	depends = v4l2loopback-dkms
+	depends = v4l2loopback-utils
 	optdepends = pipewire: pipewiresrc support if you swap GStreamer source backends
 	provides = linux-broadcast=0.1.2
 	conflicts = linux-broadcast

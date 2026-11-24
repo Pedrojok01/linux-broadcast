@@ -11,12 +11,10 @@ Out of scope: audio / microphone effects.
 ## Common commands
 
 ```bash
-# Manual host setup — only needed when building from source. The .deb's
-# postinst runs the same commands and ships conffiles in /etc/modprobe.d/
-# + /etc/modules-load.d/ so the module persists.
-sudo modprobe -r v4l2loopback 2>/dev/null
-sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LinuxBroadcast" \
-  exclusive_caps=1 max_buffers=2
+# Manual host setup — only needed when building from source, once per boot.
+# Creates /dev/video10 without module-wide options (needs v4l2loopback-utils);
+# the packages' linux-broadcast-loopback service runs the same script at boot.
+sudo packaging/linux-broadcast-loopback add
 
 # GUI (default)
 cargo run --release -p linux-broadcast
@@ -186,7 +184,7 @@ Off by default. `--features cuda` runs inference through ONNX Runtime's CUDA exe
 ### Process lifecycle gotchas
 
 - **Single-instance lock at process scope.** `lock.rs` flocks `$XDG_RUNTIME_DIR/linux-broadcast.lock` (config-dir fallback) for the lifetime of the LB process — a lazy-mode instance can sit Idle for arbitrarily long with no `/dev/video10` write contention, so we'd otherwise allow two instances to coexist and race the moment a consumer arrives. A second launch finds the lock held and exits cleanly.
-- **Headless `App::new` polls for `/dev/video10`** (10 s timeout) before auto-starting the pipeline, so it survives the autostart-vs-`systemd-modules-load.service` race on cold boot. A GUI launch doesn't wait: it reports a missing device at once.
+- **Headless `App::new` polls for `/dev/video10`** (10 s timeout) before auto-starting the pipeline, so it survives the autostart-vs-`linux-broadcast-loopback.service` race on cold boot. A GUI launch doesn't wait: it reports a missing device at once.
 - **Pipeline failures reach the GUI.** Sink-graph bus errors and a feeder panic (caught in `spawn_feeder`, which then releases the camera) land in `Pipeline::failure()`; `App::logic` drops the pipeline and shows the reason in the header. The bus sync handlers log and `Drop` every message: nothing pops those buses, so `Pass` would queue them forever.
 - **Config is sanitized on load** (`Config::sanitize`): out-of-range or odd sizes, a zero framerate and a non-finite blur fall back to safe values, logged. `Pipeline::start` also rejects configs the graphs can't run, so a library caller gets an `Err`, not a feeder panic. An unparsable file is copied to `config.toml.bad` before defaults overwrite it; saves go through a temp file and `rename`.
 - **Window close hides to tray, not exits.** The close button is intercepted (`ViewportCommand::CancelClose` + `Visible(false)`); only the tray's *Quit* sets `quit_requested` and lets the close through. Hiding the window also clears the GUI-preview synthetic-consumer signal so a tray-only instance lets the camera drop to Idle. That signal follows our own show/hide requests (`ui/presence.rs`), not the toolkit: winit can't report minimized on Wayland, and an unmapped X11 window doesn't read as minimized. A focus gain after a user hide counts as shown (Wayland taskbar restore).
@@ -204,15 +202,19 @@ Off by default. `--features cuda` runs inference through ONNX Runtime's CUDA exe
 | `packaging/linux-broadcast.wrapper` | `/usr/bin/linux-broadcast` | Wrapper that `exec`s the real binary, so ONNX Runtime resolves providers from `/usr/lib/linux-broadcast/`. |
 | `packaging/LinuxBroadcast.desktop` | `/usr/share/applications/` | System launcher; `desktop_install.rs` skips its per-user clone when this exists. |
 | `packaging/LinuxBroadcast.png` | `/usr/share/icons/hicolor/64x64/apps/` | Pre-rendered via `LB_DUMP_ICON=1` so `cargo deb` doesn't execute the binary at packaging time. Regenerate when the logo changes. |
-| `packaging/linux-broadcast.modprobe.conf` | `/etc/modprobe.d/linux-broadcast.conf` | **conffile** — `options v4l2loopback devices=1 video_nr=10 card_label="LinuxBroadcast" exclusive_caps=1 max_buffers=2`. |
-| `packaging/linux-broadcast.modules-load.conf` | `/etc/modules-load.d/linux-broadcast.conf` | **conffile** — single line `v4l2loopback`, makes the module reload on every boot. |
+| `packaging/linux-broadcast-loopback` | `/usr/lib/linux-broadcast/` | Root script, `add` / `remove`: creates or deletes our `/dev/video10` with `v4l2loopback-ctl` (module ≥ 0.13). |
+| `packaging/systemd/linux-broadcast-loopback.service` | `/usr/lib/systemd/system/` | Oneshot unit running `linux-broadcast-loopback add` at boot; enabled and started by the cargo-deb-generated `#DEBHELPER#` sections (`systemd-units` in the deb metadata). |
+
+**v4l2loopback is shared, so we add a device instead of configuring the module.** Other tools (OBS Virtual Camera, droidcam, hand-written `/etc/modprobe.d` configs) use the same module, and module options are global: a shipped `options v4l2loopback …` line merged with theirs (the file sorting last wins), and unloading the module on install/remove dropped their devices. So `linux-broadcast-loopback add`:
+- loads the module only if it isn't loaded: as configured when some `options v4l2loopback` exists (`modprobe -c`), else with `devices=0`;
+- adds `/dev/video10` (label `LinuxBroadcast`, `exclusive_caps=1`, 2 buffers) through the control device, and never touches a `/dev/video10` that isn't ours;
+- when it loaded the module itself, also adds a spare `/dev/video11` ("Virtual Camera"): OBS only loads the module if it isn't loaded, otherwise it scans for a free OUTPUT device, and ours is always held by the running app;
+- on v4l2loopback / v4l2loopback-utils < 0.13 (no control device) falls back to reloading the module with our device only when it loaded it itself in that run. Spare and device numbers are fixed so a loopback device created early at boot can never take a webcam's number.
 
 Maintainer scripts at `packaging/scripts/`:
-- `postinst` — drops a stale module if loaded with different params, then `modprobe v4l2loopback` (options come from the modprobe.d drop-in). Refreshes `update-desktop-database` and `gtk-update-icon-cache`. Module-load failure is logged but does **not** fail the install: DKMS may still be building, and the `modules-load.d` file guarantees the next boot loads it.
-- `prerm` — best-effort `modprobe -r v4l2loopback` on uninstall. Failure is harmless.
-- `postrm` — refresh desktop / icon caches after the system files are gone.
-
-`apt purge` removes the conffiles; `apt remove` keeps them for re-install.
+- `preinst` / `postinst` / `postrm` — `dpkg-maintscript-helper rm_conffile` for the 0.4.0 `/etc/modprobe.d` + `/etc/modules-load.d` drop-ins (prior version `0.5.0-1~`). `postinst` also refreshes the desktop / icon caches and only warns if `/dev/video10` isn't there yet (DKMS may still be building; the unit retries at boot).
+- `prerm` — on `remove`, deletes our `/dev/video10` (best effort: it stays until reboot if still open). The module is never unloaded.
+- Never write the literal `#DEBHELPER#` token in a comment: cargo-deb replaces every occurrence.
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`: it checks the tag matches `[workspace.package].version`, builds the cuda main `.deb` (`cargo build --features cuda` + `cargo deb --no-build`) and the GPU add-on (`packaging/build-cuda-addon.sh`), and publishes a GitHub Release with both `.deb`s attached.
 
@@ -225,7 +227,7 @@ The `linux-broadcast-bin` AUR package repackages the GitHub Release `.deb` so Ar
 | File | Purpose |
 |---|---|
 | `packaging/aur/PKGBUILD` | `pkgname=linux-broadcast-bin`, `provides=("linux-broadcast=$pkgver")`, `conflicts=('linux-broadcast')`. `package()` extracts `data.tar.{zst,xz}` from the `.deb` into `$pkgdir` and relocates `usr/share/doc/$pkg/copyright` → `usr/share/licenses/$pkg/LICENSE` to match Arch's FHS. `options=('!strip')` because `cargo --release` already strips. |
-| `packaging/aur/linux-broadcast.install` | `post_install` / `post_upgrade` / `post_remove` hooks. Mirror `packaging/scripts/postinst` semantics: drop stale `v4l2loopback`, reload, refresh desktop / icon caches. |
+| `packaging/aur/linux-broadcast.install` | `post_install` / `post_upgrade` enable and start `linux-broadcast-loopback.service`; `pre_remove` deletes our device and disables the unit; the `post_*` hooks refresh the desktop / icon caches. |
 | `packaging/aur/.SRCINFO` | **Must be byte-identical to `makepkg --printsrcinfo` output** for the current PKGBUILD. The `aur-lint` workflow diffs them on PRs. Regenerate via the docker one-liner in that workflow's error message. |
 
 Two workflows automate the loop:
@@ -240,7 +242,7 @@ Non-obvious bits:
 - **Workflow actions are pinned to commit SHAs** (tag in a trailing comment); `.github/dependabot.yml` bumps them monthly. Third-party actions run next to `AUR_SSH_KEY` and the release token, so never go back to a bare `@v2` tag.
 - **AUR publishing lives in `release.yml`, not its own workflow.** Tried that first; `release: published` events fired by `GITHUB_TOKEN` don't trigger downstream workflows. Putting both jobs in the same workflow with `needs: deb` sidesteps the cross-workflow trigger entirely.
 - **`sha256sums=('SKIP')` is committed.** Real sums only exist at release time — the `.deb` doesn't exist when the PKGBUILD is edited, and pinning a stale sum would block the workflow's substitution. The lint workflow is fine with `SKIP`; namcap warns about it advisorily.
-- **`v4l2loopback-dkms` is an AUR dep itself.** Helpers (`yay`, `paru`) handle the transitive AUR install. Do not change to a non-AUR alias.
+- **`v4l2loopback-dkms` and `v4l2loopback-utils` are in Arch's `extra` repo.** The `.install` hook enables `linux-broadcast-loopback.service` (`daemon-reload` first: scriptlets run before pacman's reload hook) and, in `pre_remove`, deletes our device and disables the unit.
 - **AUR repo init is one-time, manual.** `KSXGitHub/...-deploy-aur` only updates an existing AUR repo. The first push (via `git clone ssh://aur@aur.archlinux.org/linux-broadcast-bin.git` + push) reserves the package name.
 - **AUR pushes are over SSH only**, IPv4-only on most consumer ISPs in practice. The CI runner doesn't care; for local pushes set `Host aur.archlinux.org / AddressFamily inet` in `~/.ssh/config`.
 

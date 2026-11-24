@@ -77,7 +77,7 @@ Out of scope: audio / microphone effects.
 
 ### Option A — `.deb` (Debian / Ubuntu / Mint)
 
-Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The package depends on the v4l2loopback kernel module (the kernel's own `linux-main-modules-v4l2loopback-*` package on recent Ubuntu, otherwise `v4l2loopback-dkms ≥ 0.12.8`) and the GStreamer plugin set; everything else is statically baked into the binary.
+Tested on Ubuntu 24.04+ / Mint 22+ / Debian trixie+. The package depends on the v4l2loopback kernel module (the kernel's own `linux-main-modules-v4l2loopback-*` package on recent Ubuntu, otherwise `v4l2loopback-dkms ≥ 0.12.8`), `v4l2loopback-utils` and the GStreamer plugin set; everything else is statically baked into the binary.
 
 ```bash
 sudo apt install ./linux-broadcast_<version>_amd64.deb
@@ -85,11 +85,11 @@ sudo apt install ./linux-broadcast_<version>_amd64.deb
 
 That's it. Behind the scenes the package:
 
-- Uses the kernel's v4l2loopback module if your kernel ships one, installs it via DKMS otherwise, and loads it now (`postinst` runs `modprobe v4l2loopback`), so `/dev/video10` is available immediately.
-- Drops `/etc/modprobe.d/linux-broadcast.conf` with the right options (`devices=1 video_nr=10 card_label="LinuxBroadcast" exclusive_caps=1 max_buffers=2`) and `/etc/modules-load.d/linux-broadcast.conf` so the module reloads on every boot — no manual `modprobe` ever required.
+- Uses the kernel's v4l2loopback module if your kernel ships one, installs it via DKMS otherwise.
+- Adds its own virtual camera, `/dev/video10` ("LinuxBroadcast"), right away and at every boot, through the `linux-broadcast-loopback` systemd service. It never sets module-wide options or unloads the module, so OBS Virtual Camera, droidcam or your own v4l2loopback config keep their devices. When it is the one loading the module, it also adds a spare `/dev/video11` ("Virtual Camera", hidden until something writes to it) for tools like OBS that look for a free device.
 - Registers the app menu entry and icon under `/usr/share/applications/` and `/usr/share/icons/hicolor/64x64/apps/`.
 
-`apt remove linux-broadcast` unloads the module and removes the launcher; `apt purge` additionally drops the `/etc/modprobe.d` and `/etc/modules-load.d` drop-ins (preserved as conffiles otherwise).
+`apt remove linux-broadcast` deletes `/dev/video10` (or, if something still holds it, leaves it until the next reboot) and removes the launcher; other v4l2loopback devices are left alone. Upgrading from 0.4.0 or earlier removes the old `/etc/modprobe.d` and `/etc/modules-load.d` drop-ins.
 
 Want it always running so Zoom / Meet / Signal / Firefox just see "LinuxBroadcast" in their camera list at every login? Open the GUI and flip **Start on login** in the sidebar — see [Start on login](#start-on-login) below.
 
@@ -102,9 +102,9 @@ yay -S linux-broadcast-bin
 paru -S linux-broadcast-bin
 ```
 
-`linux-broadcast-bin` repackages the official `.deb` from GitHub Releases, so you get the same binary, the same `/etc/modprobe.d` + `/etc/modules-load.d` drop-ins, and the same desktop integration. The AUR `install` hook reloads `v4l2loopback` immediately after install (DKMS rebuild permitting) and refreshes the desktop / icon caches.
+`linux-broadcast-bin` repackages the official `.deb` from GitHub Releases, so you get the same binary, the same `linux-broadcast-loopback` service, and the same desktop integration. The AUR `install` hook enables that service, which creates `/dev/video10` immediately (DKMS build permitting), and refreshes the desktop / icon caches.
 
-The AUR dep on `v4l2loopback-dkms` will be resolved by your helper. If you'd rather use `v4l2loopback-dkms-git` or a kernel-specific `v4l2loopback-*` flavour, install it first and AUR will accept it as a `provides` match.
+`v4l2loopback-dkms` and `v4l2loopback-utils` come from Arch's official repositories. If you'd rather use `v4l2loopback-dkms-git` or a kernel-specific `v4l2loopback-*` flavour, install it first and AUR will accept it as a `provides` match.
 
 ## GPU acceleration (optional, NVIDIA)
 
@@ -256,7 +256,7 @@ sudo apt install -y \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libxkbcommon-dev libwayland-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  v4l2loopback-dkms \
+  v4l2loopback-dkms v4l2loopback-utils \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
@@ -264,17 +264,13 @@ Drop `v4l2loopback-dkms` if `modinfo v4l2loopback` already finds a module (recen
 
 #### 2. Create the virtual camera device (development only)
 
-The `.deb` does this automatically; for source builds, set the module up by hand once:
+The `.deb` does this automatically; for source builds, create the device by hand (once per boot):
 
 ```bash
-# Reload the module so our params actually take effect — modprobe is a
-# no-op if the module is already loaded with different options.
-sudo modprobe -r v4l2loopback 2>/dev/null
-sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="LinuxBroadcast" \
-  exclusive_caps=1 max_buffers=2
+sudo packaging/linux-broadcast-loopback add
 ```
 
-To make this survive reboots, drop the same options into `/etc/modprobe.d/linux-broadcast.conf` and `linux-broadcast` into `/etc/modules-load.d/` (or just install the `.deb`, which ships these files for you).
+It loads v4l2loopback if needed and adds `/dev/video10` next to any existing loopback devices, without module-wide options. To have it at every boot, install the `.deb`, whose `linux-broadcast-loopback` service runs the same script.
 
 #### 3. Build & run
 
@@ -347,7 +343,8 @@ Composite is CPU-side either way: ~2 ms for a virtual background, ~10 ms for blu
 
 ## Troubleshooting
 
-- **`/dev/video10` doesn't appear.** With the `.deb` or AUR package, this is handled automatically: the install hook does `modprobe -r` first to drop any stale module, then reloads it with the right params. For source builds, run those two commands by hand (see [step 2 above](#2-create-the-virtual-camera-device-development-only)).
+- **`/dev/video10` doesn't appear.** With the `.deb` or AUR package, check `systemctl status linux-broadcast-loopback`. Right after a first install, DKMS may still be building the module: the device then appears at the next boot, or after `sudo systemctl restart linux-broadcast-loopback`. If it says `/dev/video10` isn't LinuxBroadcast's, another v4l2loopback config already uses number 10: change that config's `video_nr`. v4l2loopback older than 0.13 can't add a device next to devices another app already loaded. For source builds, see [step 2 above](#2-create-the-virtual-camera-device-development-only).
+- **OBS Virtual Camera won't start.** OBS needs a free loopback device. LinuxBroadcast adds a spare `/dev/video11` when it loads the module itself; if another config loaded it, add one with `sudo v4l2loopback-ctl add -n "OBS Virtual Camera" -x 1`.
 - **`/dev/video10` is "busy" or "not a video capture device".** That's `exclusive_caps=1` doing its job: the device only exposes CAPTURE while LinuxBroadcast is producing frames. Real apps see it; raw `ffplay` may not until the producer is running.
 - **`apt install v4l2loopback-dkms` fails on kernel 6.8+.** You have the broken 0.12.7 — install ≥ 0.12.8 from upstream or your distro backports.
 - **Kernel updates fail with `Autoinstall … failed for module(s) v4l2loopback`.** Your kernel already ships the module (`linux-main-modules-v4l2loopback-*`) and `v4l2loopback-dkms` collides with it. Releases after 0.4.0 accept the kernel's module: `sudo apt remove v4l2loopback-dkms`, then reinstall LinuxBroadcast. With 0.4.0 itself, removing DKMS also removes the app.
@@ -365,9 +362,10 @@ crates/
 models/          # bundled ONNX (multiclass / RVM)
 assets/fonts/    # Inter + JetBrains Mono
 packaging/
-  scripts/       # Debian postinst / prerm / postrm
+  scripts/       # Debian preinst / postinst / prerm / postrm
+  systemd/       # linux-broadcast-loopback.service (creates /dev/video10 at boot)
   aur/           # PKGBUILD, .SRCINFO, install hook for linux-broadcast-bin
-  *.desktop      # menu entry / icon / modprobe.d & modules-load.d conffiles
+  *.desktop      # menu entry / icon; linux-broadcast-loopback adds /dev/video10
 DESIGN.md        # design tokens (colour, spacing, type) + rationale
 CLAUDE.md        # in-depth dev notes (pipeline, gotchas, model details)
 ```

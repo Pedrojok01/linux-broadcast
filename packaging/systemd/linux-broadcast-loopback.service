@@ -1,0 +1,14 @@
+[Unit]
+Description=LinuxBroadcast virtual camera device (/dev/video10)
+Documentation=https://github.com/Pedrojok01/linux-broadcast
+# Lets a module loaded from /etc/modules-load.d keep its own config, and a
+# DKMS build after a kernel update finish first.
+After=systemd-modules-load.service dkms.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/linux-broadcast/linux-broadcast-loopback add
+
+[Install]
+WantedBy=multi-user.target

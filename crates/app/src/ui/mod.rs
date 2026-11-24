@@ -23,7 +23,7 @@
 //! - **Headless boot guard.** `App::new` polls for the sink device
 //!   (default `/dev/video10`) for up to `HEADLESS_DEVICE_WAIT` before
 //!   starting the pipeline, so an XDG autostart entry that fires before
-//!   `systemd-modules-load.service` finishes still recovers cleanly.
+//!   `linux-broadcast-loopback.service` finishes still recovers cleanly.
 //! - **Live config writeback.** Every persisted setting (mode, blur
 //!   strength, model, image, source/sink, `start_on_login`,
 //!   `show_preview`, `auto_frame`) is written through `Config::save`
@@ -75,9 +75,9 @@ const THUMBNAIL_PX: u32 = 160;
 
 /// Maximum time `run_headless` is willing to wait for the sink device to
 /// appear before erroring out. Sized to absorb the worst-case race between
-/// XDG autostart firing and `systemd-modules-load.service` finishing on a
-/// cold boot, while still failing fast when the module genuinely isn't
-/// loaded.
+/// XDG autostart firing and `linux-broadcast-loopback.service` finishing on
+/// a cold boot, while still failing fast when the device genuinely isn't
+/// set up.
 const HEADLESS_DEVICE_WAIT: Duration = Duration::from_secs(10);
 
 fn wait_for_device(path: &str, timeout: Duration) -> bool {
@@ -357,7 +357,7 @@ impl App {
         // `exclusive_caps=1` hides the loopback from camera lists. The
         // physical camera (`/dev/video0`, LED) stays released until a
         // real consumer reads — that's `lazy.rs`'s job, not this one.
-        // An autostart on cold boot may race `systemd-modules-load.service`,
+        // An autostart on cold boot may race `linux-broadcast-loopback.service`,
         // so headless waits for the sink device; a GUI launch reports at once.
         let sink = app.cfg.sink_device.clone();
         let wait = if headless {
@@ -368,7 +368,7 @@ impl App {
         if wait_for_device(&sink, wait) {
             app.start_pipeline();
         } else {
-            let msg = format!("{sink} not found — is v4l2loopback loaded?");
+            let msg = format!("{sink} not found — see README › Troubleshooting");
             log::error!("{msg}");
             app.error = Some(msg);
         }

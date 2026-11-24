@@ -19,6 +19,7 @@ depends=(
   'gst-plugins-bad'
   'gst-libav'
   'v4l2loopback-dkms'
+  'v4l2loopback-utils'
 )
 optdepends=(
   'pipewire: pipewiresrc support if you swap GStreamer source backends'

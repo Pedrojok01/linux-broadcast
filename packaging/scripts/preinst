@@ -1,0 +1,11 @@
+#!/bin/sh
+# preinst for linux-broadcast — 0.5.0 stopped shipping module-wide
+# v4l2loopback options; drop the old drop-ins (same calls in postinst/postrm).
+set -e
+
+dpkg-maintscript-helper rm_conffile /etc/modprobe.d/linux-broadcast.conf 0.5.0-1~ -- "$@"
+dpkg-maintscript-helper rm_conffile /etc/modules-load.d/linux-broadcast.conf 0.5.0-1~ -- "$@"
+
+#DEBHELPER#
+
+exit 0

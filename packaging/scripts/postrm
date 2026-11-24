@@ -1,8 +1,10 @@
 #!/bin/sh
 # postrm for linux-broadcast — refresh desktop / icon caches after the
-# .desktop and icon files are removed. Conffiles in /etc/modprobe.d and
-# /etc/modules-load.d are handled by dpkg on `purge`.
+# .desktop and icon files are removed.
 set -e
+
+dpkg-maintscript-helper rm_conffile /etc/modprobe.d/linux-broadcast.conf 0.5.0-1~ -- "$@"
+dpkg-maintscript-helper rm_conffile /etc/modules-load.d/linux-broadcast.conf 0.5.0-1~ -- "$@"
 
 case "$1" in
   remove|purge)

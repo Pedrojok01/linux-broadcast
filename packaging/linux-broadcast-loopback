@@ -1,0 +1,75 @@
+#!/bin/sh
+# Create (add) or delete (remove) LinuxBroadcast's own v4l2loopback device
+# without module-wide options or unloading the module, so other users keep theirs.
+# Root only: run by linux-broadcast-loopback.service and the package scripts.
+set -eu
+
+NR=10
+DEV=/dev/video$NR
+LABEL=LinuxBroadcast
+# Spare device for OBS Virtual Camera & co, which only look for a free one.
+SPARE_DEV=/dev/video11
+SPARE_LABEL="Virtual Camera"
+
+log() { echo "linux-broadcast-loopback: $*" >&2; }
+
+loaded() { [ -d /sys/module/v4l2loopback ]; }
+
+ours() { [ "$(cat /sys/class/video4linux/video$NR/name 2>/dev/null)" = "$LABEL" ]; }
+
+# Needs v4l2loopback and v4l2loopback-ctl 0.13 or newer (the control device).
+ctl_add() {
+	[ -e /dev/v4l2loopback ] && command -v v4l2loopback-ctl >/dev/null &&
+		v4l2loopback-ctl add -n "$1" -x 1 -b 2 "$2" >/dev/null
+}
+
+add() {
+	fresh=false
+	if ! loaded; then
+		if modprobe -c 2>/dev/null | grep -q '^options v4l2loopback '; then
+			# Configured by someone else: load it their way.
+			modprobe v4l2loopback
+		else
+			modprobe v4l2loopback devices=0
+			fresh=true
+		fi
+	fi
+
+	if ! ours; then
+		if [ -e "$DEV" ]; then
+			log "$DEV already exists and isn't LinuxBroadcast's; leaving it alone"
+			return 1
+		fi
+		if ! ctl_add "$LABEL" "$DEV"; then
+			# Older v4l2loopback can't add devices at runtime. If we just
+			# loaded it, nothing uses it yet: reload it with our device.
+			if $fresh; then
+				modprobe -r v4l2loopback
+				modprobe v4l2loopback devices=1 video_nr=$NR card_label=$LABEL \
+					exclusive_caps=1 max_buffers=2
+				ours && return 0
+			fi
+			log "can't create $DEV next to the loaded v4l2loopback devices; v4l2loopback and v4l2loopback-utils 0.13 or newer are needed"
+			return 1
+		fi
+	fi
+
+	if $fresh && [ ! -e "$SPARE_DEV" ]; then
+		ctl_add "$SPARE_LABEL" "$SPARE_DEV" || log "no spare device created at $SPARE_DEV"
+	fi
+}
+
+remove() {
+	ours || return 0
+	v4l2loopback-ctl delete "$DEV" >/dev/null 2>&1 ||
+		log "$DEV is in use or can't be deleted; it goes away at the next reboot"
+}
+
+case "${1:-}" in
+add) add ;;
+remove) remove ;;
+*)
+	echo "usage: $0 add|remove" >&2
+	exit 2
+	;;
+esac
