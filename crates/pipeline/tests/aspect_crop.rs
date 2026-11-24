@@ -62,8 +62,13 @@ fn crop_converts_16_9_input_to_target_aspect_without_squashing() {
     let (w, h) = cropped_dims(in_w, in_h, tw, th);
 
     // Cropped frame carries the TARGET aspect, so the downstream uniform
-    // videoscale to tw×th introduces no distortion.
-    assert_eq!(w * th, h * tw, "cropped {w}x{h} aspect != target {tw}x{th}");
+    // videoscale to tw×th introduces no visible distortion. aspectratiocrop
+    // truncates a float crop, so FMA builds (Ubuntu amd64v3) land 1 px off per side.
+    let exact_w = h * tw / th;
+    assert!(
+        (w - exact_w).abs() <= 2,
+        "cropped {w}x{h} aspect != target {tw}x{th} (exact width {exact_w})"
+    );
     // Target is narrower than 16:9, so width is cropped and height is left
     // intact — proving a horizontal crop, not a vertical squash.
     assert_eq!(
