@@ -160,39 +160,40 @@ pub fn run(
     .map_err(|e| anyhow!("eframe: {e}"))
 }
 
-fn pipeline_config_from(cfg: &Config, preview_tx: Option<Sender<PreviewFrame>>) -> PipelineConfig {
+fn pipeline_config_from(
+    cfg: &Config,
+    background: Background,
+    preview_tx: Option<Sender<PreviewFrame>>,
+) -> PipelineConfig {
     PipelineConfig {
         source_device: cfg.source_device.clone(),
         sink_device: cfg.sink_device.clone(),
         width: cfg.width,
         height: cfg.height,
         framerate: cfg.framerate,
-        background: build_background(cfg),
+        background,
         model: cfg.model.into_kind(),
         preview_tx,
         framing: cfg.auto_frame,
     }
 }
 
-fn build_background(cfg: &Config) -> Background {
-    match cfg.mode {
-        Mode::None => Background::None,
-        Mode::Blur => Background::Blur {
-            strength: cfg.blur_strength,
-        },
-        Mode::Replace => match cfg.background_image_path() {
-            Some(path) => match load_background_rgba(path) {
-                Ok(bg) => bg,
-                Err(e) => {
-                    log::warn!("background image load failed ({e:#}); falling back to blur");
-                    Background::Blur {
-                        strength: cfg.blur_strength,
-                    }
-                }
-            },
-            None => Background::Blur {
-                strength: cfg.blur_strength,
-            },
+/// The pipeline background for `cfg`, plus a user-facing warning when a
+/// Replace image can't be used and blur stands in for it.
+fn build_background(cfg: &Config) -> (Background, Option<String>) {
+    let blur = Background::Blur {
+        strength: cfg.blur_strength,
+    };
+    match (cfg.mode, &cfg.background_path) {
+        (Mode::None, _) => (Background::None, None),
+        (Mode::Blur, _) | (Mode::Replace, None) => (blur, None),
+        (Mode::Replace, Some(path)) => match load_background_rgba(path) {
+            Ok(bg) => (bg, None),
+            Err(e) => {
+                log::warn!("background image load failed ({e:#}); falling back to blur");
+                let name = path.file_name().unwrap_or(path.as_os_str()).display();
+                (blur, Some(format!("Can't use {name} ({e}); showing blur")))
+            }
         },
     }
 }
@@ -228,6 +229,9 @@ pub(super) struct App {
     /// inference and the pipeline transparently continues on CPU.
     gpu_fallback_reason: Option<String>,
     error: Option<String>,
+    /// Why the Replace image isn't shown, if it isn't. Kept apart from
+    /// `error` so picking a working image clears it.
+    bg_warning: Option<String>,
     /// System tray handle. Held for the whole process lifetime. `None`
     /// only if the OS has no working tray host (logged at install time);
     /// the rest of the app continues to work — Quit just becomes
@@ -330,6 +334,7 @@ impl App {
             backend: Backend::default(),
             gpu_fallback_reason: None,
             error: initial_error,
+            bg_warning: None,
             tray,
             quit_requested: false,
             force_unhide_on_first_frame,
@@ -347,16 +352,18 @@ impl App {
         // `exclusive_caps=1` hides the loopback from camera lists. The
         // physical camera (`/dev/video0`, LED) stays released until a
         // real consumer reads — that's `lazy.rs`'s job, not this one.
-        // On cold boot we may be racing `systemd-modules-load.service`,
-        // so wait briefly for the v4l2 sink device to appear first.
+        // An autostart on cold boot may race `systemd-modules-load.service`,
+        // so headless waits for the sink device; a GUI launch reports at once.
         let sink = app.cfg.sink_device.clone();
-        if wait_for_device(&sink, HEADLESS_DEVICE_WAIT) {
+        let wait = if headless {
+            HEADLESS_DEVICE_WAIT
+        } else {
+            Duration::ZERO
+        };
+        if wait_for_device(&sink, wait) {
             app.start_pipeline();
         } else {
-            let msg = format!(
-                "{} did not appear within {:?} — is v4l2loopback loaded?",
-                sink, HEADLESS_DEVICE_WAIT,
-            );
+            let msg = format!("{sink} not found — is v4l2loopback loaded?");
             log::error!("{msg}");
             app.error = Some(msg);
         }
@@ -370,13 +377,12 @@ impl App {
         }
     }
 
-    /// Quit-time cleanup: release the camera + virtual cam, then persist
-    /// settings. Safe to call when the pipeline was never started — the
-    /// helpers below short-circuit on `None`. Order matters: stop first
-    /// so any final config changes triggered by stop are still saved.
+    /// Quit-time cleanup: persist settings, then release the camera +
+    /// virtual cam. Save first: the tray's quit watchdog may kill the
+    /// process while the pipeline is still stopping.
     fn shutdown_cleanup(&mut self) {
-        self.stop_pipeline();
         self.save_settings();
+        self.stop_pipeline();
     }
 
     fn refresh_library(&mut self) {
@@ -395,7 +401,9 @@ impl App {
         }
 
         let (tx, rx) = crossbeam_channel::bounded::<PreviewFrame>(PREVIEW_CHANNEL_CAP);
-        let pcfg = pipeline_config_from(&self.cfg, Some(tx));
+        let (background, bg_warning) = build_background(&self.cfg);
+        self.bg_warning = bg_warning;
+        let pcfg = pipeline_config_from(&self.cfg, background, Some(tx));
         match Pipeline::start(pcfg, MODEL_MULTICLASS_ONNX, MODEL_RVM_ONNX) {
             Ok(p) => {
                 self.backend = p.backend();
@@ -417,10 +425,8 @@ impl App {
     }
 
     fn stop_pipeline(&mut self) {
-        if let Some(p) = self.pipeline.take() {
-            p.stop();
-            drop(p);
-        }
+        // Dropping joins the feeder, then stops the sink graph.
+        self.pipeline = None;
         self.cmd_tx = None;
         self.preview_rx = None;
         self.preview_tex = None;
@@ -442,7 +448,9 @@ impl App {
 
     fn update_background_live(&mut self) {
         if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(Command::SetBackground(build_background(&self.cfg)));
+            let (background, bg_warning) = build_background(&self.cfg);
+            self.bg_warning = bg_warning;
+            let _ = tx.send(Command::SetBackground(background));
         }
     }
 
@@ -508,8 +516,9 @@ impl App {
         // egui loop to wake. No-op on X11.
         if self.wayland_capture_pending {
             if let Some(h) = WaylandHandles::capture(frame, frame)
-                && self.wayland_handles.set(h).is_ok()
+                && let Ok(mut slot) = self.wayland_handles.lock()
             {
+                *slot = Some(h);
                 log::info!("cached Wayland handles for direct xdg-activation");
             }
             self.wayland_capture_pending = false;
@@ -696,14 +705,19 @@ impl eframe::App for App {
             return;
         }
 
-        // Refresh the cached pipeline state for the footer; this also
-        // doubles as cheap evidence that the pipeline is still alive.
-        // Done after the early-return so we don't pay it on minimized
-        // ticks.
+        // Refresh the cached pipeline state for the footer. Done after the
+        // early-return so we don't pay it on minimized ticks. A dead
+        // pipeline is dropped so the primary button offers Start again.
         if let Some(p) = &self.pipeline {
-            self.pipeline_state = p.state();
-            self.backend = p.backend();
-            self.gpu_fallback_reason = p.gpu_fallback_reason();
+            if let Some(failure) = p.failure() {
+                log::error!("pipeline failed: {failure}");
+                self.stop_pipeline();
+                self.error = Some(format!("Broadcast stopped: {failure}"));
+            } else {
+                self.pipeline_state = p.state();
+                self.backend = p.backend();
+                self.gpu_fallback_reason = p.gpu_fallback_reason();
+            }
         }
 
         self.drain_preview(ctx);
@@ -722,6 +736,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The window's Wayland pointers die with it; stop the D-Bus thread using them.
+        if let Ok(mut slot) = self.wayland_handles.lock() {
+            *slot = None;
+        }
         self.shutdown_cleanup();
 
         // Bypass eframe's EGL/glutin teardown when the user explicitly

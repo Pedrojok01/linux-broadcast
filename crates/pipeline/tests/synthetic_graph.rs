@@ -228,7 +228,7 @@ fn pipeline_emits_frames_with_videotestsrc() {
         "expected ≥12 Live frames in 2s, got {live_count}",
     );
 
-    p.stop();
+    drop(p);
 }
 
 #[test]
@@ -270,13 +270,13 @@ fn lazy_state_walks_idle_to_live_to_idle() {
     }
     assert!(matches!(p.state(), PipelineState::Idle));
 
-    p.stop();
+    drop(p);
 }
 
-/// `stop()` then `drop()` must be clean and idempotent: `Pipeline::stop`
-/// runs explicitly on GUI Quit, then `drop` re-asserts the same teardown.
+/// Dropping a Live pipeline (what the GUI does on Stop and Quit) must
+/// join the feeder promptly instead of hanging on the source graph.
 #[test]
-fn shutdown_after_live_is_clean_and_idempotent() {
+fn shutdown_after_live_is_clean() {
     let c = cfg();
     let (p, captured) = start_pipeline(c);
     p.cmd_sender()
@@ -286,11 +286,6 @@ fn shutdown_after_live_is_clean_and_idempotent() {
     // Drive into Live so feeder is actively running source + composite.
     let _ = pull_frames_for(&sink, Duration::from_millis(2200));
     assert!(matches!(p.state(), PipelineState::Live { .. }));
-
-    // Repeated stops mirror App::shutdown_cleanup → Drop, which calls
-    // stop() twice in effect. Must not panic, must not deadlock.
-    p.stop();
-    p.stop();
 
     // Drop must complete promptly (Pipeline::Drop has a 2s join timeout
     // on the feeder; we give the whole thing 5s headroom).
@@ -343,7 +338,7 @@ fn set_background_no_frame_gap() {
         );
     }
 
-    p.stop();
+    drop(p);
 }
 
 /// When the camera can't negotiate MJPEG, the feeder's codec policy must
@@ -371,7 +366,7 @@ fn source_codec_falls_back_to_raw_when_mjpeg_unavailable() {
         "expected ≥12 Live frames in 2s via raw fallback, got {live_count}",
     );
 
-    p.stop();
+    drop(p);
 }
 
 fn wait_for(p: &Pipeline, timeout: Duration, pred: impl Fn(&PipelineState) -> bool) -> bool {
@@ -410,7 +405,7 @@ fn assert_recovers_from_source_failure(source: SourceBuilder, failure_within: Du
         "expected Live with frames flowing after the backoff",
     );
 
-    p.stop();
+    drop(p);
 }
 
 #[test]
@@ -460,5 +455,73 @@ fn preview_frames_follow_gui_preview_signal() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(drain(), 0, "preview frames stop once the GUI is inactive");
 
-    p.stop();
+    drop(p);
+}
+
+fn wait_for_failure(p: &Pipeline, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(f) = p.failure() {
+            return Some(f);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+/// A config the graphs can't run must fail `start`, not panic the feeder.
+#[test]
+fn start_rejects_unrunnable_config() {
+    for bad in [
+        PipelineConfig {
+            framerate: 0,
+            ..cfg()
+        },
+        PipelineConfig { height: 0, ..cfg() },
+        PipelineConfig {
+            width: 321,
+            ..cfg()
+        },
+    ] {
+        let captured = Arc::new(Mutex::new(None));
+        let res = Pipeline::start_with_builders(
+            bad,
+            MODEL_MULTICLASS_ONNX,
+            MODEL_RVM_ONNX,
+            synthetic_source(),
+            synthetic_sink(captured),
+        );
+        assert!(res.is_err());
+    }
+}
+
+/// A sink-graph error (device gone, negotiation failure) must reach the
+/// caller instead of only the log.
+#[test]
+fn sink_error_is_reported_as_failure() {
+    let (p, captured) = start_pipeline(cfg());
+    assert!(p.failure().is_none());
+    let sink = captured.lock().unwrap().clone().unwrap();
+    sink.post_message(
+        gst::message::Error::builder(gst::CoreError::Failed, "synthetic sink failure")
+            .src(&sink)
+            .build(),
+    )
+    .unwrap();
+    let failure = wait_for_failure(&p, Duration::from_secs(1)).expect("failure reported");
+    assert!(failure.contains("synthetic sink failure"), "{failure}");
+}
+
+/// A feeder panic must be reported instead of leaving the GUI on Idle.
+#[test]
+fn feeder_panic_is_reported_as_failure() {
+    let panicking: SourceBuilder = Arc::new(|_: &PipelineConfig, _: SourceCodec| {
+        panic!("synthetic feeder panic");
+    });
+    let (p, _captured) = start_pipeline_with_source(cfg(), panicking);
+    p.cmd_sender()
+        .send(Command::SetGuiPreviewActive(true))
+        .unwrap();
+    let failure = wait_for_failure(&p, Duration::from_secs(4)).expect("failure reported");
+    assert!(failure.contains("synthetic feeder panic"), "{failure}");
 }

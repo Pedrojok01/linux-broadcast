@@ -7,6 +7,7 @@ use super::App;
 use super::widgets::{draw_dashed_rect, toggle_row, truncate};
 use crate::autostart;
 use crate::backgrounds::{self, LibraryEntry};
+use crate::cameras::enumerate;
 use crate::config::{Mode, Model};
 use crate::theme::{self, color, control, radius, space};
 
@@ -130,6 +131,8 @@ impl App {
 
         let popup_id = ui.make_persistent_id("camera_popup");
         if resp.clicked() {
+            // Re-list on open so a camera plugged in after launch shows up.
+            self.cameras = enumerate(&self.cfg.sink_device);
             ui.memory_mut(|m| m.toggle_popup(popup_id));
         }
         let mut camera_changed = false;
@@ -195,6 +198,8 @@ impl App {
         // own dashed Import tile, and the tabs themselves announce the
         // section's purpose).
         let mut mode_changed = false;
+        // Slider moves apply live but are saved only on release.
+        let mut blur_moved = false;
         let tab_gap: f32 = 6.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = tab_gap;
@@ -306,8 +311,11 @@ impl App {
                 let t = ((pos.x - track_l) / (track_r - track_l)).clamp(0.0, 1.0);
                 if (t - self.cfg.blur_strength).abs() > 0.005 {
                     self.cfg.blur_strength = t;
-                    mode_changed = true;
+                    blur_moved = true;
                 }
+            }
+            if resp.drag_stopped() || resp.clicked() {
+                mode_changed = true;
             }
             ui.add_space(space::SM);
         }
@@ -386,9 +394,9 @@ impl App {
 
         if mode_changed {
             self.save_settings();
-            if self.running() {
-                self.update_background_live();
-            }
+        }
+        if (mode_changed || blur_moved) && self.running() {
+            self.update_background_live();
         }
     }
 
@@ -426,11 +434,7 @@ impl App {
                 if let Some(t) = &tex {
                     let mut mesh = egui::Mesh::with_texture(t.id());
                     let inner = rect.shrink(2.0);
-                    mesh.add_rect_with_uv(
-                        inner,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    mesh.add_rect_with_uv(inner, square_crop_uv(t.size()), Color32::WHITE);
                     p.add(egui::Shape::mesh(mesh));
                 }
                 // label badge
@@ -463,13 +467,9 @@ impl App {
                         Color32::from_rgb(0x06, 0x18, 0x0F),
                     );
                 }
-                // delete on right-click / shift-click
+                // Deleting is only in the context menu: a stray click must not lose a file.
                 if resp.clicked() {
-                    if ui.input(|i| i.modifiers.shift) {
-                        *to_remove = Some(entry.path.clone());
-                    } else {
-                        *to_select = Some(entry.path.clone());
-                    }
+                    *to_select = Some(entry.path.clone());
                 }
                 resp.context_menu(|ui| {
                     if ui.button("Remove from library").clicked() {
@@ -666,5 +666,36 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// UV rect showing the centred square of a `[w, h]` texture, so a
+/// thumbnail fills its square cell without stretching.
+fn square_crop_uv([w, h]: [usize; 2]) -> egui::Rect {
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+    let (du, dv) = if w > h {
+        ((1.0 - h / w) / 2.0, 0.0)
+    } else {
+        (0.0, (1.0 - w / h) / 2.0)
+    };
+    egui::Rect::from_min_max(egui::pos2(du, dv), egui::pos2(1.0 - du, 1.0 - dv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn square_crop_keeps_the_centre_of_the_long_side() {
+        let wide = square_crop_uv([200, 100]);
+        assert_eq!((wide.min.x, wide.max.x), (0.25, 0.75));
+        assert_eq!((wide.min.y, wide.max.y), (0.0, 1.0));
+        let tall = square_crop_uv([100, 400]);
+        assert_eq!((tall.min.x, tall.max.x), (0.0, 1.0));
+        assert_eq!((tall.min.y, tall.max.y), (0.375, 0.625));
+        assert_eq!(
+            square_crop_uv([64, 64]),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+        );
     }
 }

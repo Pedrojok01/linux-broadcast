@@ -42,13 +42,15 @@ fn ensure_dir() -> Result<PathBuf> {
 
 /// Copy a freshly-picked image into the library, returning its new in-library
 /// path. If a file with the same name already exists, a numeric suffix is
-/// appended.
+/// appended. A file that doesn't decode is refused, so Replace mode never
+/// picks something it can't show.
 pub fn import(src: &Path) -> Result<PathBuf> {
     let dir = ensure_dir()?;
     import_into(&dir, src)
 }
 
 fn import_into(dir: &Path, src: &Path) -> Result<PathBuf> {
+    image::open(src).with_context(|| format!("{} is not a readable image", src.display()))?;
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
     let ext = src
         .extension()
@@ -110,13 +112,20 @@ pub fn remove(path: &Path) -> Result<()> {
 }
 
 fn remove_from(dir: &Path, path: &Path) -> Result<()> {
-    if !path.starts_with(dir) {
+    // Canonical paths, so `lib/../x` can't pass the containment check.
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", dir.display()))?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("resolve {}", path.display()))?;
+    if !path.starts_with(&dir) {
         return Err(anyhow!(
             "refusing to delete path outside library: {}",
             path.display()
         ));
     }
-    std::fs::remove_file(path).with_context(|| format!("rm {}", path.display()))?;
+    std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
     Ok(())
 }
 
@@ -135,19 +144,38 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Build a 1×1 PNG so `import` has a real image to copy. `is_image`
-    /// only checks the extension, so the bytes don't have to be valid.
-    fn write_fake_png(dir: &Path, name: &str) -> PathBuf {
+    /// Write a real 1×1 PNG: `import` refuses files that don't decode.
+    fn write_png(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        image::RgbaImage::new(1, 1).save(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn import_refuses_undecodable_file() {
+        let lib = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("broken.png");
+        std::fs::write(&src, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        assert!(import_into(lib.path(), &src).is_err());
+        assert!(list_in(lib.path()).is_empty());
+    }
+
+    #[test]
+    fn remove_refuses_path_escaping_library() {
+        let root = TempDir::new().unwrap();
+        let lib = root.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        let outside = write_png(root.path(), "keep.png");
+        assert!(remove_from(&lib, &lib.join("../keep.png")).is_err());
+        assert!(outside.exists());
     }
 
     #[test]
     fn import_then_list_returns_entry() {
         let lib = TempDir::new().unwrap();
         let src_dir = TempDir::new().unwrap();
-        let src = write_fake_png(src_dir.path(), "wave.png");
+        let src = write_png(src_dir.path(), "wave.png");
         let dest = import_into(lib.path(), &src).unwrap();
         assert!(dest.exists());
 
@@ -161,7 +189,7 @@ mod tests {
     fn remove_clears_entry() {
         let lib = TempDir::new().unwrap();
         let src_dir = TempDir::new().unwrap();
-        let src = write_fake_png(src_dir.path(), "studio.png");
+        let src = write_png(src_dir.path(), "studio.png");
         let dest = import_into(lib.path(), &src).unwrap();
         assert_eq!(list_in(lib.path()).len(), 1);
 

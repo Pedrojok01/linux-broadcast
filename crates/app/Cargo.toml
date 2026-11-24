@@ -28,7 +28,6 @@ crossbeam-channel.workspace = true
 directories.workspace = true
 serde.workspace = true
 toml.workspace = true
-glob.workspace = true
 rfd.workspace = true
 image.workspace = true
 

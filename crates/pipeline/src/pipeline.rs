@@ -122,6 +122,25 @@ impl Default for PipelineConfig {
     }
 }
 
+impl PipelineConfig {
+    /// Reject sizes and rates the graphs can't run: a zero framerate
+    /// divides by zero in the feeder, a zero height panics in the crop
+    /// fraction, and YUY2 needs an even width.
+    fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 || !self.width.is_multiple_of(2) {
+            return Err(anyhow!(
+                "unsupported resolution {}×{} (width must be even, both non-zero)",
+                self.width,
+                self.height
+            ));
+        }
+        if self.framerate == 0 {
+            return Err(anyhow!("framerate must be at least 1"));
+        }
+        Ok(())
+    }
+}
+
 /// A composited RGBA frame published to the GUI for preview.
 #[derive(Debug, Clone)]
 pub struct PreviewFrame {
@@ -193,7 +212,11 @@ pub struct Pipeline {
     stop_flag: Arc<AtomicBool>,
     backend: Arc<Mutex<Backend>>,
     gpu_fallback: Arc<Mutex<Option<String>>>,
+    failure: FailureSlot,
 }
+
+/// Why the pipeline stopped working: a sink-graph error or a feeder panic.
+pub(crate) type FailureSlot = Arc<Mutex<Option<String>>>;
 
 impl Pipeline {
     /// Build the sink graph, start the consumer watcher and the feeder
@@ -227,18 +250,18 @@ impl Pipeline {
         source_builder: SourceBuilder,
         sink_builder: SinkBuilder,
     ) -> Result<Self> {
+        cfg.validate()?;
         gst::init().context("gst::init")?;
 
         // 1. Sink graph (always-on owner of /dev/video10 in production;
         //    a plain appsink in tests).
+        let failure = FailureSlot::default();
         let (sink_pipeline, sink_appsrc) = sink_builder(&cfg)?;
-        install_bus_logger(&sink_pipeline, "sink");
+        install_bus_logger(&sink_pipeline, "sink", Some(Arc::clone(&failure)));
         sink_pipeline.set_state(gst::State::Playing).map_err(|e| {
-            let bus_errs = drain_bus_errors(&sink_pipeline);
-            if bus_errs.is_empty() {
-                anyhow!("set sink pipeline to Playing: {e}")
-            } else {
-                anyhow!("set sink pipeline to Playing: {e}\n{}", bus_errs.join("\n"))
+            match failure.lock().ok().and_then(|mut f| f.take()) {
+                Some(err) => anyhow!("set sink pipeline to Playing: {e}\n  ↳ {err}"),
+                None => anyhow!("set sink pipeline to Playing: {e}"),
             }
         })?;
 
@@ -265,6 +288,7 @@ impl Pipeline {
             watcher_rx,
             Arc::clone(&state),
             Arc::clone(&stop_flag),
+            Arc::clone(&failure),
             source_builder,
         )?;
 
@@ -277,6 +301,7 @@ impl Pipeline {
             _watcher: watcher,
             backend,
             gpu_fallback,
+            failure,
         })
     }
 
@@ -309,33 +334,10 @@ impl Pipeline {
         self.state.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Block until EOS or error on the sink bus. Used by `--headless`.
-    pub fn run_until_done(&self) -> Result<()> {
-        let bus = self
-            .sink_pipeline
-            .bus()
-            .ok_or_else(|| anyhow!("sink pipeline has no bus"))?;
-        for msg in bus.iter_timed(gst::ClockTime::NONE) {
-            match msg.view() {
-                gst::MessageView::Eos(_) => break,
-                gst::MessageView::Error(err) => {
-                    return Err(anyhow!(
-                        "{}: {} ({:?})",
-                        err.src().map(|s| s.path_string()).unwrap_or_default(),
-                        err.error(),
-                        err.debug()
-                    ));
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    pub fn stop(&self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
-        let _ = self.cmd_tx.send(Command::Stop);
-        let _ = self.sink_pipeline.set_state(gst::State::Null);
+    /// Set once the pipeline has stopped working: the sink graph posted
+    /// an error or the feeder thread panicked. The caller should drop it.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|f| f.clone())
     }
 }
 
@@ -510,7 +512,7 @@ pub(crate) fn build_source_pipeline(
         appsink.upcast_ref(),
     ])?;
 
-    install_bus_logger(&pipeline, "source");
+    install_bus_logger(&pipeline, "source", None);
 
     Ok((pipeline, appsink))
 }
@@ -557,18 +559,29 @@ pub(crate) fn capture_dims(source_pipeline: &gst::Pipeline) -> Option<(u32, u32)
     Some((w as u32, h as u32))
 }
 
-fn install_bus_logger(pipeline: &gst::Pipeline, tag: &'static str) {
+/// Log the graph's errors and warnings, then drop the message: nothing
+/// pops these buses, so a `Pass` would queue every message forever.
+/// Errors also land in `failure` when the caller watches for them.
+fn install_bus_logger(pipeline: &gst::Pipeline, tag: &'static str, failure: Option<FailureSlot>) {
     if let Some(bus) = pipeline.bus() {
         bus.set_sync_handler(move |_, msg| {
             match msg.view() {
-                gst::MessageView::Error(err) => log::error!(
-                    "GST[{tag}] {} :: {} (debug: {})",
-                    err.src()
-                        .map(|s| s.path_string().to_string())
-                        .unwrap_or_default(),
-                    err.error(),
-                    err.debug().unwrap_or_default(),
-                ),
+                gst::MessageView::Error(err) => {
+                    let text = format!(
+                        "{} :: {} (debug: {})",
+                        err.src()
+                            .map(|s| s.path_string().to_string())
+                            .unwrap_or_default(),
+                        err.error(),
+                        err.debug().unwrap_or_default(),
+                    );
+                    log::error!("GST[{tag}] {text}");
+                    if let Some(slot) = &failure
+                        && let Ok(mut f) = slot.lock()
+                    {
+                        f.get_or_insert(text);
+                    }
+                }
                 gst::MessageView::Warning(w) => log::warn!(
                     "GST[{tag}] {} :: {}",
                     w.src()
@@ -578,26 +591,7 @@ fn install_bus_logger(pipeline: &gst::Pipeline, tag: &'static str) {
                 ),
                 _ => {}
             }
-            gst::BusSyncReply::Pass
+            gst::BusSyncReply::Drop
         });
     }
-}
-
-fn drain_bus_errors(pipeline: &gst::Pipeline) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(bus) = pipeline.bus() {
-        while let Some(msg) = bus.pop() {
-            if let gst::MessageView::Error(err) = msg.view() {
-                out.push(format!(
-                    "  ↳ {} :: {} (debug: {})",
-                    err.src()
-                        .map(|s| s.path_string().to_string())
-                        .unwrap_or_default(),
-                    err.error(),
-                    err.debug().unwrap_or_default(),
-                ));
-            }
-        }
-    }
-    out
 }

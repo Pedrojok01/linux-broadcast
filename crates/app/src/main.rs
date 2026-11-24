@@ -47,7 +47,7 @@ mod wayland_activation;
 
 use anyhow::Result;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::activation::{ActivationEvent, EguiWaker};
 use crate::lock::InstanceLock;
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
     //   in that state — by the time the egui loop wakes up, the
     //   activation token has typically expired in the compositor.
     let waker: EguiWaker = Arc::new(OnceLock::new());
-    let wayland_handles: WaylandHandleSlot = Arc::new(OnceLock::new());
+    let wayland_handles: WaylandHandleSlot = Arc::new(Mutex::new(None));
     let (activation_tx, activation_rx) = crossbeam_channel::unbounded::<ActivationEvent>();
     let _activation_service = match activation::serve(
         activation_tx,

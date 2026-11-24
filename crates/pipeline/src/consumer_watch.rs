@@ -128,6 +128,12 @@ impl Watcher {
     /// receiver whenever the consumer set changes (PID set comparison;
     /// process renames don't fire events).
     pub fn start(target_device: String, exclude_pid: u32) -> io::Result<Self> {
+        // `/proc/*/fd` links name the real node, so resolve a configured
+        // symlink (`/dev/v4l/by-id/…`) once or it never matches.
+        let target_device = fs::canonicalize(&target_device)
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .unwrap_or(target_device);
         let stop = Arc::new(eventfd(0, EventfdFlags::CLOEXEC)?);
         let (tx, rx) = crossbeam_channel::unbounded::<Vec<Consumer>>();
         let thread_stop = Arc::clone(&stop);

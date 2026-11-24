@@ -184,7 +184,9 @@ Off by default. `--features cuda` runs inference through ONNX Runtime's CUDA exe
 ### Process lifecycle gotchas
 
 - **Single-instance lock at process scope.** `lock.rs` flocks `$XDG_RUNTIME_DIR/linux-broadcast.lock` (config-dir fallback) for the lifetime of the LB process — a lazy-mode instance can sit Idle for arbitrarily long with no `/dev/video10` write contention, so we'd otherwise allow two instances to coexist and race the moment a consumer arrives. A second launch finds the lock held and exits cleanly.
-- **Headless `App::new` polls for `/dev/video10`** (10 s timeout) before auto-starting the pipeline, so it survives the autostart-vs-`systemd-modules-load.service` race on cold boot.
+- **Headless `App::new` polls for `/dev/video10`** (10 s timeout) before auto-starting the pipeline, so it survives the autostart-vs-`systemd-modules-load.service` race on cold boot. A GUI launch doesn't wait: it reports a missing device at once.
+- **Pipeline failures reach the GUI.** Sink-graph bus errors and a feeder panic (caught in `spawn_feeder`, which then releases the camera) land in `Pipeline::failure()`; `App::update` drops the pipeline and shows the reason in the header. The bus sync handlers log and `Drop` every message: nothing pops those buses, so `Pass` would queue them forever.
+- **Config is sanitized on load** (`Config::sanitize`): out-of-range or odd sizes, a zero framerate and a non-finite blur fall back to safe values, logged. `Pipeline::start` also rejects configs the graphs can't run, so a library caller gets an `Err`, not a feeder panic. An unparsable file is copied to `config.toml.bad` before defaults overwrite it; saves go through a temp file and `rename`.
 - **Window close hides to tray, not exits.** The close button is intercepted (`ViewportCommand::CancelClose` + `Visible(false)`); only the tray's *Quit* sets `quit_requested` and lets the close through. Hiding the window also clears the GUI-preview synthetic-consumer signal so a tray-only instance lets the camera drop to Idle. That signal follows our own show/hide requests (`ui/presence.rs`), not the toolkit: winit can't report minimized on Wayland, and an unmapped X11 window doesn't read as minimized. A focus gain after a user hide counts as shown (Wayland taskbar restore).
 - **Tray needs a GTK loop.** `tray.rs` spawns a dedicated `lb-tray-gtk` thread that runs `gtk::main()` because tray-icon's Linux backend (libayatana-appindicator) needs a GTK loop on *some* thread, and egui/winit don't host one. Install can fail on systems without a tray host — the failure is logged and the GUI keeps working without a tray entry.
 - **`desktop_install.rs` is skipped** when the `.deb`-installed system entry at `/usr/share/applications/LinuxBroadcast.desktop` is present, to avoid duplicate menu entries.
@@ -262,7 +264,7 @@ Non-obvious bits:
 - `tests/models_smoke.rs` — loads each bundled ONNX through `Segmenter::from_bytes`, runs 1–2 inferences on a synthetic frame, asserts mask shape + value range. RVM also covers `reset()` clearing recurrent state.
 - `tests/synthetic_graph.rs` — drives `videotestsrc → … → appsink` through the `Compositor` and back into the sink graph, verifying caps negotiation and PTS pacing without touching `/dev/video0` or `/dev/video10`.
 
-The GUI crate has no tests — surface is mostly egui layout. Don't add UI snapshot tests without a strong reason; egui rendering is too version-sensitive.
+The GUI crate tests only its logic (config, library, camera listing, autostart, presence, the instance lock), not its egui layout. Don't add UI snapshot tests without a strong reason; egui rendering is too version-sensitive.
 
 ## Roadmap
 

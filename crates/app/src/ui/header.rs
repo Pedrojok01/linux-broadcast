@@ -58,7 +58,7 @@ impl App {
                             self.quit_requested = true;
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
-                        if let Some(err) = &self.error {
+                        if let Some(err) = self.error.as_ref().or(self.bg_warning.as_ref()) {
                             let err = err.clone();
                             ui.label(egui::RichText::new(err).small().color(color::DANGER));
                         }

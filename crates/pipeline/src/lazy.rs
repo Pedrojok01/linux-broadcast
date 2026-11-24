@@ -39,8 +39,8 @@ use crate::consumer_watch::Consumer;
 use crate::framing::{AnchorLock, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
 use crate::idle_loader::IdleLoader;
 use crate::pipeline::{
-    CaptureInfo, Command, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame, SourceBuilder,
-    SourceCodec, capture_dims, log_negotiated_input,
+    CaptureInfo, Command, FailureSlot, NS_PER_SEC, PipelineConfig, PipelineState, PreviewFrame,
+    SourceBuilder, SourceCodec, capture_dims, log_negotiated_input,
 };
 use crate::profile::Profiler;
 use crate::segmenter::{Backend, Mask, ModelKind, Segmenter};
@@ -154,6 +154,7 @@ pub(crate) fn spawn_feeder(
     watcher_rx: Receiver<Vec<Consumer>>,
     state_pub: Arc<Mutex<PipelineState>>,
     stop_flag: Arc<AtomicBool>,
+    failure: FailureSlot,
     source_builder: SourceBuilder,
 ) -> Result<FeederHandles> {
     let model_onnx = match cfg.model {
@@ -230,7 +231,22 @@ pub(crate) fn spawn_feeder(
                 cached_framing: None,
                 profiler: Profiler::new(infer_interval),
             };
-            feeder.run(cmd_rx, watcher_rx, stop_flag);
+            // A panic would otherwise end the thread silently while the GUI
+            // keeps showing Idle; release the camera and report it instead.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                feeder.run(cmd_rx, watcher_rx, stop_flag)
+            }));
+            if let Err(payload) = run {
+                feeder.shutdown();
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                if let Ok(mut f) = failure.lock() {
+                    f.get_or_insert(format!("video thread crashed: {msg}"));
+                }
+            }
         })
         .context("spawn lb-feeder")?;
     Ok((handle, backend_pub, gpu_fallback_pub))

@@ -37,7 +37,7 @@
 
 use std::os::raw::c_void;
 use std::ptr::NonNull;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use raw_window_handle::{
@@ -60,9 +60,9 @@ use wayland_protocols::xdg::activation::v1::client::{
 /// compositor refuses to send to an unmapped surface).
 ///
 /// Populated on the first egui frame via [`WaylandHandles::capture`].
-/// Holds raw pointers from `raw_window_handle`; they remain valid for
-/// the lifetime of the eframe window, which is the lifetime of the
-/// process for our app.
+/// Holds raw pointers from `raw_window_handle`, valid only while the
+/// eframe window lives: `App::on_exit` empties the slot before the window
+/// goes, and tokens are applied under the lock so neither can race.
 #[derive(Clone, Copy)]
 pub struct WaylandHandles {
     display: NonNull<c_void>,
@@ -78,7 +78,7 @@ unsafe impl Sync for WaylandHandles {}
 
 /// Shared slot owned by `main()`, populated by `App` on its first frame
 /// when running on Wayland, consumed by the zbus activation handler.
-pub type WaylandHandleSlot = Arc<OnceLock<WaylandHandles>>;
+pub type WaylandHandleSlot = Arc<Mutex<Option<WaylandHandles>>>;
 
 impl WaylandHandles {
     /// Pull the raw Wayland pointers out of an eframe `Frame`. Returns
@@ -170,6 +170,8 @@ fn apply_token_raw(display_ptr: *mut c_void, surface_ptr: *mut c_void, token: &s
     let surface = WlSurface::from_id(&conn, surface_id)?;
 
     activation.activate(token.to_string(), &surface);
+    // Free the server-side global binding; wl_registry has no destructor.
+    activation.destroy();
     conn.flush()?;
     Ok(())
 }

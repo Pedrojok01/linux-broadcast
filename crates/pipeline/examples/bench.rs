@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
 
     let pipeline = Pipeline::start(cfg, MULTICLASS, RVM)?;
     std::thread::sleep(Duration::from_secs(secs));
-    pipeline.stop();
+    drop(pipeline);
     eprintln!("[bench] done");
     Ok(())
 }

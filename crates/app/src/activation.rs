@@ -88,7 +88,11 @@ impl AppService {
     /// X11 / no-Wayland-handles cases just return — the toolkit
     /// fallback in `App::handle_activation_events` is enough there.
     fn apply_token_now(&self, token: &str) {
-        let Some(handles) = self.wayland_handles.get() else {
+        // Held through the apply, so the window can't go away mid-call.
+        let Ok(slot) = self.wayland_handles.lock() else {
+            return;
+        };
+        let Some(handles) = slot.as_ref() else {
             return;
         };
         match handles.apply_token(token) {

@@ -50,6 +50,11 @@ impl Model {
     pub const ALL: &'static [Model] = &[Model::Rvm, Model::SelfieMulticlass];
 }
 
+/// Accepted output size range, per side, and the top framerate.
+const MIN_DIM: u32 = 64;
+const MAX_DIM: u32 = 4096;
+const MAX_FPS: u32 = 60;
+
 const QUALIFIER: &str = "io";
 const ORG: &str = "linux-broadcast";
 const APP: &str = "linux-broadcast";
@@ -137,13 +142,25 @@ impl Config {
     }
 
     fn load_from(path: &Path) -> Self {
-        match Self::try_load_from(path) {
+        let mut cfg = match Self::try_load_from(path) {
             Ok(cfg) => cfg,
             Err(e) => {
-                log::warn!("config load failed ({e:#}); using defaults");
+                // The next save overwrites the file, so keep the user's copy.
+                let backup = path.with_extension("toml.bad");
+                let kept = std::fs::copy(path, &backup).is_ok();
+                log::warn!(
+                    "config load failed ({e:#}); using defaults{}",
+                    if kept {
+                        format!(", old file kept at {}", backup.display())
+                    } else {
+                        String::new()
+                    }
+                );
                 Self::default()
             }
-        }
+        };
+        cfg.sanitize();
+        cfg
     }
 
     fn try_load_from(path: &Path) -> Result<Self> {
@@ -153,6 +170,56 @@ impl Config {
         let s =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&s).with_context(|| format!("parse {}", path.display()))
+    }
+
+    /// Bring hand-edited values back into what the pipeline can run: a
+    /// zero framerate or height panics it, and YUY2 needs an even width.
+    fn sanitize(&mut self) {
+        let d = Self::default();
+        let dims_ok = |v: u32| (MIN_DIM..=MAX_DIM).contains(&v);
+        if !dims_ok(self.width) || !dims_ok(self.height) {
+            log::warn!(
+                "config: resolution {}×{} out of range, using {}×{}",
+                self.width,
+                self.height,
+                d.width,
+                d.height
+            );
+            (self.width, self.height) = (d.width, d.height);
+        }
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
+            let (w, h) = (self.width & !1, self.height & !1);
+            log::warn!(
+                "config: odd resolution {}×{}, using {w}×{h}",
+                self.width,
+                self.height
+            );
+            (self.width, self.height) = (w, h);
+        }
+        if !(1..=MAX_FPS).contains(&self.framerate) {
+            let fps = if self.framerate == 0 {
+                d.framerate
+            } else {
+                MAX_FPS
+            };
+            log::warn!(
+                "config: framerate {} out of range, using {fps}",
+                self.framerate
+            );
+            self.framerate = fps;
+        }
+        if !(0.0..=1.0).contains(&self.blur_strength) {
+            let b = if self.blur_strength.is_finite() {
+                self.blur_strength.clamp(0.0, 1.0)
+            } else {
+                d.blur_strength
+            };
+            log::warn!(
+                "config: blur_strength {} out of range, using {b}",
+                self.blur_strength
+            );
+            self.blur_strength = b;
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -166,13 +233,11 @@ impl Config {
                 .with_context(|| format!("mkdir -p {}", parent.display()))?;
         }
         let s = toml::to_string_pretty(self).context("serialize config")?;
-        std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
+        // Write then rename, so a crash mid-write never truncates the file.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, s).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
         Ok(())
-    }
-
-    /// True when the configured background image actually resolves.
-    pub fn background_image_path(&self) -> Option<&Path> {
-        self.background_path.as_deref().filter(|p| p.exists())
     }
 }
 
@@ -269,6 +334,51 @@ mod tests {
         assert_eq!(cfg.framerate, Config::default().framerate);
         assert_eq!(cfg.show_preview, Config::default().show_preview);
         assert_eq!(cfg.start_on_login, Config::default().start_on_login);
+    }
+
+    #[test]
+    fn sanitize_fixes_values_the_pipeline_cannot_run() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_file(tmp.path());
+        std::fs::write(
+            &path,
+            "width = 1281\nheight = 721\nframerate = 0\nblur_strength = 7.5\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!((cfg.width, cfg.height), (1280, 720));
+        assert_eq!(cfg.framerate, Config::default().framerate);
+        assert_eq!(cfg.blur_strength, 1.0);
+
+        std::fs::write(&path, "width = 1280\nheight = 0\nframerate = 240\n").unwrap();
+        let cfg = Config::load_from(&path);
+        let d = Config::default();
+        assert_eq!((cfg.width, cfg.height), (d.width, d.height));
+        assert_eq!(cfg.framerate, MAX_FPS);
+    }
+
+    #[test]
+    fn unparsable_file_is_backed_up_before_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_file(tmp.path());
+        std::fs::write(&path, "width = \"wide\"\n").unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.width, Config::default().width);
+        let backup = std::fs::read_to_string(tmp.path().join("config.toml.bad")).unwrap();
+        assert_eq!(backup, "width = \"wide\"\n");
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = config_file(tmp.path());
+        Config::default().save_to(&path).unwrap();
+        Config::default().save_to(&path).unwrap();
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
     }
 
     #[test]

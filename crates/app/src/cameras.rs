@@ -5,18 +5,14 @@
 //! (no `open(2)`, no LED) and avoids fighting another process for
 //! exclusive access while the user is just *picking* a camera.
 //!
-//! Limitation: the kernel exposes every numbered subdevice a webcam
-//! claims (capture, metadata, control), so a single physical webcam
-//! often shows up as several entries. Filtering to capture-only would
-//! require a `VIDIOC_QUERYCAP` ioctl on each node, which means opening
-//! the device — and that *will* fight other consumers and may flicker
-//! the LED. We've judged the extra entries acceptable; the user can
-//! pick the right one and we persist their choice.
+//! A webcam claims several numbered nodes (capture, metadata). The sysfs
+//! `index` attribute numbers them per physical device, and the capture
+//! node is index 0, so the rest are dropped without opening anything.
 //!
 //! `sink_device` is excluded so the virtual cam (`/dev/video10`)
 //! never appears as a selectable input.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraEntry {
@@ -24,42 +20,90 @@ pub struct CameraEntry {
     pub label: String,
 }
 
-/// Enumerate `/dev/video*` capture-capable nodes, excluding `sink_device`.
-///
-/// We probe each `/dev/videoN` for a friendly name via
-/// `/sys/class/video4linux/videoN/name` rather than opening the device —
-/// cheaper and non-disruptive. The same physical webcam often exposes
-/// several numbered nodes (capture, metadata, control) and they all show
-/// up here; filtering to capture-only would require a v4l2 ioctl probe.
+/// Enumerate `/dev/video*` capture nodes, excluding `sink_device`, in
+/// numeric order (`video2` before `video10`). Cheap enough to call each
+/// time the picker opens, so hot-plugged cameras show up.
 pub fn enumerate(sink_device: &str) -> Vec<CameraEntry> {
-    let mut out = Vec::new();
-    let glob = match glob::glob("/dev/video*") {
-        Ok(g) => g,
-        Err(_) => return out,
+    enumerate_in(
+        Path::new("/dev"),
+        Path::new("/sys/class/video4linux"),
+        sink_device,
+    )
+}
+
+fn enumerate_in(dev_dir: &Path, sys_dir: &Path, sink_device: &str) -> Vec<CameraEntry> {
+    let Ok(entries) = std::fs::read_dir(dev_dir) else {
+        return Vec::new();
     };
-    for entry in glob.flatten() {
-        let path = entry.to_string_lossy().to_string();
-        if path == sink_device {
-            continue;
+    let mut out: Vec<(u32, CameraEntry)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let basename = e.file_name().into_string().ok()?;
+            let n: u32 = basename.strip_prefix("video")?.parse().ok()?;
+            let path = dev_dir.join(&basename).to_string_lossy().into_owned();
+            let sys = sys_dir.join(&basename);
+            let read = |attr: &str| {
+                std::fs::read_to_string(sys.join(attr))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
+            // Missing `index` (old kernels) keeps the node rather than hiding a camera.
+            if path == sink_device || read("index").is_some_and(|i| i != "0") {
+                return None;
+            }
+            let pretty = read("name").unwrap_or_else(|| "Unknown camera".to_string());
+            Some((
+                n,
+                CameraEntry {
+                    path,
+                    label: format!("{basename} — {pretty}"),
+                },
+            ))
+        })
+        .collect();
+    out.sort_by_key(|(n, _)| *n);
+    out.into_iter().map(|(_, c)| c).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn node(dev: &Path, sys: &Path, name: &str, index: Option<&str>, label: &str) {
+        std::fs::write(dev.join(name), "").unwrap();
+        let dir = sys.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("name"), format!("{label}\n")).unwrap();
+        if let Some(i) = index {
+            std::fs::write(dir.join("index"), format!("{i}\n")).unwrap();
         }
-        let basename = entry
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("video?")
-            .to_string();
-        let sys_name = PathBuf::from("/sys/class/video4linux")
-            .join(&basename)
-            .join("name");
-        let pretty = std::fs::read_to_string(&sys_name)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Unknown camera".to_string());
-        out.push(CameraEntry {
-            path,
-            label: format!("{} — {}", basename, pretty),
-        });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+
+    #[test]
+    fn lists_capture_nodes_in_numeric_order_without_sink_or_metadata() {
+        let (dev, sys) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (d, s) = (dev.path(), sys.path());
+        node(d, s, "video0", Some("0"), "C920");
+        node(d, s, "video1", Some("1"), "C920");
+        node(d, s, "video2", Some("0"), "Integrated");
+        node(d, s, "video10", Some("0"), "LinuxBroadcast");
+        node(d, s, "video11", None, "Old kernel");
+        std::fs::write(d.join("vhost-net"), "").unwrap();
+
+        let sink = d.join("video10").to_string_lossy().into_owned();
+        let labels: Vec<_> = enumerate_in(d, s, &sink)
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "video0 — C920",
+                "video2 — Integrated",
+                "video11 — Old kernel"
+            ]
+        );
+    }
 }
