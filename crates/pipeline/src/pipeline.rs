@@ -184,11 +184,12 @@ pub struct CaptureInfo {
 /// Public pipeline state, polled by the GUI for the footer indicator.
 #[derive(Debug, Clone, Default)]
 pub enum PipelineState {
-    /// Camera released. `/dev/video10` exists but no frames are flowing.
+    /// Camera released. `/dev/video10` shows the idle loader frame.
     #[default]
     Idle,
-    /// Camera engaged; one or more consumers are reading
-    /// `/dev/video10` (or the GUI preview heartbeat is asserting demand).
+    /// Camera engaged: consumers are reading `/dev/video10` or the GUI
+    /// preview heartbeat asserts demand. `consumers` is empty with no
+    /// preview during the deactivation grace period.
     /// `fps` is the measured output framerate (rolling ~1 s window, `None`
     /// until the first window completes); `capture` is the native camera
     /// format. Both are populated by the feeder while Live.

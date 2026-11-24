@@ -16,8 +16,11 @@ impl App {
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(space::LG);
-                    let (dot_color, label, label_color) =
-                        footer_status(self.running(), &self.pipeline_state);
+                    let (dot_color, label, label_color) = footer_status(
+                        self.running(),
+                        &self.pipeline_state,
+                        self.last_gui_preview_active == Some(true),
+                    );
                     ui.label(egui::RichText::new("●").color(dot_color).small());
                     ui.add_space(space::XS);
                     ui.label(egui::RichText::new(label).small().color(label_color));
@@ -80,9 +83,13 @@ impl App {
 ///   the user sees the difference between "the app is on but the camera
 ///   is off" and "the app is off".
 /// - running and Live → green "LIVE → name(pid)" if there's a real
-///   consumer, otherwise green "LIVE (preview)" (the GUI's preview
-///   heartbeat is the demand source).
-fn footer_status(running: bool, state: &PipelineState) -> (Color32, String, Color32) {
+///   consumer, "LIVE (preview)" if the GUI's preview heartbeat is the
+///   demand source, else "LIVE (releasing)": the deactivation grace period.
+fn footer_status(
+    running: bool,
+    state: &PipelineState,
+    preview: bool,
+) -> (Color32, String, Color32) {
     if !running {
         return (color::TEXT_MUTED, "Idle".to_string(), color::TEXT_MUTED);
     }
@@ -102,11 +109,14 @@ fn footer_status(running: bool, state: &PipelineState) -> (Color32, String, Colo
             };
             (color::SUCCESS, label, color::SUCCESS)
         }
-        PipelineState::Live { .. } => {
-            // Live without external consumers: the GUI preview heartbeat
-            // is the demand source.
+        PipelineState::Live { .. } if preview => {
             (color::SUCCESS, "LIVE (preview)".to_string(), color::SUCCESS)
         }
+        PipelineState::Live { .. } => (
+            color::SUCCESS,
+            "LIVE (releasing)".to_string(),
+            color::SUCCESS,
+        ),
         PipelineState::Idle => (
             color::ACCENT,
             "Standby (no consumer)".to_string(),

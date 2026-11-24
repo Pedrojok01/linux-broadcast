@@ -13,7 +13,7 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -524,4 +524,37 @@ fn feeder_panic_is_reported_as_failure() {
         .unwrap();
     let failure = wait_for_failure(&p, Duration::from_secs(4)).expect("failure reported");
     assert!(failure.contains("synthetic feeder panic"), "{failure}");
+}
+
+/// Demand that returns within the deactivation debounce (an in-call
+/// camera switch) must find the camera still engaged: no new source graph.
+#[test]
+fn brief_demand_gap_keeps_the_camera() {
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted: SourceBuilder = {
+        let builds = Arc::clone(&builds);
+        Arc::new(move |cfg: &PipelineConfig, _codec: SourceCodec| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            source_graph(cfg, -1, None)
+        })
+    };
+    let (p, _captured) = start_pipeline_with_source(cfg(), counted);
+    let tx = p.cmd_sender();
+    let is_live = |s: &PipelineState| matches!(s, PipelineState::Live { .. });
+
+    tx.send(Command::SetGuiPreviewActive(true)).unwrap();
+    assert!(wait_for(&p, Duration::from_secs(4), is_live));
+    tx.send(Command::SetGuiPreviewActive(false)).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(is_live(&p.state()), "camera held during the grace period");
+    tx.send(Command::SetGuiPreviewActive(true)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(is_live(&p.state()));
+    assert_eq!(builds.load(Ordering::SeqCst), 1, "camera was restarted");
+
+    tx.send(Command::SetGuiPreviewActive(false)).unwrap();
+    assert!(wait_for(&p, Duration::from_secs(5), |s| matches!(
+        s,
+        PipelineState::Idle
+    )));
 }

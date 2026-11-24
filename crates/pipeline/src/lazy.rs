@@ -85,6 +85,14 @@ pub(crate) enum State {
     Deactivating { since: Instant },
 }
 
+impl State {
+    /// The camera stays engaged through the deactivation debounce, so a
+    /// consumer that comes back within it gets frames without a restart.
+    fn holds_camera(self) -> bool {
+        matches!(self, State::Live | State::Deactivating { .. })
+    }
+}
+
 /// Inputs that drive the state machine, computed once per tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Demand {
@@ -287,13 +295,13 @@ struct Feeder {
     /// a raw-only camera pays the failed-MJPEG probe only once per
     /// process. Forced to `Raw` up-front when `LB_FORCE_RAW` is set.
     resolved_codec: Option<SourceCodec>,
-    /// Source GST graph + its appsink; only `Some` while Live.
+    /// Source GST graph + its appsink; `Some` while the camera is held.
     source: Option<(gst::Pipeline, gst_app::AppSink)>,
     /// Measured output framerate (rolling ~1 s window), published to the
-    /// GUI. `None` until the first window completes; cleared on Live exit.
+    /// GUI. `None` until the first window completes; cleared on camera release.
     live_fps: Option<f32>,
     /// Native camera capture format, read from the `v4l2src` src pad once
-    /// per Live engagement. Cleared on Live exit.
+    /// per Live engagement. Cleared on camera release.
     capture_info: Option<CaptureInfo>,
     /// Rolling fps-window start and frame count. Always-on (independent of
     /// `LB_PROFILE`); cheap (one increment + one `Instant` compare/frame).
@@ -345,11 +353,11 @@ struct Feeder {
     /// cached mask on the rest. 1 = infer every frame.
     infer_interval: u64,
     /// Live-tick counter driving the inference cadence. Reset on every
-    /// Live exit so each engagement re-infers on its first frame.
+    /// camera release so each engagement re-infers on its first frame.
     infer_tick: u64,
     /// Most recent smoothed mask, reused on ticks that skip inference.
     /// `None` until the first inference of a Live engagement (and after
-    /// every Live exit), which forces an inference regardless of cadence.
+    /// every camera release), which forces an inference regardless of cadence.
     cached_mask: Option<Mask>,
     /// Auto-frame transform that accompanied `cached_mask`, reused on the
     /// same skipped ticks so framing stays consistent with the mask.
@@ -367,16 +375,17 @@ impl Feeder {
     ) {
         while !stop_flag.load(Ordering::Relaxed) {
             // 1. Multiplex control inputs. The parking time depends on
-            //    state: while Live we must NOT sleep here — `pump_one_frame`
+            //    state: while the camera is held (Live or Deactivating) we
+            //    must NOT sleep here — `pump_one_frame`
             //    blocks on the source appsink's `try_pull_sample`, which is
             //    our real pace-maker (≈ camera framerate). Parking the full
             //    `IDLE_TICK` between Live frames would cap output at
             //    `1000/IDLE_TICK` fps (10 fps) regardless of how fast the
-            //    segment/composite stages run. While not Live there are no
-            //    frames to pull, so we park for one tick to stay responsive
-            //    to control/watcher events and observe debounce expiry
-            //    without spinning.
-            let park = if matches!(self.state, State::Live) {
+            //    segment/composite stages run. Without the camera there are
+            //    no frames to pull, so we park for one tick to stay
+            //    responsive to control/watcher events and observe debounce
+            //    expiry without spinning.
+            let park = if self.state.holds_camera() {
                 Duration::ZERO
             } else {
                 IDLE_TICK
@@ -408,14 +417,14 @@ impl Feeder {
             let now = Instant::now();
             self.step_state(now);
 
-            // 3. Frame pumping. Live: pull a real frame from the source
-            //    appsink, segment + composite, push to the sink. Otherwise:
+            // 3. Frame pumping. Camera held: pull a real frame from the
+            //    source appsink, segment + composite, push to the sink. Otherwise:
             //    push the idle-loader frame at `IDLE_PUSH_INTERVAL` so
             //    `/dev/video10` always has output for any consumer that
             //    opens it — the lazy state still controls whether
             //    `/dev/video0` is held, but virtual-cam visibility is no
             //    longer gated on consumer detection.
-            if matches!(self.state, State::Live) {
+            if self.state.holds_camera() {
                 self.pump_one_frame();
             } else {
                 self.pump_idle_frame();
@@ -470,17 +479,17 @@ impl Feeder {
 
         let next = next_state(self.state, demand, now);
 
-        // Side effects only fire when the *category* of state changes
-        // (Idle/Activating/Live/Deactivating), not on every tick.
-        let entered_live = matches!(next, State::Live) && !matches!(self.state, State::Live);
-        let exited_live = !matches!(next, State::Live) && matches!(self.state, State::Live);
+        // The camera is engaged on Activating → Live and released on
+        // Deactivating → Idle; Live ↔ Deactivating keeps it running.
+        let engage = next.holds_camera() && !self.state.holds_camera();
+        let release = !next.holds_camera() && self.state.holds_camera();
 
-        if entered_live && let Err(e) = self.start_source() {
+        if engage && let Err(e) = self.start_source() {
             log::error!("could not start source pipeline: {e:#}");
             self.back_off(now);
             return;
         }
-        if exited_live {
+        if release {
             self.leave_live();
         }
 
@@ -684,15 +693,16 @@ impl Feeder {
             );
             self.last_state_log = Some(label);
         }
-        let public = match self.state {
-            State::Live => PipelineState::Live {
+        // Public Live means camera frames are flowing, which includes the
+        // Deactivating grace period; Activating still reads as Idle.
+        let public = if self.state.holds_camera() {
+            PipelineState::Live {
                 consumers: self.consumers.clone(),
                 fps: self.live_fps,
                 capture: self.capture_info.clone(),
-            },
-            // Activating/Deactivating both look "Idle-ish" to the GUI; we
-            // only flip the public state when frames are actually flowing.
-            _ => PipelineState::Idle,
+            }
+        } else {
+            PipelineState::Idle
         };
         if let Ok(mut slot) = self.state_pub.lock() {
             *slot = public;

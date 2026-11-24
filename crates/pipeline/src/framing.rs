@@ -5,7 +5,7 @@
 //! return that locked anchor unchanged — small natural movements of a seated
 //! user don't produce visible recentering. To pick a new anchor, the caller
 //! resets the lock (the feeder does this when auto-frame is toggled off and
-//! on again, and also on Live exit).
+//! on again, and also when it releases the camera).
 //!
 //! This is the GMeet auto-frame UX: snap once at engagement, stay put. An
 //! earlier EMA-based design panned every frame to track the centroid; users
