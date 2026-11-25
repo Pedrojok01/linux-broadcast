@@ -50,10 +50,11 @@ strip = "symbols"
 # without clippy erroring on the conflict — keep it if you ever need to
 # `allow` a single lint on top of `clippy::all`.
 [workspace.lints.rust]
-# `deny` (rather than `forbid`) so two sites can opt out: the Wayland
+# `deny` (rather than `forbid`) so three sites can opt out: the Wayland
 # xdg-activation glue in `crates/app/src/wayland_activation.rs` (wraps winit's
-# raw `wl_display`/`wl_surface` pointers, see that file) and the Quit watchdog's
-# `libc::_exit` in `crates/app/src/tray.rs`. Everything else is unsafe-free.
+# raw `wl_display`/`wl_surface` pointers, see that file), the Quit watchdog's
+# `libc::_exit` in `crates/app/src/tray.rs` and the v4l2loopback event ioctls
+# in `crates/pipeline/src/consumer_watch/usage.rs`. Everything else is unsafe-free.
 unsafe_code = "deny"
 unused_must_use = "deny"
 

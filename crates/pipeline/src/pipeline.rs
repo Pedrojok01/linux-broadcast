@@ -29,7 +29,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::compositor::Background;
-use crate::consumer_watch::{Consumer, Watcher};
+use crate::consumer_watch::{Consumers, Watcher};
 use crate::lazy::spawn_feeder;
 use crate::segmenter::{Backend, ModelKind};
 
@@ -186,24 +186,22 @@ pub enum PipelineState {
     /// Camera released. `/dev/video10` shows the idle loader frame.
     #[default]
     Idle,
-    /// Camera engaged: consumers are reading `/dev/video10` or the GUI
-    /// preview heartbeat asserts demand. `consumers` is empty with no
-    /// preview during the deactivation grace period.
+    /// Camera engaged: a consumer is reading `/dev/video10` or the GUI
+    /// preview heartbeat asserts demand. `consumers.present()` is false
+    /// with no preview during the deactivation grace period.
     /// `fps` is the measured output framerate (rolling ~1 s window, `None`
     /// until the first window completes); `capture` is the native camera
     /// format. Both are populated by the feeder while Live.
     Live {
-        consumers: Vec<Consumer>,
+        consumers: Consumers,
         fps: Option<f32>,
         capture: Option<CaptureInfo>,
     },
 }
 
 pub struct Pipeline {
-    /// Held only for its `Drop` side-effect (signalling its stop flag and
-    /// joining the watcher thread). Listed first so Rust's
-    /// declaration-order field drop runs the watcher's stop+join before
-    /// the rest of the pipeline tears down.
+    /// Held only for its `Drop` side effect: stop and join the watcher thread.
+    /// Fields drop after `Drop::drop`, so it stops once the sink is torn down.
     _watcher: Watcher,
     sink_pipeline: gst::Pipeline,
     cmd_tx: Sender<Command>,

@@ -39,7 +39,7 @@ pub mod segmenter;
 pub mod temporal;
 
 pub use compositor::{Background, Compositor};
-pub use consumer_watch::Consumer;
+pub use consumer_watch::{Consumer, Consumers};
 pub use pipeline::{Command, Pipeline, PipelineConfig, PipelineState, PreviewFrame};
 pub use segmenter::{Backend, Mask, ModelKind, Segmenter};
 

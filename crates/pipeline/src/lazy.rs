@@ -14,8 +14,9 @@
 //!
 //! Transitions are debounced to absorb two real-world quirks:
 //! - Browsers (Chrome / Firefox) briefly open `/dev/video10` to probe
-//!   capabilities (ENUM_FMT) without intending to stream. A short
-//!   activation debounce hides those probes from the camera LED.
+//!   capabilities (ENUM_FMT) without intending to stream. Where demand is
+//!   fd presence (v4l2loopback 0.12.x), a short activation debounce hides
+//!   those probes from the camera LED.
 //! - In-call camera-switcher pickers close-and-reopen the device when
 //!   the user toggles between cameras. A short deactivation debounce
 //!   prevents the pipeline from thrashing.
@@ -34,7 +35,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use crate::compositor::{Background, Compositor, Framing};
-use crate::consumer_watch::Consumer;
+use crate::consumer_watch::Consumers;
 use crate::framing::{AnchorLock, FG_ZOOM, FG_ZOOM_MAX, TOP_HEADROOM};
 use crate::idle_loader::IdleLoader;
 use crate::pipeline::{
@@ -158,7 +159,7 @@ pub(crate) fn spawn_feeder(
     rvm_onnx: &'static [u8],
     sink_appsrc: gst_app::AppSrc,
     cmd_rx: Receiver<Command>,
-    watcher_rx: Receiver<Vec<Consumer>>,
+    watcher_rx: Receiver<Consumers>,
     state_pub: Arc<Mutex<PipelineState>>,
     stop_flag: Arc<AtomicBool>,
     failure: FailureSlot,
@@ -218,7 +219,7 @@ pub(crate) fn spawn_feeder(
                 fps_win_start: Instant::now(),
                 fps_win_frames: 0,
                 publish_dirty: false,
-                consumers: Vec::new(),
+                consumers: Consumers::default(),
                 gui_preview_active: false,
                 state: State::Idle,
                 state_pub,
@@ -308,7 +309,7 @@ struct Feeder {
     /// Set when the consumers, `live_fps` or `capture_info` change, so
     /// `publish_state` re-publishes without a state change. Cleared after.
     publish_dirty: bool,
-    consumers: Vec<Consumer>,
+    consumers: Consumers,
     /// True while the GUI's preview pane is visible (window visible AND
     /// `show_preview` toggle on). Acts as a synthetic consumer in the
     /// lazy state machine and gates forwarding frames to `preview_tx`.
@@ -365,7 +366,7 @@ impl Feeder {
     fn run(
         &mut self,
         cmd_rx: Receiver<Command>,
-        mut watcher_rx: Receiver<Vec<Consumer>>,
+        mut watcher_rx: Receiver<Consumers>,
         stop_flag: Arc<AtomicBool>,
     ) {
         while !stop_flag.load(Ordering::Relaxed) {
@@ -396,7 +397,7 @@ impl Feeder {
                 },
                 recv(watcher_rx) -> msg => match msg {
                     Ok(c) => {
-                        // The watcher only sends when the PID set changed.
+                        // The watcher only sends when the streaming report or PID set changed.
                         self.consumers = c;
                         self.publish_dirty = true;
                     }
@@ -472,7 +473,7 @@ impl Feeder {
         }
 
         let demand = Demand {
-            consumers_present: !self.consumers.is_empty(),
+            consumers_present: self.consumers.present(),
             gui_preview_active: self.gui_preview_active,
         };
 
@@ -678,12 +679,14 @@ impl Feeder {
         if self.last_state_log != Some(label) {
             let consumer_summary = self
                 .consumers
+                .processes
                 .iter()
                 .map(|c| format!("{}({})", c.name, c.pid))
                 .collect::<Vec<_>>()
                 .join(",");
             log::info!(
-                "lazy state → {label} (consumers=[{consumer_summary}], gui_preview={})",
+                "lazy state → {label} (streaming={:?}, consumers=[{consumer_summary}], gui_preview={})",
+                self.consumers.streaming,
                 self.gui_preview_active,
             );
             self.last_state_log = Some(label);

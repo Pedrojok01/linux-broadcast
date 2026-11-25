@@ -82,9 +82,9 @@ impl App {
 /// - running but lazy state is Idle (no consumer) → blue "Standby" so
 ///   the user sees the difference between "the app is on but the camera
 ///   is off" and "the app is off".
-/// - running and Live → green "LIVE → name(pid)" if there's a real
-///   consumer, "LIVE (preview)" if the GUI's preview heartbeat is the
-///   demand source, else "LIVE (releasing)": the deactivation grace period.
+/// - running and Live → green "LIVE → name (pid)", or "LIVE" if the reader is
+///   unnamed (another user's process, or LB itself sandboxed), "LIVE (preview)"
+///   for the preview heartbeat, else "LIVE (releasing)" in the grace period.
 fn footer_status(
     running: bool,
     state: &PipelineState,
@@ -94,18 +94,14 @@ fn footer_status(
         return (color::TEXT_MUTED, "Idle".to_string(), color::TEXT_MUTED);
     }
     match state {
-        PipelineState::Live { consumers, .. } if !consumers.is_empty() => {
-            // Show the first consumer; if there are several, append a count.
-            let first = &consumers[0];
-            let label = if consumers.len() == 1 {
-                format!("LIVE → {} ({})", first.name, first.pid)
-            } else {
-                format!(
-                    "LIVE → {} ({}) + {}",
-                    first.name,
-                    first.pid,
-                    consumers.len() - 1
-                )
+        PipelineState::Live { consumers, .. } if consumers.present() => {
+            // Show the first process; if there are several, append a count.
+            let label = match consumers.processes.as_slice() {
+                [] => "LIVE".to_string(),
+                [only] => format!("LIVE → {} ({})", only.name, only.pid),
+                [first, rest @ ..] => {
+                    format!("LIVE → {} ({}) + {}", first.name, first.pid, rest.len())
+                }
             };
             (color::SUCCESS, label, color::SUCCESS)
         }
@@ -172,4 +168,51 @@ fn sep(ui: &mut egui::Ui) {
         rect.y_range(),
         Stroke::new(1.0, color::STROKE_STRONG),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lb_pipeline::{Consumer, Consumers};
+
+    fn live(streaming: Option<bool>, processes: Vec<Consumer>) -> PipelineState {
+        PipelineState::Live {
+            consumers: Consumers {
+                streaming,
+                processes,
+            },
+            fps: None,
+            capture: None,
+        }
+    }
+
+    fn one(name: &str, pid: u32) -> Vec<Consumer> {
+        vec![Consumer {
+            pid,
+            name: name.into(),
+        }]
+    }
+
+    #[test]
+    fn live_label_follows_the_driver_report() {
+        let label = |state, preview| footer_status(true, &state, preview).1;
+        assert_eq!(label(live(Some(true), vec![]), false), "LIVE");
+        assert_eq!(
+            label(live(Some(true), one("firefox", 42)), false),
+            "LIVE → firefox (42)"
+        );
+        assert_eq!(
+            label(live(Some(false), one("zoom", 7)), false),
+            "LIVE (releasing)"
+        );
+        assert_eq!(label(live(Some(false), vec![]), true), "LIVE (preview)");
+    }
+
+    #[test]
+    fn live_label_counts_extra_processes_without_a_driver_report() {
+        let mut both = one("zoom", 7);
+        both.extend(one("obs", 9));
+        let (_, label, _) = footer_status(true, &live(None, both), false);
+        assert_eq!(label, "LIVE → zoom (7) + 1");
+    }
 }

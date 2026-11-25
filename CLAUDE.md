@@ -88,15 +88,15 @@ Cargo workspace, two crates:
 
 ```
                           ┌──────────────────────┐
-                          │ consumer_watch       │  /proc/*/fd walk on inotify open/close
-                          │ thread               │  → Vec<Consumer> on changes
-                          └──────────┬───────────┘
+                          │ consumer_watch       │  v4l2loopback stream event (demand)
+                          │ thread               │  + /proc/*/fd walk on inotify open/close
+                          └──────────┬───────────┘  → Consumers on changes
                                      │
                                      ▼
    ┌────────────  feeder thread (lazy::Feeder) ─────────────────────────┐
    │  state machine: Idle → Activating(2s debounce) → Live              │
    │                       Live → Deactivating(3s debounce) → Idle      │
-   │  demand = consumers ∪ gui_preview_active                           │
+   │  demand = consumers.present() ∪ gui_preview_active                 │
    │  owns: Segmenter, Compositor, MaskSmoother, Background slot        │
    │                                                                    │
    │  on enter Live:  build & start source graph                        │
@@ -141,11 +141,11 @@ The reverse direction (feeder → GUI) is `PipelineState`, an `Arc<Mutex<…>>` 
 
 #### Lazy mode constants and consumer detection
 
-- **Activation debounce: 2 s** (`lazy::ACTIVATION_DEBOUNCE`). Sized to reject browser capability-probes (Chrome / Firefox open `/dev/video10` briefly for `ENUM_FMT` without intending to stream — typically <500 ms).
+- **Activation debounce: 2 s** (`lazy::ACTIVATION_DEBOUNCE`). Sized to reject browser capability-probes (Chrome / Firefox open `/dev/video10` briefly for `ENUM_FMT` without intending to stream — typically <500 ms). With the driver's stream event (below) a probe never streams, so it never counts as demand; the debounce still matters on the v4l2loopback 0.12.x fd-presence fallback.
 - **Deactivation debounce: 3 s** (`lazy::DEACTIVATION_DEBOUNCE`). Absorbs in-call camera-switcher flicker (the user toggles cameras in Meet's picker). The camera stays engaged and live frames keep flowing through it (`State::holds_camera`), and the public state stays `Live` (footer: `LIVE (releasing)`), so a consumer that returns in time causes no camera restart.
-- **Watcher wake-ups: inotify, not a timer.** The watcher sleeps on `IN_OPEN`/`IN_CLOSE` events on the sink device node and walks `/proc` only when one fires, so a consumer is seen within one walk, well inside the activation window. A 30 s rescan (`consumer_watch::RESCAN_INTERVAL`) catches opens inotify can't see (another inode of the device, e.g. a container's own `/dev`). Without inotify (watch limit, missing node) it polls every 800 ms (`POLL_INTERVAL`), sleeping the full interval after each walk.
+- **Watcher wake-ups: inotify and the driver event, not a timer.** The watcher sleeps on `IN_OPEN`/`IN_CLOSE` events on the sink device node and walks `/proc` only when one fires, so a consumer is seen within one walk, well inside the activation window. In the same `poll` it waits for `POLLPRI` on the stream-event fd; that wake only dequeues events (`UsageEvents::drain`), never walks. A 30 s rescan (`consumer_watch::RESCAN_INTERVAL`) catches opens inotify can't see (another inode of the device, e.g. a container's own `/dev`). Without inotify (watch limit, missing node) it polls every 800 ms (`POLL_INTERVAL`), sleeping the full interval after each walk.
 - **Source failure while Live → Idle + backoff.** `lazy::Feeder::check_source_health` runs on every empty pull: an EOS'd appsink (unplug, USB reset, driver error) returns instantly, so without it the Live loop would spin a core. A source with no frame for `SOURCE_STALL_TIMEOUT` (3 s) counts as failed too. Either way the feeder tears down (`leave_live`), drops to Idle and arms the same exponential backoff as a failed start (2→32 s); demand then rebuilds the graph, which is also how hot-replug recovers. The failure counter resets only after `HEALTHY_STREAM` (10 s) of frames, so a camera that keeps dropping out keeps backing off.
-- **Detection mechanism: walk `/proc/*/fd/*`** in `consumer_watch::current_consumers`. v4l2loopback exposes no sysfs consumer-count, so this is the only way to name the readers. inotify says *that* the device was opened or closed (it does fire on character devices), not *who*. A walk costs one `readlink` per open fd on the system: ~1–3 ms on a typical desktop, but ~0.5 s with Docker Desktop's `virtiofsd` (~180k fds), which is why it must never run on a short timer.
+- **Detection mechanism: the driver's stream event decides demand, a `/proc/*/fd/*` walk names the readers.** The watcher subscribes to v4l2loopback's client-usage event (`consumer_watch/usage.rs`, `UsageEvents`; v4l2loopback ≥ 0.13), which fires on capture `STREAMON`/`STREAMOFF`, including `read()` I/O and `close()`. So an app that only holds the device open (a device-list probe, a call with video off) is not demand, and a crashed reader releases it. `Consumers::present` is the single definition of demand: the driver report when there is one, else fd presence from the walk. On v4l2loopback 0.12.x the subscribe fails (`EINVAL`) and demand is fd presence, as before; a subscription lost later (if the fd ever errors or hangs up; defensive, not expected while we hold it) is dropped for good and logged once. The driver reports a count, not PIDs, so the walk (`consumer_watch::current_consumers`) is the only way to name the readers; when it can't see the reader (another user's process, or LinuxBroadcast itself sandboxed) the footer shows plain `LIVE`. inotify says *that* the device was opened or closed (it does fire on character devices), not *who*. A walk costs one `readlink` per open fd on the system: ~1–3 ms on a typical desktop, but ~0.5 s with Docker Desktop's `virtiofsd` (~180k fds), which is why it must never run on a short timer.
 - The GUI preview pane is a **synthetic consumer**: while the window is visible AND the *Show preview* toggle is on, the camera stays lit. Hiding the window or turning off the toggle drops the signal. The same signal gates forwarding frames to the preview channel, so a hidden window costs no per-frame RGBA clone. There's intentionally no "GUI window open ⇒ camera on" coupling beyond this — anything stronger defeats the lazy-mode promise.
 
 ### Cross-cutting conventions
@@ -269,7 +269,7 @@ Non-obvious bits:
 - `tests/models_smoke.rs` — loads each bundled ONNX through `Segmenter::from_bytes`, runs 1–2 inferences on a synthetic frame, asserts mask shape + value range. RVM also covers `reset()` clearing recurrent state.
 - `tests/synthetic_graph.rs` — drives `videotestsrc → … → appsink` through the `Compositor` and back into the sink graph, verifying caps negotiation and PTS pacing without touching `/dev/video0` or `/dev/video10`.
 
-The GUI crate tests only its logic (config, library, camera listing, autostart, presence, the instance lock), not its egui layout. Don't add UI snapshot tests without a strong reason; egui rendering is too version-sensitive.
+The GUI crate tests only its logic (config, library, camera listing, autostart, presence, the instance lock, the footer status labels), not its egui layout. Don't add UI snapshot tests without a strong reason; egui rendering is too version-sensitive.
 
 ## Roadmap
 
