@@ -43,12 +43,15 @@ packaging/build-cuda-addon.sh   # builds the linux-broadcast-cuda add-on .deb
 
 # Cut a release. Precondition: your changes are already committed AND
 # pushed to origin/main — the script refuses a dirty tree or an
-# unpushed-ahead main (it only adds the version bump + tag on top).
-# Bumps Cargo.toml + path-dep + Cargo.lock, runs the CI gates, commits
-# "Release X.Y.Z", tags vX.Y.Z. --push sends the commit + tag; the tag
-# triggers release.yml, which validates tag==version (else fails), then
-# builds the .deb + GPU add-on, publishes the GitHub Release, and pushes
-# to AUR. So the bump is mandatory — a bare tag would fail CI.
+# unpushed-ahead main (it only adds the version bump + tag on top), and
+# needs appstreamcli + desktop-file-validate installed.
+# Bumps Cargo.toml + path-dep + Cargo.lock, inserts the AppStream
+# <release> entry (UTC date) atop the metainfo's <releases>, runs the CI
+# gates (incl. both validators), commits "Release X.Y.Z", tags vX.Y.Z.
+# --push sends the commit + tag; the tag triggers release.yml, which
+# validates tag==version (else fails), then builds the .deb + GPU add-on,
+# publishes the GitHub Release, and pushes to AUR. So the bump is
+# mandatory — a bare tag would fail CI.
 scripts/release.sh 0.1.3 --push
 
 # Verify the virtual cam from another terminal (only works while the
@@ -202,8 +205,12 @@ Off by default. `--features cuda` runs inference through ONNX Runtime's CUDA exe
 | `packaging/linux-broadcast.wrapper` | `/usr/bin/linux-broadcast` | Wrapper that `exec`s the real binary, so ONNX Runtime resolves providers from `/usr/lib/linux-broadcast/`. |
 | `packaging/LinuxBroadcast.desktop` | `/usr/share/applications/` | System launcher; `desktop_install.rs` skips its per-user clone when this exists. |
 | `packaging/LinuxBroadcast.png` | `/usr/share/icons/hicolor/64x64/apps/` | Pre-rendered via `LB_DUMP_ICON=1` so `cargo deb` doesn't execute the binary at packaging time. Regenerate when the logo changes. |
+| `packaging/LinuxBroadcast.svg` | `/usr/share/icons/hicolor/scalable/apps/` | Scalable icon, the `DESIGN.md` logo SVG. Update it with the PNG when the logo changes. |
+| `packaging/io.github.pedrojok01.LinuxBroadcast.metainfo.xml` | `/usr/share/metainfo/` | AppStream metadata (description, screenshot, links, releases) read by Discover / GNOME Software. Releases are version + date only, newest first; `scripts/release.sh` adds each new one, never by hand. CI's `metadata` job validates it with `appstreamcli validate --no-net`, and the desktop file with `desktop-file-validate`. |
 | `packaging/linux-broadcast-loopback` | `/usr/lib/linux-broadcast/` | Root script, `add` / `remove`: creates or deletes our `/dev/video10` with `v4l2loopback-ctl` (module ≥ 0.13). |
 | `packaging/systemd/linux-broadcast-loopback.service` | `/usr/lib/systemd/system/` | Oneshot unit running `linux-broadcast-loopback add` at boot; enabled and started by the cargo-deb-generated `#DEBHELPER#` sections (`systemd-units` in the deb metadata). |
+
+**The AppStream ID `io.github.pedrojok01.LinuxBroadcast` is permanent.** It equals the D-Bus name the app owns (`activation.rs`, `BUS_NAME`), and software centers track the app by it, so neither may ever change.
 
 **v4l2loopback is shared, so we add a device instead of configuring the module.** Other tools (OBS Virtual Camera, droidcam, hand-written `/etc/modprobe.d` configs) use the same module, and module options are global: a shipped `options v4l2loopback …` line merged with theirs (the file sorting last wins), and unloading the module on install/remove dropped their devices. So `linux-broadcast-loopback add`:
 - loads the module only if it isn't loaded: as configured when some `options v4l2loopback` exists (`modprobe -c`), else with `devices=0`;

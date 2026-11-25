@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect x="6" y="6" width="52" height="52" rx="10" fill="#0E1116"/>
+  <rect x="6" y="6" width="52" height="52" rx="10" fill="none" stroke="#2A313B" stroke-width="1.25"/>
+  <rect x="18" y="18" width="28" height="28" rx="5" fill="none" stroke="#E6EAF0" stroke-width="2.25"/>
+  <circle cx="44" cy="20" r="2.6" fill="#5BD4C0"/>
+</svg>

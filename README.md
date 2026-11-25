@@ -87,7 +87,7 @@ That's it. Behind the scenes the package:
 
 - Uses the kernel's v4l2loopback module if your kernel ships one, installs it via DKMS otherwise.
 - Adds its own virtual camera, `/dev/video10` ("LinuxBroadcast"), right away and at every boot, through the `linux-broadcast-loopback` systemd service. It never sets module-wide options or unloads the module, so OBS Virtual Camera, droidcam or your own v4l2loopback config keep their devices. When it is the one loading the module, it also adds a spare `/dev/video11` ("Virtual Camera", hidden until something writes to it) for tools like OBS that look for a free device.
-- Registers the app menu entry and icon under `/usr/share/applications/` and `/usr/share/icons/hicolor/64x64/apps/`.
+- Registers the app menu entry (`/usr/share/applications/`), its 64 px and scalable icons (`/usr/share/icons/hicolor/{64x64,scalable}/apps/`) and AppStream metadata (`/usr/share/metainfo/`), so the app also shows up in Discover / GNOME Software.
 
 `apt remove linux-broadcast` deletes `/dev/video10` (or, if something still holds it, leaves it until the next reboot) and removes the launcher; other v4l2loopback devices are left alone. Upgrading from 0.4.0 or earlier removes the old `/etc/modprobe.d` and `/etc/modules-load.d` drop-ins.
 
@@ -388,7 +388,7 @@ cargo build --workspace
 LB_HEADLESS=1 cargo run --release -p linux-broadcast
 ```
 
-The toolchain is pinned via [`rust-toolchain.toml`](rust-toolchain.toml) (current stable + `rustfmt` + `clippy`); rustfmt config lives in [`rustfmt.toml`](rustfmt.toml). CI in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `fmt --check`, `clippy -D warnings`, and a release build on every push and PR.
+The toolchain is pinned via [`rust-toolchain.toml`](rust-toolchain.toml) (current stable + `rustfmt` + `clippy`); rustfmt config lives in [`rustfmt.toml`](rustfmt.toml). CI in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `fmt --check`, `clippy -D warnings`, a release build, `cargo test`, `cargo audit`, `cargo deny`, and the AppStream / desktop-file validators on every push and PR.
 
 For substantive changes:
 - Stay clippy-clean. CI fails on warnings.

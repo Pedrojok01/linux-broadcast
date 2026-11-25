@@ -105,3 +105,20 @@ jobs:
         with:
           command: check
           arguments: --all-features
+
+  metadata:
+    name: AppStream + desktop file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends appstream desktop-file-utils
+
+      - name: Validate AppStream metainfo
+        run: appstreamcli validate --no-net packaging/io.github.pedrojok01.LinuxBroadcast.metainfo.xml
+
+      - name: Validate desktop file
+        run: desktop-file-validate packaging/LinuxBroadcast.desktop

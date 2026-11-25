@@ -13,7 +13,7 @@ A calm, dark, slightly-cool design for a Rust + egui virtual webcam app. Flat-wi
 
 ## Logo
 
-Frame-within-a-frame mark with a single accent dot — the "broadcast frame" + "on-air tally" idea. Renders at 16 px. The 64×64 RGBA used for the window icon is generated programmatically at startup (`crates/app/src/icon.rs`); the original SVG is reproduced below for reference.
+Frame-within-a-frame mark with a single accent dot — the "broadcast frame" + "on-air tally" idea. Renders at 16 px. The 64×64 RGBA used for the window icon is generated programmatically at startup (`crates/app/src/icon.rs`); the original SVG is reproduced below for reference. `packaging/LinuxBroadcast.svg` is the shipped copy (the `.deb`'s scalable icon), so a logo change updates it too.
 
 ```svg
 <svg viewBox="0 0 64 64" width="64" height="64">

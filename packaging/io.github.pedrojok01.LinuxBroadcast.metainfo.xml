@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The component ID is the D-Bus name the app owns (activation.rs, BUS_NAME): never change it. -->
+<component type="desktop-application">
+  <id>io.github.pedrojok01.LinuxBroadcast</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>LinuxBroadcast</name>
+  <summary>Background-replacement virtual webcam</summary>
+  <developer id="io.github.pedrojok01">
+    <name>Pedrojok01</name>
+  </developer>
+
+  <description>
+    <p>LinuxBroadcast blurs or replaces the background behind you on your webcam. It creates a virtual camera that Zoom, Meet, Teams, OBS, Firefox and Chrome see as a normal webcam, so it works in your usual video call and recording apps.</p>
+    <p>Features:</p>
+    <ul>
+      <li>Two people-detection models: Robust Video Matting for the cleanest edges, and a lighter MediaPipe model for low-power machines</li>
+      <li>Blur the background, replace it with an image, or pass the camera through unchanged</li>
+      <li>A library of saved background images</li>
+      <li>Auto-frame keeps you centered as you move</li>
+      <li>Full-resolution capture: MJPEG is used automatically, so USB webcams deliver HD at 30 fps</li>
+      <li>Your real camera only turns on while an app is using the virtual camera</li>
+    </ul>
+    <p>Requires the v4l2loopback kernel module.</p>
+  </description>
+
+  <launchable type="desktop-id">LinuxBroadcast.desktop</launchable>
+
+  <url type="homepage">https://github.com/Pedrojok01/linux-broadcast</url>
+  <url type="vcs-browser">https://github.com/Pedrojok01/linux-broadcast</url>
+  <url type="bugtracker">https://github.com/Pedrojok01/linux-broadcast/issues</url>
+  <url type="donation">https://www.buymeacoffee.com/Pedrojok01</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/Pedrojok01/linux-broadcast/main/assets/screenshot.png</image>
+      <caption>A replaced background with the live preview</caption>
+    </screenshot>
+  </screenshots>
+
+  <provides>
+    <binary>linux-broadcast</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <keywords>
+    <keyword>webcam</keyword>
+    <keyword>virtual camera</keyword>
+    <keyword>background blur</keyword>
+    <keyword>background replacement</keyword>
+    <keyword>video call</keyword>
+    <keyword>v4l2loopback</keyword>
+  </keywords>
+
+  <releases>
+    <release version="0.5.0" date="2026-11-24"/>
+    <release version="0.4.0" date="2026-08-23"/>
+    <release version="0.3.1" date="2026-06-18"/>
+    <release version="0.3.0" date="2026-06-18"/>
+    <release version="0.2.1" date="2026-06-16"/>
+    <release version="0.2.0" date="2026-06-16"/>
+    <release version="0.1.5" date="2026-06-14"/>
+    <release version="0.1.4" date="2026-05-16"/>
+    <release version="0.1.3" date="2026-05-11"/>
+    <release version="0.1.2" date="2026-05-10"/>
+    <release version="0.1.1" date="2026-05-10"/>
+  </releases>
+</component>

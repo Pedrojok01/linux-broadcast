@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Cut a new release. Bumps the workspace version, runs the same checks
-# CI runs, commits, and tags. By default stops before pushing so you can
-# inspect; pass --push to send the commit + tag and let CI build the
-# .deb and publish to AUR.
+# Cut a new release. Bumps the workspace version, adds the AppStream
+# release entry, runs the same checks CI runs (needs appstreamcli and
+# desktop-file-validate), commits, and tags. By default stops before
+# pushing so you can inspect; pass --push to send the commit + tag and
+# let CI build the .deb and publish to AUR.
 #
 # Usage:
 #   scripts/release.sh 0.1.3            # bump + commit + tag, no push
@@ -27,8 +28,15 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
+metainfo=packaging/io.github.pedrojok01.LinuxBroadcast.metainfo.xml
 
 # --- Preflight ---
+for tool in appstreamcli desktop-file-validate; do
+  if ! command -v "$tool" >/dev/null; then
+    echo "ERROR: $tool not found — install the appstream and desktop-file-utils packages" >&2
+    exit 1
+  fi
+done
 branch="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$branch" != "main" ]]; then
   echo "ERROR: must be on main, currently on '$branch'" >&2
@@ -75,6 +83,12 @@ echo
 sed -i -E "0,/^version = \"$current\"$/ s||version = \"$new\"|" Cargo.toml
 sed -i -E "s|(lb-pipeline = \\{ path = \"\\.\\./pipeline\", version = \")$current(\" \\})|\\1$new\\2|" crates/app/Cargo.toml
 cargo update --quiet -p linux-broadcast -p lb-pipeline
+# Newest release goes first; a silent no-match would ship a stale list.
+sed -i -E "s|^  <releases>$|&\n    <release version=\"$new\" date=\"$(date -u +%F)\"/>|" "$metainfo"
+if ! grep -q "<release version=\"$new\"" "$metainfo"; then
+  echo "ERROR: could not add the $new release entry to $metainfo" >&2
+  exit 1
+fi
 
 # --- Verify (same gates as CI) ---
 echo "=== cargo fmt --all -- --check ==="
@@ -83,9 +97,13 @@ echo "=== cargo clippy --workspace --all-targets -- -D warnings ==="
 cargo clippy --workspace --all-targets --quiet -- -D warnings
 echo "=== cargo test --workspace --quiet ==="
 cargo test --workspace --quiet
+echo "=== appstreamcli validate --no-net $metainfo ==="
+appstreamcli validate --no-net "$metainfo"
+echo "=== desktop-file-validate packaging/LinuxBroadcast.desktop ==="
+desktop-file-validate packaging/LinuxBroadcast.desktop
 
 # --- Commit + tag ---
-git add Cargo.toml Cargo.lock crates/app/Cargo.toml
+git add Cargo.toml Cargo.lock crates/app/Cargo.toml "$metainfo"
 git commit --quiet -m "Release $new"
 git tag -a "v$new" -m "v$new"
 

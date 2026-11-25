@@ -106,6 +106,8 @@ assets = [
     ["../../packaging/linux-broadcast.wrapper", "usr/bin/linux-broadcast", "755"],
     ["../../packaging/LinuxBroadcast.desktop", "usr/share/applications/", "644"],
     ["../../packaging/LinuxBroadcast.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../packaging/LinuxBroadcast.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../packaging/io.github.pedrojok01.LinuxBroadcast.metainfo.xml", "usr/share/metainfo/", "644"],
     ["../../packaging/linux-broadcast-loopback", "usr/lib/linux-broadcast/", "755"],
     ["../../README.md", "usr/share/doc/linux-broadcast/README.md", "644"],
     ["../../models/README.md", "usr/share/doc/linux-broadcast/models/README.md", "644"],
