@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "lb-pipeline"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1926,7 +1926,7 @@ checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 
 [[package]]
 name = "linux-broadcast"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytemuck",
